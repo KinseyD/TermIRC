@@ -176,3 +176,91 @@ fn client_answers_server_ping_with_pong() {
         "no PONG in {lines:?}"
     );
 }
+
+/// A mock that greets the client, answers its JOIN with one PRIVMSG, and then
+/// closes the connection — simulating a server restart or idle kick.
+fn spawn_mock_server_that_closes() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    std::thread::spawn(move || {
+        let (socket, _) = match listener.accept() {
+            Ok(pair) => pair,
+            Err(_) => return,
+        };
+        let mut reader = BufReader::new(socket.try_clone().unwrap());
+        let mut writer = socket;
+
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                break;
+            }
+            if line.starts_with("USER") {
+                write!(
+                    writer,
+                    ":mock 001 test :Welcome to the Mock IRC Network\r\n\
+                     :mock 376 test :End of /MOTD command.\r\n"
+                )
+                .unwrap();
+                writer.flush().unwrap();
+            }
+            if line.starts_with("JOIN") {
+                write!(writer, ":alice!a@b PRIVMSG #test :hi\r\n").unwrap();
+                writer.flush().unwrap();
+                break; // drop everything -> clean TCP close
+            }
+        }
+    });
+
+    port
+}
+
+#[test]
+fn reports_status_when_server_closes_connection() {
+    // Arrange: the server will close the socket right after one PRIVMSG.
+    let port = spawn_mock_server_that_closes();
+    let (tx, rx) = mpsc::channel();
+
+    // Act
+    let _handle = spawn_irc(server_config_for(port), "#test".to_string(), tx);
+
+    // Assert: after the chat message, a disconnect notification must arrive —
+    // the UI must never keep showing "connected" to a dead feed.
+    let deadline = std::time::Instant::now() + RECV_TIMEOUT;
+    let mut disconnected = false;
+    while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
+        match rx.recv_timeout(remaining) {
+            Ok(IrcEvent::Status(text)) if text.contains("disconnected") => {
+                disconnected = true;
+                break;
+            }
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    assert!(
+        disconnected,
+        "no disconnect notification after server close"
+    );
+}
+
+#[test]
+fn reports_error_when_connection_is_refused() {
+    // Arrange: claim an ephemeral port, then drop the listener — nothing listens.
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let (tx, rx) = mpsc::channel();
+
+    // Act
+    let _handle = spawn_irc(server_config_for(port), "#test".to_string(), tx);
+
+    // Assert: the failed connect surfaces as an Error event, not silence.
+    match rx.recv_timeout(RECV_TIMEOUT) {
+        Ok(IrcEvent::Error(_)) => {}
+        other => panic!("expected IrcEvent::Error, got {other:?}"),
+    }
+}

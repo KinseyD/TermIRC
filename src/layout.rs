@@ -67,7 +67,7 @@ pub fn wrap_body(text: &str, width: u16) -> Vec<String> {
             }
             for c in word.chars() {
                 let c_w = UnicodeWidthChar::width(c).unwrap_or(0);
-                if current_w + c_w > width {
+                if current_w + c_w > width && !current.is_empty() {
                     lines.push(std::mem::take(&mut current));
                     current_w = 0;
                 }
@@ -252,5 +252,18 @@ mod tests {
         // "中文" is 4 columns, plus ": " makes 6.
         assert_eq!(nick_column_width("中文"), 6);
         assert_eq!(nick_column_width("alice"), 7);
+    }
+
+    #[test]
+    fn fullwidth_char_at_width_one_produces_no_phantom_blank_line() {
+        // Arrange: a 2-column char can never fit in a 1-column line; it must
+        // overflow in place rather than emitting an empty row first.
+
+        // Act & Assert
+        assert_eq!(wrap_body("一", 1), vec!["一".to_string()]);
+        assert_eq!(
+            wrap_body("中文", 1),
+            vec!["中".to_string(), "文".to_string()]
+        );
     }
 }

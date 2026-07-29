@@ -42,7 +42,9 @@ pub fn build_client_config(server: &ServerConfig, channel: &str) -> IrcClientCon
 /// Spawn the IRC client thread; events arrive on `tx`.
 ///
 /// The thread connects, registers, joins the channel, and forwards chat
-/// messages until the connection ends, then reports an error or stops.
+/// messages until the connection ends. A terminal event is ALWAYS emitted on
+/// exit — `Status` for a clean close, `Error` otherwise — so the UI never
+/// keeps claiming "connected" to a dead feed.
 pub fn spawn_irc(
     server: ServerConfig,
     channel: String,
@@ -62,11 +64,17 @@ pub fn spawn_irc(
 
         let server_name = server.server.clone();
         let result = runtime.block_on(run_client(server, channel, &tx));
-        if result.is_err() {
-            let _ = tx.send(IrcEvent::Status(format!("disconnected from {server_name}")));
-        }
-        if let Err(e) = result {
-            let _ = tx.send(IrcEvent::Error(e.to_string()));
+        // `send` failing means the receiver is gone — the UI has quit and the
+        // process is about to reap this thread; nothing to report anywhere.
+        match result {
+            Ok(()) => {
+                let _ = tx.send(IrcEvent::Status(format!(
+                    "disconnected from {server_name} (connection closed)"
+                )));
+            }
+            Err(e) => {
+                let _ = tx.send(IrcEvent::Error(e.to_string()));
+            }
         }
     })
 }
@@ -84,7 +92,7 @@ async fn run_client(
     while let Some(result) = stream.next().await {
         match result {
             Ok(message) => {
-                if let Some(chat) = ChatMessage::from_proto(&message) {
+                if let Some(chat) = ChatMessage::from_proto(&message, &channel) {
                     let _ = tx.send(IrcEvent::Message(chat));
                 }
             }

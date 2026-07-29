@@ -2,11 +2,12 @@
 
 use std::path::Path;
 
+use anyhow::Context as _;
 use indexmap::IndexMap;
 use serde::Deserialize;
 
 /// Per-server connection settings, as written in the `[servers.<name>]` tables.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct ServerConfig {
     pub username: String,
     pub nickname: String,
@@ -16,6 +17,21 @@ pub struct ServerConfig {
     pub use_tls: bool,
     pub port: u16,
     pub channels: Vec<String>,
+}
+
+impl std::fmt::Debug for ServerConfig {
+    /// The password is a credential — never include it in debug output.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerConfig")
+            .field("username", &self.username)
+            .field("nickname", &self.nickname)
+            .field("password", &"<redacted>")
+            .field("server", &self.server)
+            .field("use_tls", &self.use_tls)
+            .field("port", &self.port)
+            .field("channels", &self.channels)
+            .finish()
+    }
 }
 
 impl ServerConfig {
@@ -43,9 +59,8 @@ impl Config {
     /// Load and parse configuration from a file path.
     pub fn load(path: &Path) -> anyhow::Result<Config> {
         let content = std::fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
-        Config::parse(&content)
-            .map_err(|e| anyhow::anyhow!("failed to parse {}: {e}", path.display()))
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        Config::parse(&content).with_context(|| format!("failed to parse {}", path.display()))
     }
 
     /// The first server in file order, with its name.
@@ -216,5 +231,32 @@ channels = []
 
         // Assert
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn debug_output_redacts_password() {
+        // Arrange: the config holds a plaintext credential.
+        let content = r##"
+[servers.osu_irc]
+username = "alice"
+nickname = "alice"
+password = "super-secret-token"
+server = "irc.example.org"
+port = 6667
+channels = ["#osu"]
+"##;
+        let config = Config::parse(content).unwrap();
+
+        // Act
+        let debug = format!("{:?}", config.first_server().unwrap().1);
+
+        // Assert: the token never appears; non-sensitive fields still do.
+        assert!(
+            !debug.contains("super-secret-token"),
+            "password leaked: {debug}"
+        );
+        assert!(debug.contains("<redacted>"));
+        assert!(debug.contains("alice"));
+        assert!(debug.contains("irc.example.org"));
     }
 }

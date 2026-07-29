@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use anyhow::Context;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
 use termirc::app::App;
 use termirc::config::{Config, ServerConfig};
@@ -17,6 +17,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const BORDER: u16 = 2;
 
 fn main() -> anyhow::Result<()> {
+    install_panic_hook();
+
     let config_path = dirs::home_dir()
         .context("could not resolve the home directory")?
         .join(".config")
@@ -41,6 +43,16 @@ fn main() -> anyhow::Result<()> {
     result
 }
 
+/// Restore the terminal before the default panic hook prints the backtrace,
+/// so a panic never strands the user's shell in raw mode / alternate screen.
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = ratatui::try_restore();
+        default_hook(info);
+    }));
+}
+
 fn run(
     terminal: &mut ratatui::DefaultTerminal,
     server: ServerConfig,
@@ -58,7 +70,7 @@ fn run(
     );
     let mut status = format!("connecting to {channel}…");
 
-    while app.running {
+    while app.is_running() {
         terminal.draw(|frame| ui::draw(frame, &app, &status))?;
 
         if event::poll(POLL_INTERVAL)? {
@@ -68,6 +80,10 @@ fn run(
                     KeyCode::PageUp => app.scroll_page_up(),
                     KeyCode::PageDown => app.scroll_page_down(),
                     KeyCode::Char('q') | KeyCode::Esc => app.quit(),
+                    // Raw mode disables SIGINT, so Ctrl+C arrives as a key event.
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.quit()
+                    }
                     _ => {}
                 },
                 Event::Resize(width, height) => {

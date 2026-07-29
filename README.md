@@ -25,7 +25,11 @@ There is exactly one blank line between two messages (never a trailing one).
 |-----|--------|
 | `PgUp` | scroll up by ⅓ of the window height |
 | `PgDn` | scroll down by ⅓ of the window height |
-| `q` / `Esc` | quit |
+| `q` / `Esc` / `Ctrl+C` | quit |
+
+Connection status is shown on the pane's bottom border. If the server drops
+the connection, the status changes to `disconnected from …` (or an error
+message) — termirc does not auto-reconnect; quit and restart to rejoin.
 
 Auto-scroll: when a new message arrives, the view follows it **only if the
 newest message's last line is currently visible**. If you have scrolled up so
@@ -39,6 +43,7 @@ The config file lives at `~/.config/termirc/config.toml` (on Windows that is
 
 ```bash
 cp test.toml ~/.config/termirc/config.toml
+chmod 600 ~/.config/termirc/config.toml   # Unix: it holds a credential
 ```
 
 Format (multiple servers and channels are allowed; termirc currently uses the
@@ -54,6 +59,11 @@ use_tls = false
 port = 6667
 channels = ["#osu", "#chinese"]
 ```
+
+The connection defaults to plaintext (`use_tls = false`, port 6667 — what
+osu! Bancho historically uses). If your network offers TLS, prefer it so the
+token does not cross the wire in clear: set `use_tls = true` and the TLS port
+(the system trust store is used; certificate and hostname are verified).
 
 ## Running
 

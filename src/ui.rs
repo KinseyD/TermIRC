@@ -16,19 +16,23 @@ use crate::app::App;
 const NICK_STYLE: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
 
 /// Convert the app's laid-out rows into ratatui `Text`.
-pub fn build_text(app: &App) -> Text<'static> {
-    let lines: Vec<Line<'static>> = app
+///
+/// Borrows the row bodies instead of cloning them: the `Paragraph` only needs
+/// the text for the duration of the render call, so per-frame allocations stay
+/// flat no matter how much scrollback is held.
+pub fn build_text(app: &App) -> Text<'_> {
+    let lines: Vec<Line<'_>> = app
         .lines()
         .iter()
         .map(|row| match row.nick.as_ref() {
             Some(nick) => Line::from(vec![
                 Span::styled(format!("{nick}: "), NICK_STYLE),
-                Span::raw(row.body.clone()),
+                Span::raw(row.body.as_str()),
             ]),
             None if row.body.is_empty() => Line::from(""),
             None => Line::from(vec![
                 Span::raw(" ".repeat(usize::from(row.indent))),
-                Span::raw(row.body.clone()),
+                Span::raw(row.body.as_str()),
             ]),
         })
         .collect();
@@ -38,12 +42,8 @@ pub fn build_text(app: &App) -> Text<'static> {
 /// Render the whole screen: a bordered chat pane scrolled to the app offset.
 pub fn draw(frame: &mut Frame, app: &App, status: &str) {
     let paragraph = Paragraph::new(build_text(app))
-        .block(
-            Block::bordered()
-                .title("termirc")
-                .title_bottom(status.to_string()),
-        )
-        .scroll((app.scroll_offset, 0));
+        .block(Block::bordered().title("termirc").title_bottom(status))
+        .scroll((app.scroll_offset(), 0));
     frame.render_widget(paragraph, frame.area());
 }
 
@@ -136,7 +136,7 @@ mod tests {
         for i in 0..5 {
             app.push_message(msg("u", &format!("m{i}")));
         }
-        app.scroll_offset = 2;
+        app.set_scroll_offset(2);
 
         // Act
         let buffer = render_sized(&app, 30, 6);
