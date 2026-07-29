@@ -6,7 +6,7 @@ use indexmap::IndexMap;
 use serde::Deserialize;
 
 /// Per-server connection settings, as written in the `[servers.<name>]` tables.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
     pub username: String,
     pub nickname: String,
