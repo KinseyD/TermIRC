@@ -13,8 +13,11 @@ use termirc::ui;
 /// How often the event loop wakes up to pump IRC events and redraw.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Rows/columns taken by the pane border (one on each side).
-const BORDER: u16 = 2;
+/// Blank padding (each side) between the screen edge and the chat content.
+const HORIZONTAL_PAD: u16 = 2;
+
+/// Rows reserved for chrome: the channel title (top) and status line (bottom).
+const CHROME_ROWS: u16 = 2;
 
 fn main() -> anyhow::Result<()> {
     install_panic_hook();
@@ -65,13 +68,13 @@ fn run(
 
     let size = terminal.size()?;
     let mut app = App::new(
-        size.width.saturating_sub(BORDER),
-        size.height.saturating_sub(BORDER),
+        size.width.saturating_sub(2 * HORIZONTAL_PAD),
+        size.height.saturating_sub(CHROME_ROWS),
     );
     let mut status = format!("connecting to {channel}…");
 
     while app.is_running() {
-        terminal.draw(|frame| ui::draw(frame, &app, &status))?;
+        terminal.draw(|frame| ui::draw(frame, &app, &channel, &status))?;
 
         if event::poll(POLL_INTERVAL)? {
             match event::read()? {
@@ -86,9 +89,10 @@ fn run(
                     }
                     _ => {}
                 },
-                Event::Resize(width, height) => {
-                    app.resize(width.saturating_sub(BORDER), height.saturating_sub(BORDER))
-                }
+                Event::Resize(width, height) => app.resize(
+                    width.saturating_sub(2 * HORIZONTAL_PAD),
+                    height.saturating_sub(CHROME_ROWS),
+                ),
                 _ => {}
             }
         }
