@@ -13,12 +13,6 @@ use termirc::ui;
 /// How often the event loop wakes up to pump IRC events and redraw.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Blank padding (each side) between the screen edge and the chat content.
-const HORIZONTAL_PAD: u16 = 2;
-
-/// Rows reserved for chrome: the channel title (top) and status line (bottom).
-const CHROME_ROWS: u16 = 2;
-
 fn main() -> anyhow::Result<()> {
     install_panic_hook();
 
@@ -29,7 +23,7 @@ fn main() -> anyhow::Result<()> {
         .join("config.toml");
     let config = Config::load(&config_path).with_context(|| {
         format!(
-            "failed to load config from {} — copy your config file there (e.g. test.toml)",
+            "failed to load config from {} - copy your config file there (e.g. test.toml)",
             config_path.display()
         )
     })?;
@@ -41,7 +35,7 @@ fn main() -> anyhow::Result<()> {
         .to_string();
 
     let mut terminal = ratatui::try_init()?;
-    let result = run(&mut terminal, server.clone(), channel);
+    let result = run(&mut terminal, server.clone(), channel, &config, server_name);
     ratatui::restore();
     result
 }
@@ -60,6 +54,8 @@ fn run(
     terminal: &mut ratatui::DefaultTerminal,
     server: ServerConfig,
     channel: String,
+    config: &Config,
+    server_name: &str,
 ) -> anyhow::Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
     // The IRC thread is deliberately not joined: it blocks on network I/O and
@@ -68,17 +64,27 @@ fn run(
 
     let size = terminal.size()?;
     let mut app = App::new(
-        size.width.saturating_sub(2 * HORIZONTAL_PAD),
-        size.height.saturating_sub(CHROME_ROWS),
+        size.width
+            .saturating_sub(ui::SIDEBAR_WIDTH)
+            .saturating_sub(2 * ui::HORIZONTAL_PAD),
+        size.height
+            .saturating_sub(ui::TITLE_ROWS)
+            .saturating_sub(ui::INPUT_ROWS),
     );
     let mut status = format!("connecting to {channel}…");
 
     while app.is_running() {
-        terminal.draw(|frame| ui::draw(frame, &app, &channel, &status))?;
+        let chrome = ui::Chrome {
+            config,
+            active_server: server_name,
+            active_channel: &channel,
+            status: &status,
+        };
+        terminal.draw(|frame| ui::draw(frame, &app, &chrome))?;
 
         if event::poll(POLL_INTERVAL)? {
             match event::read()? {
-                // Windows also emits Release/Repeat events — handle presses only.
+                // Windows also emits Release/Repeat events - handle presses only.
                 Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                     KeyCode::PageUp => app.scroll_page_up(),
                     KeyCode::PageDown => app.scroll_page_down(),
@@ -90,8 +96,12 @@ fn run(
                     _ => {}
                 },
                 Event::Resize(width, height) => app.resize(
-                    width.saturating_sub(2 * HORIZONTAL_PAD),
-                    height.saturating_sub(CHROME_ROWS),
+                    width
+                        .saturating_sub(ui::SIDEBAR_WIDTH)
+                        .saturating_sub(2 * ui::HORIZONTAL_PAD),
+                    height
+                        .saturating_sub(ui::TITLE_ROWS)
+                        .saturating_sub(ui::INPUT_ROWS),
                 ),
                 _ => {}
             }
