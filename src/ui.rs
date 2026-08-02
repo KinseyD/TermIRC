@@ -35,6 +35,9 @@ pub const HORIZONTAL_PAD: u16 = 2;
 pub const TITLE_ROWS: u16 = 1;
 /// Rows taken by the composer at the bottom of the main column.
 pub const INPUT_ROWS: u16 = 4;
+/// Rows below the composer: a half-block "fade" of its background on the row
+/// immediately under it, then a blank row before the window bottom.
+pub const GAP_ROWS: u16 = 2;
 
 /// Accent color for the composer's decorative bar and the active channel.
 const ACCENT: Color = Color::Magenta;
@@ -86,6 +89,7 @@ pub fn draw(frame: &mut Frame, app: &App, chrome: &Chrome<'_>) {
         Constraint::Length(TITLE_ROWS), // channel title
         Constraint::Min(0),             // messages
         Constraint::Length(INPUT_ROWS), // composer
+        Constraint::Length(GAP_ROWS),   // fade + blank below the composer
     ])
     .split(columns[1]);
 
@@ -101,6 +105,7 @@ pub fn draw(frame: &mut Frame, app: &App, chrome: &Chrome<'_>) {
         inset(rows[1], HORIZONTAL_PAD),
     );
     render_input(frame, rows[2], chrome.status);
+    render_gap(frame, rows[3]);
 }
 
 /// Render the server/channel sidebar from the config, highlighting the active
@@ -148,6 +153,17 @@ fn render_input(frame: &mut Frame, area: Rect, status: &str) {
     frame.render_widget(
         Paragraph::new(Text::from(lines)).style(Style::new().bg(INPUT_BG)),
         area,
+    );
+}
+
+/// Render the gap below the composer: a half-block "fade" of the composer's
+/// background on the row immediately below it, then a blank row.
+fn render_gap(frame: &mut Frame, area: Rect) {
+    let top = Rect::new(area.x, area.y, area.width, 1);
+    let bar = "▀".repeat(usize::from(top.width));
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(bar, Style::new().fg(INPUT_BG)))),
+        top,
     );
 }
 
@@ -219,7 +235,7 @@ channels = ["#osu", "#chinese"]
     #[test]
     fn channel_name_shown_on_top_row_and_no_border() {
         // Arrange: 50x10 terminal -> sidebar 22, main 28; viewport 24x5.
-        let mut app = App::new(24, 5);
+        let mut app = App::new(24, 3);
         app.push_message(msg("alice", "hi"));
         let config = test_config();
 
@@ -247,7 +263,7 @@ channels = ["#osu", "#chinese"]
     #[test]
     fn render_shows_nick_then_body_on_first_message_row() {
         // Arrange
-        let mut app = App::new(24, 5);
+        let mut app = App::new(24, 3);
         app.push_message(msg("alice", "hello"));
         let config = test_config();
 
@@ -261,14 +277,14 @@ channels = ["#osu", "#chinese"]
 
     #[test]
     fn continuation_rows_are_blank_under_username() {
-        // Arrange: terminal 44x8 -> main 22, viewport 18x3; nick "alice" takes
+        // Arrange: terminal 44x10 -> main 22, viewport 18x3; nick "alice" takes
         // 7 columns, body width 11; "one two three four" -> "one two" / "three four".
         let mut app = App::new(18, 3);
         app.push_message(msg("alice", "one two three four"));
         let config = test_config();
 
         // Act
-        let buffer = render_sized(&app, &config, "", 44, 8);
+        let buffer = render_sized(&app, &config, "", 44, 10);
 
         // Assert: row 2 is blank under the nick, body resumes at the next column.
         let nick_end = MAIN_COL_X + 7; // "alice: " is 7 columns
@@ -286,7 +302,7 @@ channels = ["#osu", "#chinese"]
     #[test]
     fn blank_separator_between_messages_but_not_after_last() {
         // Arrange
-        let mut app = App::new(24, 5);
+        let mut app = App::new(24, 3);
         app.push_message(msg("a", "first"));
         app.push_message(msg("b", "second"));
         let config = test_config();
@@ -309,8 +325,8 @@ channels = ["#osu", "#chinese"]
 
     #[test]
     fn scroll_offset_shifts_visible_content() {
-        // Arrange: 5 one-line messages -> 9 content rows; viewport shows 5.
-        let mut app = App::new(24, 5);
+        // Arrange: 5 one-line messages -> 9 content rows; viewport shows 3.
+        let mut app = App::new(24, 3);
         for i in 0..5 {
             app.push_message(msg("u", &format!("m{i}")));
         }
@@ -328,7 +344,7 @@ channels = ["#osu", "#chinese"]
     #[test]
     fn sidebar_lists_configured_servers_and_channels() {
         // Arrange
-        let app = App::new(24, 5);
+        let app = App::new(24, 3);
         let config = test_config();
 
         // Act
@@ -343,7 +359,7 @@ channels = ["#osu", "#chinese"]
     #[test]
     fn sidebar_highlights_active_channel() {
         // Arrange
-        let app = App::new(24, 5);
+        let app = App::new(24, 3);
         let config = test_config();
 
         // Act
@@ -359,8 +375,8 @@ channels = ["#osu", "#chinese"]
 
     #[test]
     fn input_area_has_background_and_accent_column() {
-        // Arrange: 50x10 -> input occupies the bottom 4 rows (6..9).
-        let app = App::new(24, 5);
+        // Arrange: 50x10 -> input occupies rows 4..=7 (above the 2-row gap).
+        let app = App::new(24, 3);
         let config = test_config();
 
         // Act
@@ -369,29 +385,47 @@ channels = ["#osu", "#chinese"]
         // Assert: each input row has the `┃` accent at the main column's left
         // edge (col SIDEBAR_WIDTH) in the accent color, and the region's
         // background is INPUT_BG.
-        for y in 6..=9 {
+        for y in 4..=7 {
             let cell = buffer.cell((SIDEBAR_WIDTH, y)).unwrap();
             assert_eq!(cell.symbol(), "┃", "accent missing on row {y}");
             assert_eq!(cell.fg, ACCENT, "accent color wrong on row {y}");
         }
-        assert_eq!(buffer.cell((SIDEBAR_WIDTH + 2, 7)).unwrap().bg, INPUT_BG);
+        assert_eq!(buffer.cell((SIDEBAR_WIDTH + 2, 5)).unwrap().bg, INPUT_BG);
     }
 
     #[test]
     fn input_area_shows_tips_on_last_row() {
         // Arrange: a wide terminal so the full status + tips line fits.
-        let app = App::new(74, 5);
+        let app = App::new(74, 3);
         let config = test_config();
 
         // Act
         let buffer = render_sized(&app, &config, "connected to irc.example.org", 100, 10);
 
-        // Assert: the last row carries the status plus key hints.
-        let tips = buffer_line(&buffer, 9);
+        // Assert: the input's last row (row 7) carries status plus key hints.
+        let tips = buffer_line(&buffer, 7);
         assert!(
             tips.contains("connected to irc.example.org"),
             "tips: {tips:?}"
         );
         assert!(tips.contains("q quit"), "tips: {tips:?}");
+    }
+
+    #[test]
+    fn gap_below_input_has_half_block_fade() {
+        // Arrange: 50x10 -> input rows 4..=7, gap rows 8 (fade) and 9 (blank).
+        let app = App::new(24, 3);
+        let config = test_config();
+
+        // Act
+        let buffer = render_sized(&app, &config, "", 50, 10);
+
+        // Assert: the row immediately below the composer is a half-block bar
+        // in the composer's background color, spanning the main column; the
+        // sidebar on that row stays blank, and the row below is fully blank.
+        assert_eq!(buffer.cell((SIDEBAR_WIDTH, 8)).unwrap().symbol(), "▀");
+        assert_eq!(buffer.cell((SIDEBAR_WIDTH, 8)).unwrap().fg, INPUT_BG);
+        assert_eq!(buffer.cell((0, 8)).unwrap().symbol(), " "); // sidebar untouched
+        assert_eq!(buffer.cell((SIDEBAR_WIDTH, 9)).unwrap().symbol(), " ");
     }
 }

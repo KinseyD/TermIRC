@@ -69,7 +69,8 @@ fn run(
             .saturating_sub(2 * ui::HORIZONTAL_PAD),
         size.height
             .saturating_sub(ui::TITLE_ROWS)
-            .saturating_sub(ui::INPUT_ROWS),
+            .saturating_sub(ui::INPUT_ROWS)
+            .saturating_sub(ui::GAP_ROWS),
     );
     let mut status = format!("connecting to {channel}…");
 
@@ -101,7 +102,8 @@ fn run(
                         .saturating_sub(2 * ui::HORIZONTAL_PAD),
                     height
                         .saturating_sub(ui::TITLE_ROWS)
-                        .saturating_sub(ui::INPUT_ROWS),
+                        .saturating_sub(ui::INPUT_ROWS)
+                        .saturating_sub(ui::GAP_ROWS),
                 ),
                 _ => {}
             }
