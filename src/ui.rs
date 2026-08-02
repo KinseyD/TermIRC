@@ -39,12 +39,16 @@ pub const INPUT_ROWS: u16 = 4;
 /// immediately under it, then a blank row before the window bottom.
 pub const GAP_ROWS: u16 = 2;
 
-/// Accent color for the composer's decorative bar and the active channel.
-const ACCENT: Color = Color::Magenta;
+/// Global background color for the whole screen.
+const GLOBAL_BG: Color = Color::Rgb(0x0a, 0x0a, 0x0a);
 /// Background color distinguishing the composer region.
-const INPUT_BG: Color = Color::DarkGray;
+const INPUT_BG: Color = Color::Rgb(0x1e, 0x1e, 0x1e);
+/// Color of the thin vertical line separating the sidebar from the main column.
+const SEPARATOR: Color = Color::Rgb(0x55, 0x55, 0x55);
+/// Accent color for the active channel in the sidebar.
+const ACCENT: Color = Color::Magenta;
 const ACCENT_STYLE: Style = Style::new().fg(ACCENT).add_modifier(Modifier::BOLD);
-const DIM_STYLE: Style = Style::new().fg(Color::DarkGray);
+const DIM_STYLE: Style = Style::new().fg(Color::Rgb(0x70, 0x70, 0x70));
 
 /// Render-only chrome state: what to show outside the message scrollback.
 pub struct Chrome<'a> {
@@ -81,9 +85,16 @@ pub fn build_text(app: &App) -> Text<'_> {
 /// Render the whole screen: sidebar on the left, main column (channel title /
 /// messages / composer) on the right.
 pub fn draw(frame: &mut Frame, app: &App, chrome: &Chrome<'_>) {
+    // Fill the screen with the global background.
+    frame.render_widget(
+        Paragraph::new("").style(Style::new().bg(GLOBAL_BG)),
+        frame.area(),
+    );
+
     let columns = Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(0)])
         .split(frame.area());
     render_sidebar(frame, columns[0], chrome);
+    render_separator(frame, frame.area());
 
     let rows = Layout::vertical([
         Constraint::Length(TITLE_ROWS), // channel title
@@ -106,6 +117,16 @@ pub fn draw(frame: &mut Frame, app: &App, chrome: &Chrome<'_>) {
     );
     render_input(frame, rows[2], chrome.status);
     render_gap(frame, rows[3]);
+}
+
+/// Render the thin gray vertical line that separates the sidebar from the main
+/// column, spanning the full height. The composer's left accent (`┃`) is drawn
+/// on top of it for the input rows.
+fn render_separator(frame: &mut Frame, area: Rect) {
+    let col = Rect::new(SIDEBAR_WIDTH, area.y, 1, area.height);
+    let line = Line::from(Span::styled("│", Style::new().fg(SEPARATOR)));
+    let lines = vec![line; usize::from(area.height)];
+    frame.render_widget(Paragraph::new(Text::from(lines)), col);
 }
 
 /// Render the server/channel sidebar from the config, highlighting the active
@@ -138,7 +159,9 @@ fn render_sidebar(frame: &mut Frame, area: Rect, chrome: &Chrome<'_>) {
 /// Render the composer: a background-shaded 4-row region with a decorative
 /// accent bar on the left (top blank / input / blank / tips).
 fn render_input(frame: &mut Frame, area: Rect, status: &str) {
-    let accent = Span::styled("┃", Style::new().fg(ACCENT));
+    // The left accent bar uses the global background color (a dark seam on
+    // the lighter composer background).
+    let accent = Span::styled("┃", Style::new().fg(GLOBAL_BG));
     let tips = if status.is_empty() {
         "q quit · PgUp/PgDn scroll".to_string()
     } else {
@@ -247,13 +270,13 @@ channels = ["#osu", "#chinese"]
         assert!(buffer_line(&buffer, 0).contains("#osu"));
         assert!(!buffer_line(&buffer, 0).contains("termirc"));
 
-        // Assert: no light box-drawing characters anywhere (the heavy `┃`
-        // accent is allowed - it is not in this set).
+        // Assert: no box-drawing characters anywhere except the thin gray `│`
+        // separator (and the heavy `┃` accent) - no corners/tees/horizontals.
         for y in 0..buffer.area.height {
             for x in 0..buffer.area.width {
                 let symbol = buffer.cell((x, y)).unwrap().symbol();
                 assert!(
-                    !symbol.chars().any(|c| "│─┌┐└┘├┤┬┴┼".contains(c)),
+                    !symbol.chars().any(|c| "─┌┐└┘├┤┬┴┼".contains(c)),
                     "border char {symbol:?} at ({x},{y})"
                 );
             }
@@ -310,10 +333,10 @@ channels = ["#osu", "#chinese"]
         // Act
         let buffer = render_sized(&app, &config, "", 50, 10);
 
-        // Assert: in the main column, the row between the messages is blank
-        // (the sidebar occupies the left columns on the same row); the row
-        // after it carries the second message.
-        let main_slice: String = (SIDEBAR_WIDTH..buffer.area.width)
+        // Assert: in the main content area, the row between the messages is
+        // blank (the sidebar separator `│` sits in the pad column to its left);
+        // the row after it carries the second message.
+        let main_slice: String = (SIDEBAR_WIDTH + HORIZONTAL_PAD..buffer.area.width)
             .map(|x| buffer.cell((x, 2)).unwrap().symbol())
             .collect();
         assert!(
@@ -388,7 +411,7 @@ channels = ["#osu", "#chinese"]
         for y in 4..=7 {
             let cell = buffer.cell((SIDEBAR_WIDTH, y)).unwrap();
             assert_eq!(cell.symbol(), "┃", "accent missing on row {y}");
-            assert_eq!(cell.fg, ACCENT, "accent color wrong on row {y}");
+            assert_eq!(cell.fg, GLOBAL_BG, "accent color wrong on row {y}");
         }
         assert_eq!(buffer.cell((SIDEBAR_WIDTH + 2, 5)).unwrap().bg, INPUT_BG);
     }
@@ -426,6 +449,27 @@ channels = ["#osu", "#chinese"]
         assert_eq!(buffer.cell((SIDEBAR_WIDTH, 8)).unwrap().symbol(), "▀");
         assert_eq!(buffer.cell((SIDEBAR_WIDTH, 8)).unwrap().fg, INPUT_BG);
         assert_eq!(buffer.cell((0, 8)).unwrap().symbol(), " "); // sidebar untouched
-        assert_eq!(buffer.cell((SIDEBAR_WIDTH, 9)).unwrap().symbol(), " ");
+        // Row 9 (the blank gap row): the sidebar separator `│` continues, but
+        // the main content area is blank.
+        assert_eq!(buffer.cell((SIDEBAR_WIDTH, 9)).unwrap().symbol(), "│");
+        assert_eq!(buffer.cell((SIDEBAR_WIDTH + 2, 9)).unwrap().symbol(), " ");
+    }
+
+    #[test]
+    fn separator_and_background_colors() {
+        // Arrange
+        let app = App::new(24, 3);
+        let config = test_config();
+
+        // Act
+        let buffer = render_sized(&app, &config, "", 50, 10);
+
+        // Assert: a thin gray `│` separates sidebar and main on the message
+        // rows (where the composer's `┃` doesn't override it).
+        assert_eq!(buffer.cell((SIDEBAR_WIDTH, 1)).unwrap().symbol(), "│");
+        assert_eq!(buffer.cell((SIDEBAR_WIDTH, 1)).unwrap().fg, SEPARATOR);
+        // The global background fills every non-composer region.
+        assert_eq!(buffer.cell((0, 5)).unwrap().bg, GLOBAL_BG); // sidebar blank
+        assert_eq!(buffer.cell((SIDEBAR_WIDTH + 5, 9)).unwrap().bg, GLOBAL_BG); // gap blank
     }
 }
