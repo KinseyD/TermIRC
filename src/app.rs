@@ -19,6 +19,9 @@ pub const MAX_MESSAGES: usize = 5000;
 /// only a few hundred rows on top of this cap.
 pub const MAX_LINES: usize = 50_000;
 
+/// Maximum input buffer length, in chars.
+pub const MAX_INPUT: usize = 512;
+
 pub struct App {
     messages: Vec<ChatMessage>,
     message_cap: usize,
@@ -29,6 +32,10 @@ pub struct App {
     /// First visible content row (0 = top).
     scroll_offset: u16,
     running: bool,
+    /// Text the user is typing in the composer (not sent anywhere).
+    input: String,
+    /// Cursor position as a char index into `input`.
+    input_cursor: usize,
 }
 
 impl App {
@@ -46,6 +53,8 @@ impl App {
             viewport_height,
             scroll_offset: 0,
             running: true,
+            input: String::new(),
+            input_cursor: 0,
         }
     }
 
@@ -122,6 +131,67 @@ impl App {
     /// The stored messages, oldest first.
     pub fn messages(&self) -> &[ChatMessage] {
         &self.messages
+    }
+
+    // ----- composer input (receive-only: no sending) -----
+
+    /// The text currently typed in the composer.
+    pub fn input(&self) -> &str {
+        &self.input
+    }
+
+    /// Cursor position as a char index.
+    pub fn input_cursor(&self) -> usize {
+        self.input_cursor
+    }
+
+    /// Insert a character at the cursor (subject to MAX_INPUT).
+    pub fn type_char(&mut self, c: char) {
+        if self.input.chars().count() >= MAX_INPUT {
+            return;
+        }
+        match self.input.char_indices().nth(self.input_cursor) {
+            Some((byte, _)) => self.input.insert(byte, c),
+            None => self.input.push(c),
+        }
+        self.input_cursor += 1;
+    }
+
+    /// Delete the character before the cursor.
+    pub fn backspace(&mut self) {
+        if self.input_cursor == 0 {
+            return;
+        }
+        let idx = self.input_cursor - 1;
+        if let Some((byte, _)) = self.input.char_indices().nth(idx) {
+            self.input.remove(byte);
+            self.input_cursor = idx;
+        }
+    }
+
+    /// Delete the character at the cursor.
+    pub fn delete(&mut self) {
+        if let Some((byte, _)) = self.input.char_indices().nth(self.input_cursor) {
+            self.input.remove(byte);
+        }
+    }
+
+    pub fn cursor_left(&mut self) {
+        self.input_cursor = self.input_cursor.saturating_sub(1);
+    }
+
+    pub fn cursor_right(&mut self) {
+        if self.input_cursor < self.input.chars().count() {
+            self.input_cursor += 1;
+        }
+    }
+
+    pub fn cursor_home(&mut self) {
+        self.input_cursor = 0;
+    }
+
+    pub fn cursor_end(&mut self) {
+        self.input_cursor = self.input.chars().count();
     }
 
     fn page_step(&self) -> u16 {
@@ -393,5 +463,121 @@ mod tests {
         assert_eq!(app.total_height(), 8);
         assert!(app.scroll_offset() <= app.max_offset());
         assert_eq!(app.scroll_offset(), 0);
+    }
+
+    #[test]
+    fn type_char_inserts_at_cursor_and_advances() {
+        // Arrange
+        let mut app = App::new(40, 10);
+
+        // Act
+        app.type_char('h');
+        app.type_char('i');
+
+        // Assert
+        assert_eq!(app.input(), "hi");
+        assert_eq!(app.input_cursor(), 2);
+    }
+
+    #[test]
+    fn type_char_inserts_in_the_middle_at_cursor() {
+        // Arrange
+        let mut app = App::new(40, 10);
+        app.type_char('a');
+        app.type_char('c');
+        app.cursor_left(); // cursor between a and c
+
+        // Act
+        app.type_char('b');
+
+        // Assert
+        assert_eq!(app.input(), "abc");
+        assert_eq!(app.input_cursor(), 2);
+    }
+
+    #[test]
+    fn backspace_deletes_behind_cursor() {
+        // Arrange
+        let mut app = App::new(40, 10);
+        app.type_char('h');
+        app.type_char('i');
+
+        // Act
+        app.backspace();
+
+        // Assert
+        assert_eq!(app.input(), "h");
+        assert_eq!(app.input_cursor(), 1);
+    }
+
+    #[test]
+    fn backspace_at_start_is_a_noop() {
+        let mut app = App::new(40, 10);
+        app.backspace();
+        assert_eq!(app.input(), "");
+        assert_eq!(app.input_cursor(), 0);
+    }
+
+    #[test]
+    fn delete_removes_char_at_cursor() {
+        // Arrange
+        let mut app = App::new(40, 10);
+        app.type_char('a');
+        app.type_char('b');
+        app.type_char('c');
+        app.cursor_home(); // cursor before 'a'
+
+        // Act
+        app.delete();
+
+        // Assert
+        assert_eq!(app.input(), "bc");
+        assert_eq!(app.input_cursor(), 0);
+    }
+
+    #[test]
+    fn cursor_left_right_clamp_at_bounds() {
+        let mut app = App::new(40, 10);
+        app.type_char('a');
+        app.type_char('b');
+        // at end (2): left -> 1, left -> 0, left -> 0 (clamp)
+        app.cursor_left();
+        assert_eq!(app.input_cursor(), 1);
+        app.cursor_left();
+        assert_eq!(app.input_cursor(), 0);
+        app.cursor_left();
+        assert_eq!(app.input_cursor(), 0);
+        // right -> 1, right -> 2, right -> 2 (clamp)
+        app.cursor_right();
+        assert_eq!(app.input_cursor(), 1);
+        app.cursor_right();
+        assert_eq!(app.input_cursor(), 2);
+        app.cursor_right();
+        assert_eq!(app.input_cursor(), 2);
+    }
+
+    #[test]
+    fn cursor_home_and_end() {
+        let mut app = App::new(40, 10);
+        app.type_char('a');
+        app.type_char('b');
+        app.type_char('c');
+        app.cursor_home();
+        assert_eq!(app.input_cursor(), 0);
+        app.cursor_end();
+        assert_eq!(app.input_cursor(), 3);
+    }
+
+    #[test]
+    fn type_beyond_max_input_is_capped() {
+        // Arrange
+        let mut app = App::new(40, 10);
+        for _ in 0..(MAX_INPUT + 10) {
+            app.type_char('x');
+        }
+
+        // Assert: never exceeds the cap; cursor sits at the end.
+        assert_eq!(app.input().chars().count(), MAX_INPUT);
+        assert_eq!(app.input_cursor(), MAX_INPUT);
     }
 }

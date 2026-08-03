@@ -66,6 +66,7 @@ fn run(
     let mut app = App::new(
         size.width
             .saturating_sub(ui::SIDEBAR_WIDTH)
+            .saturating_sub(ui::SEPARATOR_GAP)
             .saturating_sub(2 * ui::HORIZONTAL_PAD),
         size.height
             .saturating_sub(ui::TITLE_ROWS)
@@ -89,16 +90,30 @@ fn run(
                 Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                     KeyCode::PageUp => app.scroll_page_up(),
                     KeyCode::PageDown => app.scroll_page_down(),
-                    KeyCode::Char('q') | KeyCode::Esc => app.quit(),
-                    // Raw mode disables SIGINT, so Ctrl+C arrives as a key event.
+                    // Quit: Esc or Ctrl+C. (`q` now types into the composer.)
+                    KeyCode::Esc => app.quit(),
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         app.quit()
                     }
+                    // Composer input (receive-only: Enter does not send).
+                    KeyCode::Char(c)
+                        if !key.modifiers.contains(KeyModifiers::CONTROL) && !c.is_control() =>
+                    {
+                        app.type_char(c)
+                    }
+                    KeyCode::Backspace => app.backspace(),
+                    KeyCode::Delete => app.delete(),
+                    KeyCode::Left => app.cursor_left(),
+                    KeyCode::Right => app.cursor_right(),
+                    KeyCode::Home => app.cursor_home(),
+                    KeyCode::End => app.cursor_end(),
+                    KeyCode::Enter => {}
                     _ => {}
                 },
                 Event::Resize(width, height) => app.resize(
                     width
                         .saturating_sub(ui::SIDEBAR_WIDTH)
+                        .saturating_sub(ui::SEPARATOR_GAP)
                         .saturating_sub(2 * ui::HORIZONTAL_PAD),
                     height
                         .saturating_sub(ui::TITLE_ROWS)

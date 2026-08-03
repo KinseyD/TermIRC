@@ -25,7 +25,7 @@ There is exactly one blank line between two messages (never a trailing one).
 |-----|--------|
 | `PgUp` | scroll up by ⅓ of the window height |
 | `PgDn` | scroll down by ⅓ of the window height |
-| `q` / `Esc` / `Ctrl+C` | quit |
+| `Esc` / `Ctrl+C` | quit (typing `q` inserts `q` into the composer) |
 
 Connection status is shown on the pane's bottom border. If the server drops
 the connection, the status changes to `disconnected from …` (or an error
