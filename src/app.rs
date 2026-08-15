@@ -49,10 +49,31 @@ impl ChannelState {
     }
 }
 
+/// Which region currently holds the keyboard focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    Sidebar,
+    Messages,
+    Composer,
+}
+
+/// One visible row of the server/channel sidebar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidebarRow {
+    pub server: String,
+    /// `None` for a server header row, `Some(channel)` for a channel row.
+    pub channel: Option<String>,
+}
+
 pub struct App {
     /// Registered channels in sidebar order; `active` indexes the viewed one.
     channels: Vec<ChannelState>,
     active: usize,
+    focus: Focus,
+    /// Sidebar cursor (visible-row index), present only while the sidebar is focused.
+    sidebar_cursor: Option<usize>,
+    /// Lower-cased names of servers whose channel lists are collapsed.
+    collapsed: std::collections::BTreeSet<String>,
     width: u16,
     viewport_height: u16,
     running: bool,
@@ -73,6 +94,9 @@ impl App {
         App {
             channels: Vec::new(),
             active: 0,
+            focus: Focus::Composer,
+            sidebar_cursor: None,
+            collapsed: std::collections::BTreeSet::new(),
             width,
             viewport_height,
             running: true,
@@ -333,6 +357,137 @@ impl App {
         } else {
             state.scroll_offset.min(max)
         };
+    }
+
+    // ----- focus & sidebar -----
+
+    /// The region that currently holds keyboard focus.
+    pub fn focus(&self) -> Focus {
+        self.focus
+    }
+
+    /// Move focus: Composer -> Sidebar -> Messages -> Composer. Entering the
+    /// sidebar places the cursor on its first row.
+    pub fn tab(&mut self) {
+        self.focus = match self.focus {
+            Focus::Composer => {
+                if self.channels.is_empty() {
+                    Focus::Composer // nothing to navigate without channels
+                } else {
+                    if self.sidebar_cursor.is_none() {
+                        self.sidebar_cursor = Some(0);
+                    }
+                    Focus::Sidebar
+                }
+            }
+            Focus::Sidebar => Focus::Messages,
+            Focus::Messages => Focus::Composer,
+        };
+    }
+
+    /// One visible row of the sidebar (a server header, or one of its channels).
+    pub fn sidebar_rows(&self) -> Vec<SidebarRow> {
+        // Servers in first-appearance order, each followed by its channels
+        // unless collapsed.
+        let mut servers: Vec<&str> = Vec::new();
+        for state in &self.channels {
+            if !servers
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case(&state.server))
+            {
+                servers.push(&state.server);
+            }
+        }
+        let mut rows = Vec::new();
+        for server in servers {
+            rows.push(SidebarRow {
+                server: server.to_string(),
+                channel: None,
+            });
+            if self.server_collapsed(server) {
+                continue;
+            }
+            for state in &self.channels {
+                if state.server.eq_ignore_ascii_case(server) {
+                    rows.push(SidebarRow {
+                        server: server.to_string(),
+                        channel: Some(state.channel.clone()),
+                    });
+                }
+            }
+        }
+        rows
+    }
+
+    /// The sidebar cursor row, present only while the sidebar has focus.
+    pub fn sidebar_cursor(&self) -> Option<usize> {
+        self.sidebar_cursor
+    }
+
+    /// Move the sidebar cursor down one visible row (no-op unless focused).
+    pub fn sidebar_down(&mut self) {
+        self.move_sidebar_cursor(|c, len| (c + 1).min(len - 1));
+    }
+
+    /// Move the sidebar cursor up one visible row (no-op unless focused).
+    pub fn sidebar_up(&mut self) {
+        self.move_sidebar_cursor(|c, _| c.saturating_sub(1));
+    }
+
+    /// Whether a server's channel list is collapsed.
+    pub fn server_collapsed(&self, server: &str) -> bool {
+        self.collapsed.contains(&server.to_lowercase())
+    }
+
+    /// Interact with the row under the sidebar cursor: on a server row,
+    /// collapse/expand its channel list; on a channel row, switch the message
+    /// pane to it and return focus to the composer.
+    pub fn sidebar_enter(&mut self) {
+        if self.focus != Focus::Sidebar {
+            return;
+        }
+        let Some(cursor) = self.sidebar_cursor else {
+            return;
+        };
+        let rows = self.sidebar_rows();
+        let Some(row) = rows.get(cursor) else {
+            return;
+        };
+        match &row.channel {
+            None => self.toggle_server_collapse(&row.server),
+            Some(channel) => {
+                if let Some(idx) = self.find_channel(&row.server, channel) {
+                    self.select_channel(idx);
+                    self.focus = Focus::Composer;
+                    self.sidebar_cursor = None;
+                }
+            }
+        }
+    }
+
+    fn toggle_server_collapse(&mut self, server: &str) {
+        let key = server.to_lowercase();
+        if self.collapsed.remove(&key) {
+            return;
+        }
+        self.collapsed.insert(key);
+        // Collapse shortens the row list; keep the cursor within bounds.
+        let len = self.sidebar_rows().len().max(1);
+        if let Some(cursor) = self.sidebar_cursor {
+            self.sidebar_cursor = Some(cursor.min(len - 1));
+        }
+    }
+
+    fn move_sidebar_cursor(&mut self, step: impl Fn(usize, usize) -> usize) {
+        if self.focus != Focus::Sidebar {
+            return;
+        }
+        let len = self.sidebar_rows().len();
+        if len == 0 {
+            return;
+        }
+        let cursor = self.sidebar_cursor.unwrap_or(0);
+        self.sidebar_cursor = Some(step(cursor, len).min(len - 1));
     }
 }
 
@@ -806,5 +961,141 @@ mod tests {
 
         // Assert
         assert_eq!(app.total_height(), height);
+    }
+
+    // ----- focus & sidebar -----
+
+    #[test]
+    fn tab_cycles_composer_sidebar_messages() {
+        let mut app = App::new(40, 10);
+        app.open_channel("srv", "#a");
+
+        assert_eq!(app.focus(), Focus::Composer);
+        app.tab();
+        assert_eq!(app.focus(), Focus::Sidebar);
+        app.tab();
+        assert_eq!(app.focus(), Focus::Messages);
+        app.tab();
+        assert_eq!(app.focus(), Focus::Composer);
+    }
+
+    #[test]
+    fn tab_into_sidebar_places_cursor_on_first_row() {
+        let mut app = App::new(40, 10);
+        app.open_channel("srv", "#a");
+        app.tab();
+        assert_eq!(app.sidebar_cursor(), Some(0));
+        // Leaving the sidebar keeps the cursor position for the next visit.
+        app.tab();
+        assert_eq!(app.focus(), Focus::Messages);
+        assert_eq!(app.sidebar_cursor(), Some(0));
+    }
+
+    #[test]
+    fn sidebar_jk_moves_cursor_and_clamps() {
+        // Arrange: one server with two channels -> 3 visible rows.
+        let mut app = App::new(40, 10);
+        app.open_channel("srv", "#a");
+        app.open_channel("srv", "#b");
+        app.tab();
+
+        // Act / Assert
+        app.sidebar_down();
+        assert_eq!(app.sidebar_cursor(), Some(1));
+        app.sidebar_down();
+        assert_eq!(app.sidebar_cursor(), Some(2));
+        app.sidebar_down();
+        assert_eq!(app.sidebar_cursor(), Some(2)); // clamped
+        app.sidebar_up();
+        app.sidebar_up();
+        app.sidebar_up();
+        assert_eq!(app.sidebar_cursor(), Some(0)); // clamped
+    }
+
+    #[test]
+    fn sidebar_jk_ignored_when_sidebar_not_focused() {
+        let mut app = App::new(40, 10);
+        app.open_channel("srv", "#a");
+        app.sidebar_down(); // focus is Composer - no-op
+        assert_eq!(app.sidebar_cursor(), None);
+    }
+
+    #[test]
+    fn sidebar_enter_on_server_row_toggles_collapse() {
+        // Arrange: rows = [srv, #a, #b]
+        let mut app = App::new(40, 10);
+        app.open_channel("srv", "#a");
+        app.open_channel("srv", "#b");
+        app.tab();
+
+        // Act: collapse, then expand.
+        app.sidebar_enter();
+        assert!(app.server_collapsed("srv"));
+        assert_eq!(app.sidebar_rows().len(), 1); // only the server row remains
+        app.sidebar_enter();
+        assert!(!app.server_collapsed("srv"));
+        assert_eq!(app.sidebar_rows().len(), 3);
+    }
+
+    #[test]
+    fn collapsing_keeps_cursor_on_the_server_row() {
+        // Arrange: cursor on the server header row (row 0).
+        let mut app = App::new(40, 10);
+        app.open_channel("srv", "#a");
+        app.open_channel("srv", "#b");
+        app.tab();
+        assert_eq!(app.sidebar_cursor(), Some(0));
+
+        // Act: collapse via Enter on the server row.
+        app.sidebar_enter();
+
+        // Assert: the cursor stays on the (now only) server row and is valid.
+        assert_eq!(app.sidebar_rows().len(), 1);
+        assert_eq!(app.sidebar_cursor(), Some(0));
+    }
+
+    #[test]
+    fn collapse_moves_a_cursor_stranded_past_the_end() {
+        // Arrange: two servers [s1, #a, s2, #b]; cursor on #b (row 3), then
+        // walk it back to s1's header (row 0) before collapsing s1.
+        let mut app = App::new(40, 10);
+        app.open_channel("s1", "#a");
+        app.open_channel("s2", "#b");
+        app.tab();
+        app.sidebar_down();
+        app.sidebar_down();
+        app.sidebar_down();
+        assert_eq!(app.sidebar_cursor(), Some(3)); // on #b
+
+        // Act: collapse s1 (cursor walked to its header at row 0).
+        app.sidebar_up();
+        app.sidebar_up();
+        app.sidebar_up();
+        app.sidebar_enter();
+
+        // Assert: rows shrink to [s1, s2, #b]; the cursor is valid and clamped.
+        assert_eq!(app.sidebar_rows().len(), 3);
+        assert_eq!(app.sidebar_cursor(), Some(0));
+    }
+
+    #[test]
+    fn sidebar_enter_on_channel_switches_view_and_focuses_composer() {
+        // Arrange: rows = [srv, #a, #b]; cursor on #b.
+        let mut app = App::new(40, 10);
+        app.open_channel("srv", "#a");
+        app.open_channel("srv", "#b");
+        app.push_message(chan_msg("srv", "#a", "hello a"));
+        app.tab();
+        app.sidebar_down();
+        app.sidebar_down();
+
+        // Act
+        app.sidebar_enter();
+
+        // Assert: view switched to #b, focus returned to the composer.
+        assert_eq!(app.active_channel(), ("srv", "#b"));
+        assert_eq!(app.messages().len(), 0);
+        assert_eq!(app.focus(), Focus::Composer);
+        assert_eq!(app.sidebar_cursor(), None);
     }
 }
