@@ -5,27 +5,38 @@ use irc::client::prelude::{Command, Message};
 /// A single chat message to display, extracted from an IRC PRIVMSG.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatMessage {
+    /// Config key of the server the message came through.
+    pub server: String,
+    /// Channel the message was addressed to (target as received).
+    pub channel: String,
     pub nick: String,
     pub text: String,
 }
 
 impl ChatMessage {
-    /// Extract a chat message from a protocol message addressed to `channel`.
+    /// Extract a chat message from a protocol message addressed to any of
+    /// `channels` on `server`.
     ///
-    /// Returns `None` for anything that is not a PRIVMSG targeted at the
-    /// channel we are viewing (DMs to our own nick, other channels), anything
-    /// without an identifiable user as its source (server notices, numerics),
-    /// and non-ACTION CTCP queries. `/me` actions render as `* <text>`.
-    pub fn from_proto(msg: &Message, channel: &str) -> Option<ChatMessage> {
+    /// Returns `None` for anything that is not a PRIVMSG targeted at one of
+    /// the joined channels (DMs to our own nick, unconfigured channels),
+    /// anything without an identifiable user as its source (server notices,
+    /// numerics), and non-ACTION CTCP queries. `/me` actions render as
+    /// `* <text>`.
+    pub fn from_proto(msg: &Message, server: &str, channels: &[String]) -> Option<ChatMessage> {
         let Command::PRIVMSG(target, body) = &msg.command else {
             return None;
         };
-        if !target.eq_ignore_ascii_case(channel) {
-            return None; // DMs to our nick and other channels are not channel chat
+        if !channels.iter().any(|c| target.eq_ignore_ascii_case(c)) {
+            return None; // DMs to our nick and unconfigured channels are not channel chat
         }
         let nick = msg.source_nickname()?.to_string();
         let text = display_text(body)?;
-        Some(ChatMessage { nick, text })
+        Some(ChatMessage {
+            server: server.to_string(),
+            channel: target.clone(),
+            nick,
+            text,
+        })
     }
 }
 
@@ -47,7 +58,11 @@ fn display_text(body: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    const CHANNEL: &str = "#osu";
+    const SERVER: &str = "osu_irc";
+
+    fn channels() -> Vec<String> {
+        vec!["#osu".to_string(), "#chinese".to_string()]
+    }
 
     #[test]
     fn privmsg_with_full_nickmask_yields_nick_and_text() {
@@ -55,12 +70,14 @@ mod tests {
         let msg: Message = ":alice!a@b PRIVMSG #osu :hello world".parse().unwrap();
 
         // Act
-        let chat = ChatMessage::from_proto(&msg, CHANNEL);
+        let chat = ChatMessage::from_proto(&msg, SERVER, &channels());
 
         // Assert
         assert_eq!(
             chat,
             Some(ChatMessage {
+                server: "osu_irc".to_string(),
+                channel: "#osu".to_string(),
                 nick: "alice".to_string(),
                 text: "hello world".to_string(),
             })
@@ -75,42 +92,56 @@ mod tests {
             .unwrap();
 
         // Act
-        let chat = ChatMessage::from_proto(&msg, CHANNEL);
+        let chat = ChatMessage::from_proto(&msg, SERVER, &channels());
 
         // Assert
         assert_eq!(chat.unwrap().nick, "Bubble_Shark");
     }
 
     #[test]
-    fn channel_target_match_is_case_insensitive() {
+    fn channel_match_is_case_insensitive_and_keeps_received_case() {
         // Arrange: IRC channel names compare case-insensitively.
         let msg: Message = ":alice!a@b PRIVMSG #OSU :hi".parse().unwrap();
 
         // Act
-        let chat = ChatMessage::from_proto(&msg, "#osu");
+        let chat = ChatMessage::from_proto(&msg, SERVER, &channels());
 
         // Assert
-        assert!(chat.is_some());
+        let chat = chat.unwrap();
+        assert_eq!(chat.channel, "#OSU");
+        assert_eq!(chat.server, "osu_irc");
     }
 
     #[test]
-    fn privmsg_to_a_private_nick_is_ignored() {
-        // Arrange: a DM/whisper targets our nick, not the channel.
+    fn any_configured_channel_is_accepted() {
+        // Arrange: a message to the second configured channel.
+        let msg: Message = ":alice!a@b PRIVMSG #chinese :ni hao".parse().unwrap();
+
+        // Act
+        let chat = ChatMessage::from_proto(&msg, SERVER, &channels());
+
+        // Assert
+        assert_eq!(chat.unwrap().channel, "#chinese");
+    }
+
+    #[test]
+    fn privmsg_to_private_nick_is_ignored() {
+        // Arrange: a DM/whisper targets our nick, not a channel.
         let msg: Message = ":BanchoBot!bot@ppy.sh PRIVMSG Bubble_Shark :your rank is #1234"
             .parse()
             .unwrap();
 
         // Act & Assert
-        assert_eq!(ChatMessage::from_proto(&msg, CHANNEL), None);
+        assert_eq!(ChatMessage::from_proto(&msg, SERVER, &channels()), None);
     }
 
     #[test]
-    fn privmsg_to_another_channel_is_ignored() {
+    fn privmsg_to_unconfigured_channel_is_ignored() {
         // Arrange
-        let msg: Message = ":alice!a@b PRIVMSG #chinese :ni hao".parse().unwrap();
+        let msg: Message = ":alice!a@b PRIVMSG #other :hi".parse().unwrap();
 
         // Act & Assert
-        assert_eq!(ChatMessage::from_proto(&msg, CHANNEL), None);
+        assert_eq!(ChatMessage::from_proto(&msg, SERVER, &channels()), None);
     }
 
     #[test]
@@ -121,12 +152,14 @@ mod tests {
             .unwrap();
 
         // Act
-        let chat = ChatMessage::from_proto(&msg, CHANNEL);
+        let chat = ChatMessage::from_proto(&msg, SERVER, &channels());
 
         // Assert
         assert_eq!(
             chat,
             Some(ChatMessage {
+                server: "osu_irc".to_string(),
+                channel: "#osu".to_string(),
                 nick: "alice".to_string(),
                 text: "* dances".to_string(),
             })
@@ -139,7 +172,7 @@ mod tests {
         let msg: Message = ":alice!a@b PRIVMSG #osu :\x01VERSION\x01".parse().unwrap();
 
         // Act & Assert
-        assert_eq!(ChatMessage::from_proto(&msg, CHANNEL), None);
+        assert_eq!(ChatMessage::from_proto(&msg, SERVER, &channels()), None);
     }
 
     #[test]
@@ -148,7 +181,7 @@ mod tests {
         let msg: Message = ":alice!a@b NOTICE #osu :hi".parse().unwrap();
 
         // Act & Assert
-        assert_eq!(ChatMessage::from_proto(&msg, CHANNEL), None);
+        assert_eq!(ChatMessage::from_proto(&msg, SERVER, &channels()), None);
     }
 
     #[test]
@@ -159,7 +192,7 @@ mod tests {
             .unwrap();
 
         // Act & Assert
-        assert_eq!(ChatMessage::from_proto(&msg, CHANNEL), None);
+        assert_eq!(ChatMessage::from_proto(&msg, SERVER, &channels()), None);
     }
 
     #[test]
@@ -168,7 +201,7 @@ mod tests {
         let msg: Message = ":cho.ppy.sh PRIVMSG #osu :hello".parse().unwrap();
 
         // Act & Assert
-        assert_eq!(ChatMessage::from_proto(&msg, CHANNEL), None);
+        assert_eq!(ChatMessage::from_proto(&msg, SERVER, &channels()), None);
     }
 
     #[test]
@@ -177,7 +210,7 @@ mod tests {
         let msg: Message = ":srv 001 me :Welcome".parse().unwrap();
 
         // Act & Assert
-        assert_eq!(ChatMessage::from_proto(&msg, CHANNEL), None);
+        assert_eq!(ChatMessage::from_proto(&msg, SERVER, &channels()), None);
     }
 
     #[test]
@@ -186,7 +219,7 @@ mod tests {
         let msg: Message = ":alice!a@b PRIVMSG #osu :hello\r".parse().unwrap();
 
         // Act
-        let chat = ChatMessage::from_proto(&msg, CHANNEL);
+        let chat = ChatMessage::from_proto(&msg, SERVER, &channels());
 
         // Assert
         assert_eq!(chat.unwrap().text, "hello");

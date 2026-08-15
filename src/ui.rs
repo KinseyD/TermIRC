@@ -354,6 +354,8 @@ mod tests {
 
     fn msg(nick: &str, text: &str) -> ChatMessage {
         ChatMessage {
+            server: "srv".to_string(),
+            channel: "#c".to_string(),
             nick: nick.to_string(),
             text: text.to_string(),
         }

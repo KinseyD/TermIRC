@@ -24,7 +24,7 @@ fn server_config_for(port: u16) -> ServerConfig {
         server: "127.0.0.1".to_string(),
         use_tls: false,
         port,
-        channels: vec!["#test".to_string()],
+        channels: vec!["#test".to_string(), "#test2".to_string()],
     }
 }
 
@@ -110,7 +110,12 @@ fn connects_sends_pass_before_nick_and_joins_target_channel() {
     let (tx, _rx) = mpsc::channel();
 
     // Act
-    let _handle = spawn_irc(server_config_for(port), "#test".to_string(), tx);
+    let _handle = spawn_irc(
+        server_config_for(port),
+        "osu_irc".to_string(),
+        server_config_for(port).channels,
+        tx,
+    );
     let lines = collect_client_lines_until(&lines_rx, |l| l.starts_with("JOIN"));
 
     // Assert
@@ -130,13 +135,52 @@ fn connects_sends_pass_before_nick_and_joins_target_channel() {
 }
 
 #[test]
+fn joins_all_configured_channels() {
+    // Arrange: the server config lists two channels.
+    let (port, lines_rx) = spawn_mock_server();
+    let (tx, _rx) = mpsc::channel();
+
+    // Act: collect until both JOINs have been sent (or the timeout elapses).
+    let _handle = spawn_irc(
+        server_config_for(port),
+        "osu_irc".to_string(),
+        server_config_for(port).channels,
+        tx,
+    );
+    let joins = std::cell::Cell::new(0);
+    let lines = collect_client_lines_until(&lines_rx, |l| {
+        if l.starts_with("JOIN") {
+            joins.set(joins.get() + 1);
+            joins.get() >= 2
+        } else {
+            false
+        }
+    });
+
+    // Assert: every configured channel is joined.
+    assert!(
+        lines.iter().any(|l| l.starts_with("JOIN #test")),
+        "no JOIN #test in {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.starts_with("JOIN #test2")),
+        "no JOIN #test2 in {lines:?}"
+    );
+}
+
+#[test]
 fn forwards_privmsg_as_chat_message() {
     // Arrange
     let (port, _lines_rx) = spawn_mock_server();
     let (tx, rx) = mpsc::channel();
 
     // Act
-    let _handle = spawn_irc(server_config_for(port), "#test".to_string(), tx);
+    let _handle = spawn_irc(
+        server_config_for(port),
+        "osu_irc".to_string(),
+        server_config_for(port).channels,
+        tx,
+    );
 
     // Assert: skipping the status event, the PRIVMSG arrives as a ChatMessage.
     let deadline = std::time::Instant::now() + RECV_TIMEOUT;
@@ -154,6 +198,8 @@ fn forwards_privmsg_as_chat_message() {
     assert_eq!(
         chat,
         Some(ChatMessage {
+            server: "osu_irc".to_string(),
+            channel: "#test".to_string(),
             nick: "alice".to_string(),
             text: "hello world".to_string(),
         })
@@ -167,7 +213,12 @@ fn client_answers_server_ping_with_pong() {
     let (tx, _rx) = mpsc::channel();
 
     // Act: the mock sends PING right after the PRIVMSG.
-    let _handle = spawn_irc(server_config_for(port), "#test".to_string(), tx);
+    let _handle = spawn_irc(
+        server_config_for(port),
+        "osu_irc".to_string(),
+        server_config_for(port).channels,
+        tx,
+    );
     let lines = collect_client_lines_until(&lines_rx, |l| l.starts_with("PONG"));
 
     // Assert
@@ -223,7 +274,12 @@ fn reports_status_when_server_closes_connection() {
     let (tx, rx) = mpsc::channel();
 
     // Act
-    let _handle = spawn_irc(server_config_for(port), "#test".to_string(), tx);
+    let _handle = spawn_irc(
+        server_config_for(port),
+        "osu_irc".to_string(),
+        server_config_for(port).channels,
+        tx,
+    );
 
     // Assert: after the chat message, a disconnect notification must arrive —
     // the UI must never keep showing "connected" to a dead feed.
@@ -256,7 +312,12 @@ fn reports_error_when_connection_is_refused() {
     let (tx, rx) = mpsc::channel();
 
     // Act
-    let _handle = spawn_irc(server_config_for(port), "#test".to_string(), tx);
+    let _handle = spawn_irc(
+        server_config_for(port),
+        "osu_irc".to_string(),
+        server_config_for(port).channels,
+        tx,
+    );
 
     // Assert: the failed connect surfaces as an Error event, not silence.
     match rx.recv_timeout(RECV_TIMEOUT) {

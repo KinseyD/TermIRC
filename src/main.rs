@@ -58,9 +58,10 @@ fn run(
     server_name: &str,
 ) -> anyhow::Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
-    // The IRC thread is deliberately not joined: it blocks on network I/O and
-    // is reaped when the process exits.
-    let _irc_thread = spawn_irc(server, channel.clone(), tx);
+    // IRC threads are deliberately not joined: they block on network I/O and
+    // are reaped when the process exits.
+    let channels = server.channels.clone();
+    let _irc_thread = spawn_irc(server, server_name.to_string(), channels, tx);
 
     let s = terminal.size()?;
     let mut term_size = (s.width, s.height);

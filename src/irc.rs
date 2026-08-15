@@ -2,7 +2,8 @@
 //!
 //! The async `irc` crate needs a tokio runtime; we confine it to a single
 //! background thread with a cheap current-thread runtime and forward events
-//! to the synchronous UI loop over an `mpsc` channel.
+//! to the synchronous UI loop over an `mpsc` channel. One thread is spawned
+//! per configured server, each joining all of that server's channels.
 
 use std::sync::mpsc;
 use std::thread;
@@ -16,16 +17,17 @@ use crate::message::ChatMessage;
 /// Events produced by the IRC adapter thread.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IrcEvent {
-    /// A chat message received from the channel.
+    /// A chat message received from one of the joined channels.
     Message(ChatMessage),
-    /// Informational status (e.g. "connected to ...").
+    /// Informational status (e.g. "osu_irc: connected to irc.ppy.sh").
     Status(String),
     /// A connection or protocol error; the thread stops afterwards.
     Error(String),
 }
 
-/// Map our server settings onto the irc crate's client configuration.
-pub fn build_client_config(server: &ServerConfig, channel: &str) -> IrcClientConfig {
+/// Map our server settings onto the irc crate's client configuration,
+/// joining every channel in `channels`.
+pub fn build_client_config(server: &ServerConfig, channels: &[String]) -> IrcClientConfig {
     IrcClientConfig {
         nickname: Some(server.nickname.clone()),
         username: Some(server.username.clone()),
@@ -34,20 +36,22 @@ pub fn build_client_config(server: &ServerConfig, channel: &str) -> IrcClientCon
         port: Some(server.port),
         password: Some(server.password.clone()),
         use_tls: Some(server.use_tls),
-        channels: vec![channel.to_string()],
+        channels: channels.to_vec(),
         ..Default::default()
     }
 }
 
-/// Spawn the IRC client thread; events arrive on `tx`.
+/// Spawn the IRC client thread for one server; events arrive on `tx`.
 ///
-/// The thread connects, registers, joins the channel, and forwards chat
-/// messages until the connection ends. A terminal event is ALWAYS emitted on
-/// exit — `Status` for a clean close, `Error` otherwise — so the UI never
+/// `server_label` is the config key identifying the server in events and
+/// statuses. The thread connects, registers, joins all channels, and forwards
+/// chat messages until the connection ends. A terminal event is ALWAYS emitted
+/// on exit — `Status` for a clean close, `Error` otherwise — so the UI never
 /// keeps claiming "connected" to a dead feed.
 pub fn spawn_irc(
     server: ServerConfig,
-    channel: String,
+    server_label: String,
+    channels: Vec<String>,
     tx: mpsc::Sender<IrcEvent>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
@@ -57,23 +61,26 @@ pub fn spawn_irc(
         {
             Ok(runtime) => runtime,
             Err(e) => {
-                let _ = tx.send(IrcEvent::Error(format!("runtime init failed: {e}")));
+                let _ = tx.send(IrcEvent::Error(format!(
+                    "{server_label}: runtime init failed: {e}"
+                )));
                 return;
             }
         };
 
-        let server_name = server.server.clone();
-        let result = runtime.block_on(run_client(server, channel, &tx));
+        let host = server.server.clone();
+        let label = server_label.clone();
+        let result = runtime.block_on(run_client(server, &server_label, &channels, &tx));
         // `send` failing means the receiver is gone — the UI has quit and the
         // process is about to reap this thread; nothing to report anywhere.
         match result {
             Ok(()) => {
                 let _ = tx.send(IrcEvent::Status(format!(
-                    "disconnected from {server_name} (connection closed)"
+                    "{label}: disconnected from {host} (connection closed)"
                 )));
             }
             Err(e) => {
-                let _ = tx.send(IrcEvent::Error(e.to_string()));
+                let _ = tx.send(IrcEvent::Error(format!("{label}: {e}")));
             }
         }
     })
@@ -81,18 +88,22 @@ pub fn spawn_irc(
 
 async fn run_client(
     server: ServerConfig,
-    channel: String,
+    server_label: &str,
+    channels: &[String],
     tx: &mpsc::Sender<IrcEvent>,
 ) -> anyhow::Result<()> {
-    let mut client = Client::from_config(build_client_config(&server, &channel)).await?;
+    let mut client = Client::from_config(build_client_config(&server, channels)).await?;
     client.identify()?;
     let mut stream = client.stream()?;
-    let _ = tx.send(IrcEvent::Status(format!("connected to {}", server.server)));
+    let _ = tx.send(IrcEvent::Status(format!(
+        "{server_label}: connected to {}",
+        server.server
+    )));
 
     while let Some(result) = stream.next().await {
         match result {
             Ok(message) => {
-                if let Some(chat) = ChatMessage::from_proto(&message, &channel) {
+                if let Some(chat) = ChatMessage::from_proto(&message, server_label, channels) {
                     let _ = tx.send(IrcEvent::Message(chat));
                 }
             }
@@ -124,7 +135,7 @@ mod tests {
         let server = server_config();
 
         // Act
-        let client_config = build_client_config(&server, "#osu");
+        let client_config = build_client_config(&server, &server.channels);
 
         // Assert
         assert_eq!(client_config.server.as_deref(), Some("irc.example.org"));
@@ -136,15 +147,15 @@ mod tests {
     }
 
     #[test]
-    fn channels_contains_exactly_the_target_channel() {
+    fn joins_every_configured_channel() {
         // Arrange
         let server = server_config();
 
         // Act
-        let client_config = build_client_config(&server, "#osu");
+        let client_config = build_client_config(&server, &server.channels);
 
-        // Assert: only the one channel we actually connect to.
-        assert_eq!(client_config.channels, vec!["#osu".to_string()]);
+        // Assert: both channels are joined, in config order.
+        assert_eq!(client_config.channels, server.channels);
     }
 
     #[test]
@@ -153,7 +164,7 @@ mod tests {
         let server = server_config();
 
         // Act
-        let client_config = build_client_config(&server, "#osu");
+        let client_config = build_client_config(&server, &server.channels);
 
         // Assert
         assert_eq!(client_config.realname.as_deref(), Some("alice_"));
