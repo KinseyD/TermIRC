@@ -6,7 +6,7 @@
 //! user has scrolled up so that line leaves the window, the viewport stays put
 //! until they scroll back to the bottom.
 
-use crate::layout::{LayoutLine, layout_messages};
+use crate::layout::{LayoutLine, layout_messages, message_spans};
 use crate::message::ChatMessage;
 
 /// Maximum number of messages kept per channel; the oldest are dropped first.
@@ -31,6 +31,8 @@ struct ChannelState {
     lines: Vec<LayoutLine>,
     /// First visible content row (0 = top).
     scroll_offset: u16,
+    /// Selected message index (used while the message pane has focus).
+    selected: Option<usize>,
 }
 
 impl ChannelState {
@@ -41,6 +43,7 @@ impl ChannelState {
             messages: Vec::new(),
             lines: Vec::new(),
             scroll_offset: 0,
+            selected: None,
         }
     }
 
@@ -167,7 +170,10 @@ impl App {
             None => return,
         };
         if idx == self.active {
-            let was_at_bottom = self.is_at_bottom();
+            // Auto-follow is paused while the message pane has a selection, so
+            // the selected message stays put instead of being nudged by a new one.
+            let was_at_bottom = self.is_at_bottom()
+                && !(self.focus == Focus::Messages && self.selected().is_some());
             self.push_into(idx, message);
             self.relayout_active(was_at_bottom);
         } else {
@@ -182,6 +188,9 @@ impl App {
         if state.messages.len() > cap {
             let excess = state.messages.len() - cap;
             state.messages.drain(..excess);
+            if let Some(sel) = state.selected {
+                state.selected = Some(sel.saturating_sub(excess));
+            }
         }
     }
 
@@ -349,6 +358,9 @@ impl App {
         // oldest messages until the layout fits the line cap.
         while state.lines.len() > line_cap && state.messages.len() > 1 {
             state.messages.remove(0);
+            if let Some(sel) = state.selected {
+                state.selected = Some(sel.saturating_sub(1));
+            }
             state.lines = layout_messages(&state.messages, width);
         }
         let max = state.total_height().saturating_sub(viewport_height);
@@ -357,6 +369,101 @@ impl App {
         } else {
             state.scroll_offset.min(max)
         };
+    }
+
+    // ----- message selection (message pane) -----
+
+    /// The selected message index, when one is selected.
+    pub fn selected(&self) -> Option<usize> {
+        self.channels[self.active].selected
+    }
+
+    /// The selected message's row span `(start, height)` in the laid-out
+    /// coordinate system, or `None` when nothing is selected.
+    pub fn selected_span(&self) -> Option<(u16, u16)> {
+        let idx = self.channels[self.active].selected?;
+        message_spans(&self.channels[self.active].messages, self.width)
+            .get(idx)
+            .copied()
+    }
+
+    /// Move the selection to the next (newer) message, revealing it with the
+    /// minimal scroll. No-op unless the message pane has focus.
+    pub fn select_next(&mut self) {
+        if self.focus != Focus::Messages {
+            return;
+        }
+        self.ensure_selection();
+        let len = self.channels[self.active].messages.len();
+        if len == 0 {
+            return;
+        }
+        let next = self.channels[self.active]
+            .selected
+            .unwrap_or(0)
+            .min(len - 1);
+        self.channels[self.active].selected = Some((next + 1).min(len - 1));
+        self.reveal_selection();
+    }
+
+    /// Move the selection to the previous (older) message, revealing it with
+    /// the minimal scroll. No-op unless the message pane has focus.
+    pub fn select_prev(&mut self) {
+        if self.focus != Focus::Messages {
+            return;
+        }
+        self.ensure_selection();
+        let cur = self.channels[self.active].selected.unwrap_or(0);
+        self.channels[self.active].selected = Some(cur.saturating_sub(1));
+        self.reveal_selection();
+    }
+
+    /// Ensure a message is selected (when the pane has focus): the newest one
+    /// fully visible, or the newest message otherwise.
+    fn ensure_selection(&mut self) {
+        let width = self.width;
+        let viewport_height = self.viewport_height;
+        let state = &self.channels[self.active];
+        if state.selected.is_some_and(|i| i < state.messages.len()) {
+            return;
+        }
+        let spans = message_spans(&state.messages, width);
+        if spans.is_empty() {
+            return;
+        }
+        let off = state.scroll_offset;
+        let chosen = (0..spans.len())
+            .rev()
+            .find(|&i| {
+                let (start, h) = spans[i];
+                start >= off && start + h <= off + viewport_height
+            })
+            .unwrap_or(spans.len() - 1);
+        self.channels[self.active].selected = Some(chosen);
+    }
+
+    /// Scroll the minimum amount so the selected message is fully visible, and
+    /// clamp the offset once the layout is stable.
+    fn reveal_selection(&mut self) {
+        let idx = self.channels[self.active].selected;
+        let Some(idx) = idx else {
+            return;
+        };
+        let width = self.width;
+        let viewport_height = self.viewport_height;
+        let spans = message_spans(&self.channels[self.active].messages, width);
+        let Some(&(start, height)) = spans.get(idx) else {
+            return;
+        };
+        let end = start + height;
+        let state = &mut self.channels[self.active];
+        if start < state.scroll_offset {
+            state.scroll_offset = start;
+        } else if end > state.scroll_offset + viewport_height {
+            state.scroll_offset = end.saturating_sub(viewport_height);
+        }
+        let max = state.total_height().saturating_sub(viewport_height);
+        state.scroll_offset = state.scroll_offset.min(max);
     }
 
     // ----- focus & sidebar -----
@@ -380,7 +487,10 @@ impl App {
                     Focus::Sidebar
                 }
             }
-            Focus::Sidebar => Focus::Messages,
+            Focus::Sidebar => {
+                self.ensure_selection();
+                Focus::Messages
+            }
             Focus::Messages => Focus::Composer,
         };
     }
@@ -1097,5 +1207,131 @@ mod tests {
         assert_eq!(app.messages().len(), 0);
         assert_eq!(app.focus(), Focus::Composer);
         assert_eq!(app.sidebar_cursor(), None);
+    }
+
+    // ----- message selection -----
+
+    #[test]
+    fn no_selection_when_channel_is_empty() {
+        let mut app = App::new(40, 10);
+        app.open_channel("srv", "#a");
+        app.tab();
+        app.tab();
+        assert_eq!(app.focus(), Focus::Messages);
+        assert_eq!(app.selected(), None);
+    }
+
+    #[test]
+    fn focusing_messages_selects_lowest_fully_visible() {
+        // Arrange: 5 one-line messages in a 3-row viewport (total 9 rows, max 6).
+        // Spans: m0=(0) m1=(2) m2=(4) m3=(6) m4=(8); at the bottom (off=6) the
+        // fully-visible ones are m3 and m4, so m4 is selected.
+        let mut app = App::new(40, 3);
+        app.open_channel("srv", "#a");
+        for i in 0..5 {
+            app.push_message(chan_msg("srv", "#a", &format!("m{i}")));
+        }
+        assert_eq!(app.scroll_offset(), app.max_offset());
+
+        // Act
+        app.tab();
+        app.tab();
+
+        // Assert
+        assert_eq!(app.focus(), Focus::Messages);
+        assert_eq!(app.selected(), Some(4));
+        assert_eq!(app.selected_span(), Some((8, 1)));
+    }
+
+    #[test]
+    fn select_prev_moves_up_and_reveals_with_minimal_scroll() {
+        // Arrange: as above, selected m4 (span (8,1)), offset 6.
+        let mut app = App::new(40, 3);
+        app.open_channel("srv", "#a");
+        for i in 0..5 {
+            app.push_message(chan_msg("srv", "#a", &format!("m{i}")));
+        }
+        app.tab();
+        app.tab();
+        assert_eq!(app.selected(), Some(4));
+
+        // Act / Assert
+        app.select_prev(); // -> m3 (span 6), fully visible, no scroll
+        assert_eq!(app.selected(), Some(3));
+        assert_eq!(app.scroll_offset(), 6);
+        app.select_prev(); // -> m2 (span 4), scroll up to reveal its top
+        assert_eq!(app.selected(), Some(2));
+        assert_eq!(app.scroll_offset(), 4);
+        app.select_prev(); // -> m1
+        assert_eq!(app.selected(), Some(1));
+        assert_eq!(app.scroll_offset(), 2);
+        app.select_prev(); // -> m0
+        assert_eq!(app.selected(), Some(0));
+        assert_eq!(app.scroll_offset(), 0);
+        app.select_prev(); // clamped at oldest
+        assert_eq!(app.selected(), Some(0));
+    }
+
+    #[test]
+    fn select_next_moves_down_and_clamps_at_newest() {
+        let mut app = App::new(40, 3);
+        app.open_channel("srv", "#a");
+        for i in 0..5 {
+            app.push_message(chan_msg("srv", "#a", &format!("m{i}")));
+        }
+        app.tab();
+        app.tab();
+        for _ in 0..4 {
+            app.select_prev();
+        }
+        assert_eq!(app.selected(), Some(0));
+
+        app.select_next();
+        assert_eq!(app.selected(), Some(1));
+        app.select_next();
+        assert_eq!(app.selected(), Some(2));
+        // jump repeatedly past the end clamps at the newest
+        for _ in 0..10 {
+            app.select_next();
+        }
+        assert_eq!(app.selected(), Some(4));
+        assert_eq!(app.scroll_offset(), app.max_offset());
+    }
+
+    #[test]
+    fn follow_is_paused_while_a_message_is_selected() {
+        // Arrange
+        let mut app = App::new(40, 3);
+        app.open_channel("srv", "#a");
+        for i in 0..4 {
+            app.push_message(chan_msg("srv", "#a", &format!("m{i}")));
+        }
+        app.tab();
+        app.tab();
+        let selected = app.selected().unwrap();
+        let offset = app.scroll_offset();
+
+        // Act: a new message arrives while a message is selected.
+        app.push_message(chan_msg("srv", "#a", "m4"));
+
+        // Assert: neither the viewport nor the selection was disturbed.
+        assert_eq!(app.scroll_offset(), offset);
+        assert_eq!(app.selected(), Some(selected));
+    }
+
+    #[test]
+    fn selection_ignored_when_messages_not_focused() {
+        // Arrange: selection changes are no-ops unless the message pane is focused.
+        let mut app = App::new(40, 3);
+        app.open_channel("srv", "#a");
+        app.push_message(chan_msg("srv", "#a", "m0"));
+        assert_eq!(app.focus(), Focus::Composer);
+
+        // Act
+        app.select_prev();
+        app.select_next();
+
+        // Assert
+        assert_eq!(app.selected(), None);
     }
 }

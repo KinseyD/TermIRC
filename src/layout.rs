@@ -83,6 +83,25 @@ pub fn wrap_body(text: &str, width: u16) -> Vec<String> {
     lines
 }
 
+/// Row span `(start, height)` of each message in the same coordinate system as
+/// `layout_messages` (i.e. including the blank separator rows between messages).
+/// The total row count implied by the spans equals `layout_messages(...).len()`.
+pub fn message_spans(messages: &[ChatMessage], width: u16) -> Vec<(u16, u16)> {
+    let mut spans = Vec::with_capacity(messages.len());
+    let mut row = 0u16;
+    for (i, message) in messages.iter().enumerate() {
+        if i > 0 {
+            row += 1; // blank separator row before this message
+        }
+        let indent = nick_column_width(&message.nick).min(width.saturating_sub(1));
+        let body_width = width.saturating_sub(indent).max(1);
+        let height = wrap_body(&message.text, body_width).len() as u16;
+        spans.push((row, height));
+        row += height;
+    }
+    spans
+}
+
 /// Lay out all messages for a viewport `width` columns wide.
 pub fn layout_messages(messages: &[ChatMessage], width: u16) -> Vec<LayoutLine> {
     let mut lines = Vec::new();
@@ -316,5 +335,48 @@ mod tests {
     fn input_line_count_zero_width_falls_back_to_one_column() {
         // Width 0 clamps to 1 column per line (cursor not at end, so no extra line).
         assert_eq!(input_line_count("abc", 0, 0), 3);
+    }
+
+    #[test]
+    fn message_spans_account_for_separator_rows() {
+        // Arrange: three one-line messages -> 3 rows + 2 separators = 5 rows.
+        let messages = vec![msg("a", "one"), msg("b", "two"), msg("c", "three")];
+
+        // Act
+        let spans = message_spans(&messages, 40);
+
+        // Assert: each message is one row, two separator rows between them.
+        assert_eq!(spans, vec![(0, 1), (2, 1), (4, 1)]);
+        assert_eq!(layout_messages(&messages, 40).len(), 5);
+    }
+
+    #[test]
+    fn message_spans_height_matches_wrapped_lines() {
+        // Arrange: nick "alice" -> indent 7, body width 11; message wraps to 2 rows.
+        let messages = vec![msg("alice", "one two three four five")];
+
+        // Act
+        let spans = message_spans(&messages, 20);
+
+        // Assert: one span with height 2, matching the 2 laid-out lines.
+        assert_eq!(spans, vec![(0, 2)]);
+        assert_eq!(layout_messages(&messages, 20).len(), 2);
+    }
+
+    #[test]
+    fn message_spans_total_matches_layout_messages_len() {
+        // Arrange
+        let messages = vec![
+            msg("alice", "one two three four five"),
+            msg("bob", "short"),
+            msg("carol", "another longer message over here"),
+        ];
+
+        // Act
+        let spans = message_spans(&messages, 24);
+        let total: u16 = spans.last().map(|&(s, h)| s + h).unwrap_or(0);
+
+        // Assert
+        assert_eq!(total as usize, layout_messages(&messages, 24).len());
     }
 }
