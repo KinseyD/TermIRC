@@ -115,6 +115,22 @@ pub fn layout_messages(messages: &[ChatMessage], width: u16) -> Vec<LayoutLine> 
     lines
 }
 
+/// Number of display lines the composer input occupies when hard-wrapped to
+/// `width` columns (at least one line), including a trailing line when the
+/// cursor sits at the end of a full line and needs room to sit on.
+pub fn input_line_count(text: &str, cursor: usize, width: u16) -> usize {
+    let width = usize::from(width.max(1));
+    let total = text.chars().count();
+    if total == 0 {
+        return 1;
+    }
+    let mut lines = total.div_ceil(width);
+    if cursor >= total && total.is_multiple_of(width) {
+        lines += 1;
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,5 +281,38 @@ mod tests {
             wrap_body("中文", 1),
             vec!["中".to_string(), "文".to_string()]
         );
+    }
+
+    #[test]
+    fn input_line_count_empty_is_one_line() {
+        assert_eq!(input_line_count("", 0, 10), 1);
+    }
+
+    #[test]
+    fn input_line_count_short_is_one_line() {
+        assert_eq!(input_line_count("hi", 2, 10), 1);
+    }
+
+    #[test]
+    fn input_line_count_wraps_to_multiple_lines() {
+        // 5 chars at width 2 -> ceil(5/2) = 3 lines (cursor not at a full-line end).
+        assert_eq!(input_line_count("abcde", 5, 2), 3);
+        // 4 chars at width 2 -> 2 lines when the cursor is not at the end.
+        assert_eq!(input_line_count("abcd", 2, 2), 2);
+    }
+
+    #[test]
+    fn input_line_count_cursor_at_end_of_full_line_adds_a_line() {
+        // 4 chars fill exactly 2 lines (width 2); the cursor at the end (index 4)
+        // needs its own line -> 3 lines.
+        assert_eq!(input_line_count("abcd", 4, 2), 3);
+        // Cursor before the end does not add a line.
+        assert_eq!(input_line_count("abcd", 3, 2), 2);
+    }
+
+    #[test]
+    fn input_line_count_zero_width_falls_back_to_one_column() {
+        // Width 0 clamps to 1 column per line (cursor not at end, so no extra line).
+        assert_eq!(input_line_count("abc", 0, 0), 3);
     }
 }

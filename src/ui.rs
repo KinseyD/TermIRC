@@ -36,11 +36,25 @@ pub const SEPARATOR_GAP: u16 = 2;
 pub const HORIZONTAL_PAD: u16 = 2;
 /// Rows taken by the channel title at the top of the main column.
 pub const TITLE_ROWS: u16 = 1;
-/// Rows taken by the composer at the bottom of the main column.
-pub const INPUT_ROWS: u16 = 4;
+/// A single blank row (global background) between the message pane and the
+/// composer.
+pub const MESSAGE_INPUT_SPACER: u16 = 1;
+/// Fixed rows of the composer besides the typed text: a blank row above, a
+/// blank row below, and the tips row.
+pub const INPUT_FIXED_ROWS: u16 = 3;
 /// Rows below the composer: a half-block "fade" of its background on the row
 /// immediately under it, then a blank row before the window bottom.
 pub const GAP_ROWS: u16 = 2;
+/// Blank padding between the composer panel's left edge and its text.
+pub const INPUT_LEFT_PAD: u16 = 1;
+/// Blank padding between the composer text and the panel's right edge.
+pub const INPUT_RIGHT_PAD: u16 = 2;
+/// Blank columns (global background) between the composer panel's right edge
+/// and the screen's right edge.
+pub const INPUT_RIGHT_GAP: u16 = 3;
+/// The composer text is this many columns narrower than the message viewport
+/// (INPUT_LEFT_PAD + INPUT_RIGHT_PAD, given how the panel is positioned).
+pub const INPUT_TEXT_INSET: u16 = INPUT_LEFT_PAD + INPUT_RIGHT_PAD;
 
 /// Global background color for the whole screen.
 const GLOBAL_BG: Color = Color::Rgb(0x0a, 0x0a, 0x0a);
@@ -48,6 +62,9 @@ const GLOBAL_BG: Color = Color::Rgb(0x0a, 0x0a, 0x0a);
 const INPUT_BG: Color = Color::Rgb(0x1e, 0x1e, 0x1e);
 /// Color of the thin vertical line separating the sidebar from the main column.
 const SEPARATOR: Color = Color::Rgb(0x55, 0x55, 0x55);
+/// Color of the composer's left accent `┃` (pale green), drawn on the global
+/// background (no composer-panel background behind it).
+const INPUT_LINE: Color = Color::Rgb(0x9a, 0xd9, 0x9a);
 /// Accent color for the active channel in the sidebar.
 const ACCENT: Color = Color::Magenta;
 const ACCENT_STYLE: Style = Style::new().fg(ACCENT).add_modifier(Modifier::BOLD);
@@ -103,11 +120,17 @@ pub fn draw(frame: &mut Frame, app: &App, chrome: &Chrome<'_>) {
     render_sidebar(frame, columns[0], chrome);
     render_separator(frame, columns[1]);
 
+    // The composer's wrapped input lines drive its height.
+    let (_, input_text_width) = input_text_geometry(frame.area().width);
+    let input_lines = build_wrapped_input_lines(app.input(), app.input_cursor(), input_text_width);
+    let input_height = composer_height(input_lines.len());
+
     let rows = Layout::vertical([
-        Constraint::Length(TITLE_ROWS), // channel title
-        Constraint::Min(0),             // messages
-        Constraint::Length(INPUT_ROWS), // composer
-        Constraint::Length(GAP_ROWS),   // fade + blank below the composer
+        Constraint::Length(TITLE_ROWS),           // channel title
+        Constraint::Min(0),                       // messages
+        Constraint::Length(MESSAGE_INPUT_SPACER), // blank row between messages & composer
+        Constraint::Length(input_height),         // composer
+        Constraint::Length(GAP_ROWS),             // fade + blank below the composer
     ])
     .split(columns[2]);
 
@@ -122,8 +145,14 @@ pub fn draw(frame: &mut Frame, app: &App, chrome: &Chrome<'_>) {
         Paragraph::new(build_text(app)).scroll((app.scroll_offset(), 0)),
         inset(rows[1], HORIZONTAL_PAD),
     );
-    render_input(frame, rows[2], app, chrome.status);
-    render_gap(frame, rows[3]);
+    render_composer(
+        frame,
+        rows[3],
+        frame.area().width,
+        input_lines,
+        chrome.status,
+    );
+    render_gap(frame, rows[4], frame.area().width);
 }
 
 /// Render the thin gray vertical line that separates the sidebar from the main
@@ -162,66 +191,148 @@ fn render_sidebar(frame: &mut Frame, area: Rect, chrome: &Chrome<'_>) {
     frame.render_widget(Paragraph::new(Text::from(lines)), inset(area, 1));
 }
 
-/// Render the composer: a background-shaded 4-row region with a decorative
-/// accent bar on the left (top blank / input line / blank / tips). The input
-/// line shows the user's text with a reverse-video cursor.
-fn render_input(frame: &mut Frame, area: Rect, app: &App, status: &str) {
-    // The left accent bar uses the global background color (a dark seam on
-    // the lighter composer background).
-    let accent = Span::styled("┃", Style::new().fg(GLOBAL_BG));
+/// The composer accent column: right after the sidebar separator gap.
+const COMPOSER_ACCENT_X: u16 = SIDEBAR_WIDTH + SEPARATOR_GAP;
+
+/// Composer text geometry for a given screen width: `(text_left_col, text_width)`.
+pub fn input_text_geometry(screen_w: u16) -> (u16, u16) {
+    let panel_left = COMPOSER_ACCENT_X + 1; // panel starts right of the ┃
+    let panel_right = screen_w.saturating_sub(INPUT_RIGHT_GAP); // exclusive
+    let text_left = panel_left + INPUT_LEFT_PAD;
+    let text_right = panel_right.saturating_sub(INPUT_RIGHT_PAD); // exclusive
+    (text_left, text_right.saturating_sub(text_left))
+}
+
+/// Height of the composer region for a given number of wrapped input lines.
+pub fn composer_height(input_lines: usize) -> u16 {
+    input_lines as u16 + INPUT_FIXED_ROWS
+}
+
+/// Build the composer's input lines: hard-wrap `text` to `width` columns and
+/// render a reverse-video cursor at the `cursor` char index (a solid block when
+/// the cursor sits at the end of the text).
+fn build_wrapped_input_lines(text: &str, cursor: usize, width: u16) -> Vec<Line<'static>> {
+    let width = usize::from(width.max(1));
+    let chars: Vec<char> = text.chars().collect();
+    let total = chars.len();
+    let cursor = cursor.min(total);
+
+    let mut segments: Vec<Vec<char>> = Vec::new();
+    let mut i = 0;
+    while i < total {
+        let end = (i + width).min(total);
+        segments.push(chars[i..end].to_vec());
+        i = end;
+    }
+    if segments.is_empty() {
+        segments.push(Vec::new());
+    }
+    // A cursor at the end of a full line needs its own line to sit on.
+    if cursor == total && total > 0 && total.is_multiple_of(width) {
+        segments.push(Vec::new());
+    }
+
+    let cursor_style = Style::new().fg(INPUT_BG).bg(Color::White);
+    let mut lines = Vec::new();
+    let mut base = 0usize;
+    for (si, seg) in segments.iter().enumerate() {
+        let is_last = si == segments.len() - 1;
+        let mut before = String::new();
+        let mut cursor_str: Option<String> = None;
+        let mut after = String::new();
+        for (j, &c) in seg.iter().enumerate() {
+            let gidx = base + j;
+            if gidx == cursor && cursor_str.is_none() {
+                cursor_str = Some(c.to_string());
+            } else if cursor_str.is_none() {
+                before.push(c);
+            } else {
+                after.push(c);
+            }
+        }
+        if cursor_str.is_none() && cursor == base + seg.len() && is_last {
+            cursor_str = Some(" ".to_string());
+        }
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        if !before.is_empty() {
+            spans.push(Span::raw(before));
+        }
+        if let Some(cs) = cursor_str {
+            spans.push(Span::styled(cs, cursor_style));
+        }
+        if !after.is_empty() {
+            spans.push(Span::raw(after));
+        }
+        lines.push(Line::from(spans));
+        base += seg.len();
+    }
+    lines
+}
+
+/// Render the composer: an INPUT_BG panel with a pale-green `┃` accent on its
+/// left (standing on the global background), the wrapped input lines with a
+/// reverse-video cursor, and a tips row. Rows: blank / text×N / blank / tips.
+fn render_composer(
+    frame: &mut Frame,
+    area: Rect,
+    screen_w: u16,
+    input_lines: Vec<Line<'static>>,
+    status: &str,
+) {
+    let panel_left = COMPOSER_ACCENT_X + 1;
+    let panel_w = screen_w
+        .saturating_sub(INPUT_RIGHT_GAP)
+        .saturating_sub(panel_left);
+    // Panel background (starts right of the ┃, so the ┃ sits on the global bg).
+    frame.buffer_mut().set_style(
+        Rect::new(panel_left, area.y, panel_w, area.height),
+        Style::new().bg(INPUT_BG),
+    );
+
+    // ┃ accent at the composer's left edge, spanning all its rows.
+    let accent = Span::styled("┃", Style::new().fg(INPUT_LINE));
+    let accent_lines: Vec<Line<'static>> = (0..area.height)
+        .map(|_| Line::from(accent.clone()))
+        .collect();
+    frame.render_widget(
+        Paragraph::new(Text::from(accent_lines)),
+        Rect::new(COMPOSER_ACCENT_X, area.y, 1, area.height),
+    );
+
+    // Wrapped input lines on rows 1..=n; tips row after the bottom blank.
+    let (text_left, text_width) = input_text_geometry(screen_w);
+    let n = input_lines.len() as u16;
+    frame.render_widget(
+        Paragraph::new(Text::from(input_lines)),
+        Rect::new(text_left, area.y + 1, text_width, n),
+    );
     let tips = if status.is_empty() {
         "Esc quit · PgUp/PgDn scroll".to_string()
     } else {
         format!("{status}  ·  Esc quit · PgUp/PgDn scroll")
     };
-    let mut input_spans: Vec<Span<'static>> = vec![accent.clone(), Span::raw(" ")];
-    input_spans.extend(build_input_spans(app.input(), app.input_cursor()));
-    let lines = vec![
-        Line::from(vec![accent.clone()]),
-        Line::from(input_spans),
-        Line::from(vec![accent.clone()]),
-        Line::from(vec![accent, Span::raw(" "), Span::raw(tips)]),
-    ];
     frame.render_widget(
-        Paragraph::new(Text::from(lines)).style(Style::new().bg(INPUT_BG)),
-        area,
+        Paragraph::new(tips),
+        Rect::new(text_left, area.y + n + 2, text_width, 1),
     );
 }
 
-/// Build the composer's input line spans: the typed text with a reverse-video
-/// cursor at the cursor position (a solid block when the cursor is past the end).
-fn build_input_spans(text: &str, cursor: usize) -> Vec<Span<'static>> {
-    let chars: Vec<char> = text.chars().collect();
-    let cur = cursor.min(chars.len());
-    let before: String = chars[..cur].iter().collect();
-    let (cursor_ch, after): (String, String) = if cur < chars.len() {
-        (chars[cur].to_string(), chars[cur + 1..].iter().collect())
-    } else {
-        (" ".to_string(), String::new())
-    };
-    let cursor_style = Style::new().fg(INPUT_BG).bg(Color::White);
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    if !before.is_empty() {
-        spans.push(Span::raw(before));
-    }
-    spans.push(Span::styled(cursor_ch, cursor_style));
-    if !after.is_empty() {
-        spans.push(Span::raw(after));
-    }
-    spans
-}
-
-/// Render the gap below the composer: the left accent tapers into an upper-half
-/// heavy vertical (`╹`) on the row immediately below it, the rest of that row
-/// is a half-block fade of the composer background, then a blank row.
-fn render_gap(frame: &mut Frame, area: Rect) {
-    let top = Rect::new(area.x, area.y, area.width, 1);
-    let taper = Span::styled("╹", Style::new().fg(GLOBAL_BG).bg(INPUT_BG));
-    let fade = Span::styled(
-        "▀".repeat(usize::from(top.width.saturating_sub(1))),
-        Style::new().fg(INPUT_BG),
+/// Render the gap below the composer: the `┃` accent tapers into a `╹` and the
+/// composer panel fades out via `▀` across its width.
+fn render_gap(frame: &mut Frame, area: Rect, screen_w: u16) {
+    let panel_left = COMPOSER_ACCENT_X + 1;
+    let panel_w = screen_w
+        .saturating_sub(INPUT_RIGHT_GAP)
+        .saturating_sub(panel_left);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled("╹", Style::new().fg(INPUT_LINE)))),
+        Rect::new(COMPOSER_ACCENT_X, area.y, 1, 1),
     );
-    frame.render_widget(Paragraph::new(Line::from(vec![taper, fade])), top);
+    let fade = Span::styled("▀".repeat(panel_w as usize), Style::new().fg(INPUT_BG));
+    frame.render_widget(
+        Paragraph::new(Line::from(fade)),
+        Rect::new(panel_left, area.y, panel_w, 1),
+    );
 }
 
 /// Shrink a region by `pad` columns on each side (vertical unchanged) so
@@ -360,14 +471,16 @@ channels = ["#osu", "#chinese"]
 
     #[test]
     fn blank_separator_between_messages_but_not_after_last() {
-        // Arrange
+        // Arrange: terminal 50x11 -> message area is 3 rows (title + spacer +
+        // composer + gap take the other 8), so two messages and their blank
+        // separator all fit.
         let mut app = App::new(22, 3);
         app.push_message(msg("a", "first"));
         app.push_message(msg("b", "second"));
         let config = test_config();
 
         // Act
-        let buffer = render_sized(&app, &config, "", 50, 10);
+        let buffer = render_sized(&app, &config, "", 50, 11);
 
         // Assert: in the main content area, the row between the messages is
         // blank (the sidebar separator `│` sits in the pad column to its left);
@@ -442,13 +555,18 @@ channels = ["#osu", "#chinese"]
         let buffer = render_sized(&app, &config, "", 50, 10);
 
         // Assert: each input row has the `┃` accent at the composer's left edge
-        // (col INPUT_X) in the global bg color, and the region's background is INPUT_BG.
+        // (col INPUT_X) in pale green, standing on the global bg (no panel bg
+        // behind it); the panel background starts one column to the right.
         for y in 4..=7 {
             let cell = buffer.cell((INPUT_X, y)).unwrap();
             assert_eq!(cell.symbol(), "┃", "accent missing on row {y}");
-            assert_eq!(cell.fg, GLOBAL_BG, "accent color wrong on row {y}");
+            assert_eq!(cell.fg, INPUT_LINE, "accent color wrong on row {y}");
+            assert_eq!(
+                cell.bg, GLOBAL_BG,
+                "accent should sit on global bg on row {y}"
+            );
         }
-        assert_eq!(buffer.cell((INPUT_X + 4, 5)).unwrap().bg, INPUT_BG);
+        assert_eq!(buffer.cell((INPUT_X + 1, 5)).unwrap().bg, INPUT_BG); // panel starts here
     }
 
     #[test]
@@ -523,11 +641,11 @@ channels = ["#osu", "#chinese"]
         let buffer = render_sized(&app, &config, "", 50, 10);
 
         // Assert: on the fade row (row 8), the composer's `┃` tapers via `╹`
-        // (fg GLOBAL_BG on INPUT_BG); the rest of the row is the `▀` fade.
+        // (pale green, on the global bg); the rest of the row is the `▀` fade.
         let taper = buffer.cell((INPUT_X, 8)).unwrap();
         assert_eq!(taper.symbol(), "╹");
-        assert_eq!(taper.fg, GLOBAL_BG);
-        assert_eq!(taper.bg, INPUT_BG);
+        assert_eq!(taper.fg, INPUT_LINE);
+        assert_eq!(taper.bg, GLOBAL_BG);
         let fade = buffer.cell((INPUT_X + 1, 8)).unwrap();
         assert_eq!(fade.symbol(), "▀");
         assert_eq!(fade.fg, INPUT_BG);
@@ -552,5 +670,91 @@ channels = ["#osu", "#chinese"]
         assert_eq!(buffer.cell((0, 5)).unwrap().bg, GLOBAL_BG); // sidebar blank
         assert_eq!(buffer.cell((INPUT_X + 5, 9)).unwrap().bg, GLOBAL_BG); // gap blank
         assert_eq!(buffer.cell((INPUT_X + 4, 5)).unwrap().bg, INPUT_BG); // composer
+    }
+
+    #[test]
+    fn composer_right_margins() {
+        // Arrange: for W=50 the panel spans cols 25..=46 (right gap 47..49 is
+        // global bg), and the text keeps a 2-col margin inside the panel.
+        let mut app = App::new(22, 3);
+        app.type_char('h');
+        app.type_char('i');
+        let config = test_config();
+
+        // Act
+        let buffer = render_sized(&app, &config, "", 50, 10);
+        let row = 5; // the input text row
+
+        // Assert: panel right edge is 3 columns from the screen edge.
+        assert_eq!(buffer.cell((46, row)).unwrap().bg, INPUT_BG); // panel rightmost
+        for x in 47..=49 {
+            assert_eq!(buffer.cell((x, row)).unwrap().bg, GLOBAL_BG, "col {x}");
+        }
+        // Assert: no text reaches the last 2 panel columns (the text margin).
+        assert_eq!(buffer.cell((45, row)).unwrap().symbol(), " ");
+        assert_eq!(buffer.cell((46, row)).unwrap().symbol(), " ");
+    }
+
+    #[test]
+    fn blank_spacer_row_between_messages_and_composer() {
+        // Arrange: H=11 with empty input -> messages rows 1-3, spacer row 4,
+        // composer rows 5-8.
+        let app = App::new(22, 3);
+        let config = test_config();
+
+        // Act
+        let buffer = render_sized(&app, &config, "", 50, 11);
+
+        // Assert: the spacer row is blank with the global background across the
+        // main column, and the composer ┃ starts on the row below it.
+        for x in INPUT_X..50 {
+            assert_eq!(buffer.cell((x, 4)).unwrap().symbol(), " ", "col {x}");
+            assert_eq!(buffer.cell((x, 4)).unwrap().bg, GLOBAL_BG, "col {x}");
+        }
+        assert_eq!(buffer.cell((INPUT_X, 5)).unwrap().symbol(), "┃");
+    }
+
+    #[test]
+    fn multiline_input_grows_the_composer() {
+        // Arrange: 25 chars at text width 19 wrap into 2 lines, so the composer
+        // is 5 rows (blank + 2 text + blank + tips). For H=11 that puts the
+        // composer on rows 4..=8.
+        let mut app = App::new(22, 2);
+        for _ in 0..25 {
+            app.type_char('x');
+        }
+        let config = test_config();
+
+        // Act
+        let buffer = render_sized(&app, &config, "", 50, 11);
+
+        // Assert: the ┃ spans all 5 composer rows, both wrapped text lines are
+        // shown, and the tips row moved down to row 8.
+        for y in 4..=8 {
+            assert_eq!(buffer.cell((INPUT_X, y)).unwrap().symbol(), "┃", "row {y}");
+        }
+        assert!(buffer_line(&buffer, 5).contains('x'));
+        assert!(buffer_line(&buffer, 6).contains('x'));
+        assert!(buffer_line(&buffer, 8).contains("Esc quit"));
+    }
+
+    #[test]
+    fn multiline_input_squeezes_the_message_pane() {
+        // Arrange / Act: empty input -> composer 4 rows (┃ top at row 5 for H=11);
+        // 2-line input -> composer 5 rows (┃ top moves up to row 4).
+        let config = test_config();
+        let app_empty = App::new(22, 3);
+        let buf_empty = render_sized(&app_empty, &config, "", 50, 11);
+        assert_eq!(buf_empty.cell((INPUT_X, 5)).unwrap().symbol(), "┃");
+        assert_eq!(buf_empty.cell((INPUT_X, 4)).unwrap().symbol(), " ");
+
+        let mut app_full = App::new(22, 2);
+        for _ in 0..25 {
+            app_full.type_char('x');
+        }
+        let buf_full = render_sized(&app_full, &config, "", 50, 11);
+
+        // Assert: the composer's top edge moved up one row.
+        assert_eq!(buf_full.cell((INPUT_X, 4)).unwrap().symbol(), "┃");
     }
 }

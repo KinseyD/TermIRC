@@ -133,6 +133,11 @@ impl App {
         &self.messages
     }
 
+    /// The current message viewport size `(width, height)`.
+    pub fn size(&self) -> (u16, u16) {
+        (self.width, self.viewport_height)
+    }
+
     // ----- composer input (receive-only: no sending) -----
 
     /// The text currently typed in the composer.

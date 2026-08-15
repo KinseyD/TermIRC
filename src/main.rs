@@ -62,17 +62,10 @@ fn run(
     // is reaped when the process exits.
     let _irc_thread = spawn_irc(server, channel.clone(), tx);
 
-    let size = terminal.size()?;
-    let mut app = App::new(
-        size.width
-            .saturating_sub(ui::SIDEBAR_WIDTH)
-            .saturating_sub(ui::SEPARATOR_GAP)
-            .saturating_sub(2 * ui::HORIZONTAL_PAD),
-        size.height
-            .saturating_sub(ui::TITLE_ROWS)
-            .saturating_sub(ui::INPUT_ROWS)
-            .saturating_sub(ui::GAP_ROWS),
-    );
+    let s = terminal.size()?;
+    let mut term_size = (s.width, s.height);
+    let mut app = App::new(1, 1);
+    fit_app(&mut app, term_size);
     let mut status = format!("connecting to {channel}…");
 
     while app.is_running() {
@@ -85,6 +78,7 @@ fn run(
         terminal.draw(|frame| ui::draw(frame, &app, &chrome))?;
 
         if event::poll(POLL_INTERVAL)? {
+            let mut relayout = false;
             match event::read()? {
                 // Windows also emits Release/Repeat events - handle presses only.
                 Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
@@ -95,32 +89,49 @@ fn run(
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         app.quit()
                     }
-                    // Composer input (receive-only: Enter does not send).
+                    // Composer input (receive-only: Enter does not send). Any
+                    // edit can change the composer's line count, so re-fit.
                     KeyCode::Char(c)
                         if !key.modifiers.contains(KeyModifiers::CONTROL) && !c.is_control() =>
                     {
-                        app.type_char(c)
+                        app.type_char(c);
+                        relayout = true;
                     }
-                    KeyCode::Backspace => app.backspace(),
-                    KeyCode::Delete => app.delete(),
-                    KeyCode::Left => app.cursor_left(),
-                    KeyCode::Right => app.cursor_right(),
-                    KeyCode::Home => app.cursor_home(),
-                    KeyCode::End => app.cursor_end(),
+                    KeyCode::Backspace => {
+                        app.backspace();
+                        relayout = true;
+                    }
+                    KeyCode::Delete => {
+                        app.delete();
+                        relayout = true;
+                    }
+                    KeyCode::Left => {
+                        app.cursor_left();
+                        relayout = true;
+                    }
+                    KeyCode::Right => {
+                        app.cursor_right();
+                        relayout = true;
+                    }
+                    KeyCode::Home => {
+                        app.cursor_home();
+                        relayout = true;
+                    }
+                    KeyCode::End => {
+                        app.cursor_end();
+                        relayout = true;
+                    }
                     KeyCode::Enter => {}
                     _ => {}
                 },
-                Event::Resize(width, height) => app.resize(
-                    width
-                        .saturating_sub(ui::SIDEBAR_WIDTH)
-                        .saturating_sub(ui::SEPARATOR_GAP)
-                        .saturating_sub(2 * ui::HORIZONTAL_PAD),
-                    height
-                        .saturating_sub(ui::TITLE_ROWS)
-                        .saturating_sub(ui::INPUT_ROWS)
-                        .saturating_sub(ui::GAP_ROWS),
-                ),
+                Event::Resize(width, height) => {
+                    term_size = (width, height);
+                    relayout = true;
+                }
                 _ => {}
+            }
+            if relayout {
+                fit_app(&mut app, term_size);
             }
         }
 
@@ -134,4 +145,25 @@ fn run(
     }
 
     Ok(())
+}
+
+/// Resize the app's message viewport to fit the terminal, leaving room for the
+/// title, the message/composer spacer, the (variable-height) composer, and the
+/// gap below it. No-op when the computed size is unchanged.
+fn fit_app(app: &mut App, (w, h): (u16, u16)) {
+    let message_width = w
+        .saturating_sub(ui::SIDEBAR_WIDTH)
+        .saturating_sub(ui::SEPARATOR_GAP)
+        .saturating_sub(2 * ui::HORIZONTAL_PAD);
+    let (_, input_text_width) = ui::input_text_geometry(w);
+    let input_lines =
+        termirc::layout::input_line_count(app.input(), app.input_cursor(), input_text_width);
+    let message_height = h
+        .saturating_sub(ui::TITLE_ROWS)
+        .saturating_sub(ui::MESSAGE_INPUT_SPACER)
+        .saturating_sub(ui::composer_height(input_lines))
+        .saturating_sub(ui::GAP_ROWS);
+    if app.size() != (message_width, message_height) {
+        app.resize(message_width, message_height);
+    }
 }
