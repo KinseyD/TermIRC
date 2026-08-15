@@ -4,31 +4,50 @@ A receive-only terminal TUI IRC client written in Rust.
 
 It reads your server list from a TOML config file, connects to the **first
 server's first channel**, and displays incoming chat messages in a scrollable
-full-width pane. Sending messages is intentionally not implemented (yet).
+pane beside a server/channel sidebar, with a composer along the bottom.
+Sending messages is intentionally not implemented (yet) — the composer accepts
+and edits text but `Enter` does not send.
 
-## Message layout
-
-Each message spans the full window width. The nick and the body each take
-their own horizontal space; wrapped body lines are indented to the body
-column and never run underneath the nick:
+## Layout
 
 ```text
-username:  messages messages
-                  messages .....
+ osu_irc          │  #osu
+   ▶ #osu        │  alice:  hello world
+     #chinese    │  bob:    a longer message that wraps
+                  │           under the body column, never
+                  │           under the nick
+                  │
+                  │  ┃ hi_                      <- composer (grows as you type)
+                  │  ┃
+                  │  ┃ connected to irc.ppy.sh · Esc quit · PgUp/PgDn scroll
+                  │  ╹▀▀▀▀▀▀▀▀▀▀
 ```
 
-There is exactly one blank line between two messages (never a trailing one).
+- **Sidebar** (fixed width): the configured servers and their channels; the
+  connected channel is highlighted.
+- **Message pane**: each message spans the pane; the nick and body each take
+  their own horizontal space, and wrapped body lines are indented to the body
+  column (never under the nick). Exactly one blank line separates two messages.
+- **Composer** (bottom): a shaded input box with a pale-green `┃` accent on its
+  left. It keeps a 3-column gap from the screen's right edge and a 2-column
+  margin inside the box. When the typed text exceeds one line it wraps, the
+  composer grows taller, and the message pane shrinks to match. A single blank
+  row (global background) sits between the messages and the composer.
 
-## Scrolling
+## Keys
 
 | Key | Action |
 |-----|--------|
 | `PgUp` | scroll up by ⅓ of the window height |
 | `PgDn` | scroll down by ⅓ of the window height |
-| `Esc` / `Ctrl+C` | quit (typing `q` inserts `q` into the composer) |
+| printable chars | type into the composer |
+| `Backspace` / `Delete` | delete behind / at the cursor |
+| `Left` / `Right` / `Home` / `End` | move the composer cursor |
+| `Enter` | (no-op — sending is not implemented) |
+| `Esc` / `Ctrl+C` | quit |
 
-Connection status is shown on the pane's bottom border. If the server drops
-the connection, the status changes to `disconnected from …` (or an error
+Connection status is shown on the composer's bottom (tips) row. If the server
+drops the connection, the status changes to `disconnected from …` (or an error
 message) — termirc does not auto-reconnect; quit and restart to rejoin.
 
 Auto-scroll: when a new message arrives, the view follows it **only if the
@@ -82,7 +101,7 @@ Test-driven throughout; the suite includes unit tests for every pure module
 that run the real `irc` client against a local mock TCP server:
 
 ```bash
-cargo test                       # 44 unit + 3 integration tests
+cargo test                       # 80 unit + 5 integration tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
