@@ -1,17 +1,18 @@
-//! Application state: message list, viewport, and scroll behavior.
+//! Application state: per-channel message histories with independent scroll,
+//! plus the composer input buffer.
 //!
-//! Auto-scroll rule: a newly arriving message only moves the viewport when the
-//! newest message's last line is currently visible — i.e. the content bottom
-//! is in view. Once the user has scrolled up so that line leaves the window,
-//! the viewport stays put until they scroll back to the bottom.
+//! Auto-scroll rule (per channel): a newly arriving message only moves the
+//! viewport when the newest message's last line is currently visible. Once the
+//! user has scrolled up so that line leaves the window, the viewport stays put
+//! until they scroll back to the bottom.
 
 use crate::layout::{LayoutLine, layout_messages};
 use crate::message::ChatMessage;
 
-/// Maximum number of messages kept in memory; the oldest are dropped first.
+/// Maximum number of messages kept per channel; the oldest are dropped first.
 pub const MAX_MESSAGES: usize = 5000;
 
-/// Maximum number of laid-out rows kept in memory; the oldest messages are
+/// Maximum number of laid-out rows kept per channel; the oldest messages are
 /// dropped when the layout grows past this. Must stay comfortably below
 /// `u16::MAX`: ratatui's scroll offset is a `u16`, and the scroll model
 /// (offsets, `is_at_bottom`) only stays honest while the row count fits.
@@ -22,20 +23,45 @@ pub const MAX_LINES: usize = 50_000;
 /// Maximum input buffer length, in chars.
 pub const MAX_INPUT: usize = 512;
 
-pub struct App {
+/// One channel's history plus its scroll state.
+struct ChannelState {
+    server: String,
+    channel: String,
     messages: Vec<ChatMessage>,
-    message_cap: usize,
-    line_cap: usize,
     lines: Vec<LayoutLine>,
-    width: u16,
-    viewport_height: u16,
     /// First visible content row (0 = top).
     scroll_offset: u16,
+}
+
+impl ChannelState {
+    fn new(server: String, channel: String) -> ChannelState {
+        ChannelState {
+            server,
+            channel,
+            messages: Vec::new(),
+            lines: Vec::new(),
+            scroll_offset: 0,
+        }
+    }
+
+    fn total_height(&self) -> u16 {
+        u16::try_from(self.lines.len()).unwrap_or(u16::MAX)
+    }
+}
+
+pub struct App {
+    /// Registered channels in sidebar order; `active` indexes the viewed one.
+    channels: Vec<ChannelState>,
+    active: usize,
+    width: u16,
+    viewport_height: u16,
     running: bool,
     /// Text the user is typing in the composer (not sent anywhere).
     input: String,
     /// Cursor position as a char index into `input`.
     input_cursor: usize,
+    message_cap: usize,
+    line_cap: usize,
 }
 
 impl App {
@@ -45,72 +71,138 @@ impl App {
 
     fn with_caps(width: u16, viewport_height: u16, message_cap: usize, line_cap: usize) -> App {
         App {
-            messages: Vec::new(),
-            message_cap,
-            line_cap,
-            lines: Vec::new(),
+            channels: Vec::new(),
+            active: 0,
             width,
             viewport_height,
-            scroll_offset: 0,
             running: true,
             input: String::new(),
             input_cursor: 0,
+            message_cap,
+            line_cap,
         }
     }
 
-    /// Append a message and re-layout, following the auto-scroll rule.
-    pub fn push_message(&mut self, message: ChatMessage) {
-        let was_at_bottom = self.is_at_bottom();
-        self.messages.push(message);
-        if self.messages.len() > self.message_cap {
-            let excess = self.messages.len() - self.message_cap;
-            self.messages.drain(..excess);
+    // ----- channels -----
+
+    /// Register a channel (idempotent, matched case-insensitively). The first
+    /// registered channel is the initially viewed one.
+    pub fn open_channel(&mut self, server: &str, channel: &str) {
+        if self.find_channel(server, channel).is_none() {
+            self.channels
+                .push(ChannelState::new(server.to_string(), channel.to_string()));
         }
-        self.relayout(was_at_bottom);
     }
+
+    /// Number of registered channels.
+    pub fn channel_count(&self) -> usize {
+        self.channels.len()
+    }
+
+    /// The `(server, channel)` currently being viewed.
+    pub fn active_channel(&self) -> (&str, &str) {
+        match self.channels.get(self.active) {
+            Some(state) => (&state.server, &state.channel),
+            None => ("", ""),
+        }
+    }
+
+    /// Switch the message pane to a registered channel, keeping that channel's
+    /// scroll position (non-following).
+    pub fn select_channel(&mut self, index: usize) {
+        if index < self.channels.len() {
+            self.active = index;
+            self.relayout_active(false);
+        }
+    }
+
+    fn find_channel(&self, server: &str, channel: &str) -> Option<usize> {
+        self.channels.iter().position(|state| {
+            state.server.eq_ignore_ascii_case(server) && state.channel.eq_ignore_ascii_case(channel)
+        })
+    }
+
+    // ----- messages -----
+
+    /// Route a message to its channel. The active channel re-lays-out and
+    /// follows the auto-scroll rule; background channels only accumulate
+    /// history. Messages for unregistered channels are dropped (when no
+    /// channel is registered at all, the first message opens one - this keeps
+    /// the App usable standalone, e.g. in tests).
+    pub fn push_message(&mut self, message: ChatMessage) {
+        let idx = match self.find_channel(&message.server, &message.channel) {
+            Some(idx) => idx,
+            None if self.channels.is_empty() => {
+                self.channels.push(ChannelState::new(
+                    message.server.clone(),
+                    message.channel.clone(),
+                ));
+                self.active = 0;
+                0
+            }
+            None => return,
+        };
+        if idx == self.active {
+            let was_at_bottom = self.is_at_bottom();
+            self.push_into(idx, message);
+            self.relayout_active(was_at_bottom);
+        } else {
+            self.push_into(idx, message);
+        }
+    }
+
+    fn push_into(&mut self, idx: usize, message: ChatMessage) {
+        let cap = self.message_cap;
+        let state = &mut self.channels[idx];
+        state.messages.push(message);
+        if state.messages.len() > cap {
+            let excess = state.messages.len() - cap;
+            state.messages.drain(..excess);
+        }
+    }
+
+    // ----- scrolling (active channel) -----
 
     /// Scroll up by one third of the viewport height (at least one line).
     pub fn scroll_page_up(&mut self) {
-        self.scroll_offset = self.scroll_offset.saturating_sub(self.page_step());
+        let step = self.page_step();
+        if let Some(state) = self.channels.get_mut(self.active) {
+            state.scroll_offset = state.scroll_offset.saturating_sub(step);
+        }
     }
 
     /// Scroll down by one third of the viewport height (at least one line).
     pub fn scroll_page_down(&mut self) {
-        self.scroll_offset = self
-            .scroll_offset
-            .saturating_add(self.page_step())
-            .min(self.max_offset());
+        let step = self.page_step();
+        let viewport_height = self.viewport_height;
+        if let Some(state) = self.channels.get_mut(self.active) {
+            let max = state.total_height().saturating_sub(viewport_height);
+            state.scroll_offset = state.scroll_offset.saturating_add(step).min(max);
+        }
     }
 
     /// Set the scroll offset, clamped to the valid range.
     pub fn set_scroll_offset(&mut self, offset: u16) {
-        self.scroll_offset = offset.min(self.max_offset());
-    }
-
-    /// Update the viewport size and re-layout, following the auto-scroll rule.
-    pub fn resize(&mut self, width: u16, viewport_height: u16) {
-        let was_at_bottom = self.is_at_bottom();
-        self.width = width;
-        self.viewport_height = viewport_height;
-        self.relayout(was_at_bottom);
-    }
-
-    pub fn quit(&mut self) {
-        self.running = false;
-    }
-
-    pub fn is_running(&self) -> bool {
-        self.running
+        let viewport_height = self.viewport_height;
+        if let Some(state) = self.channels.get_mut(self.active) {
+            let max = state.total_height().saturating_sub(viewport_height);
+            state.scroll_offset = offset.min(max);
+        }
     }
 
     /// First visible content row.
     pub fn scroll_offset(&self) -> u16 {
-        self.scroll_offset
+        self.channels
+            .get(self.active)
+            .map(|s| s.scroll_offset)
+            .unwrap_or(0)
     }
 
     /// Total height of the laid-out content, in rows.
     pub fn total_height(&self) -> u16 {
-        u16::try_from(self.lines.len()).unwrap_or(u16::MAX)
+        self.channels
+            .get(self.active)
+            .map_or(0, |s| s.total_height())
     }
 
     /// Largest valid scroll offset for the current content and viewport.
@@ -120,22 +212,40 @@ impl App {
 
     /// Whether the newest message's last line is currently visible.
     pub fn is_at_bottom(&self) -> bool {
-        self.scroll_offset >= self.max_offset()
+        self.scroll_offset() >= self.max_offset()
     }
 
     /// The laid-out rows to render.
     pub fn lines(&self) -> &[LayoutLine] {
-        &self.lines
+        self.channels.get(self.active).map_or(&[], |s| &s.lines)
     }
 
-    /// The stored messages, oldest first.
+    /// The stored messages of the viewed channel, oldest first.
     pub fn messages(&self) -> &[ChatMessage] {
-        &self.messages
+        self.channels.get(self.active).map_or(&[], |s| &s.messages)
     }
 
     /// The current message viewport size `(width, height)`.
     pub fn size(&self) -> (u16, u16) {
         (self.width, self.viewport_height)
+    }
+
+    // ----- lifecycle -----
+
+    pub fn quit(&mut self) {
+        self.running = false;
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.running
+    }
+
+    /// Update the viewport size and re-layout, following the auto-scroll rule.
+    pub fn resize(&mut self, width: u16, viewport_height: u16) {
+        let was_at_bottom = self.is_at_bottom();
+        self.width = width;
+        self.viewport_height = viewport_height;
+        self.relayout_active(was_at_bottom);
     }
 
     // ----- composer input (receive-only: no sending) -----
@@ -203,18 +313,25 @@ impl App {
         (self.viewport_height / 3).max(1)
     }
 
-    fn relayout(&mut self, was_at_bottom: bool) {
-        self.lines = layout_messages(&self.messages, self.width);
+    /// Re-wrap the active channel at the current width, enforce the line cap,
+    /// and settle the scroll offset (follow the bottom or keep it clamped).
+    fn relayout_active(&mut self, was_at_bottom: bool) {
+        let width = self.width;
+        let line_cap = self.line_cap;
+        let viewport_height = self.viewport_height;
+        let state = &mut self.channels[self.active];
+        state.lines = layout_messages(&state.messages, width);
         // Bound the row count so the u16 scroll model stays valid: drop the
         // oldest messages until the layout fits the line cap.
-        while self.lines.len() > self.line_cap && self.messages.len() > 1 {
-            self.messages.remove(0);
-            self.lines = layout_messages(&self.messages, self.width);
+        while state.lines.len() > line_cap && state.messages.len() > 1 {
+            state.messages.remove(0);
+            state.lines = layout_messages(&state.messages, width);
         }
-        self.scroll_offset = if was_at_bottom {
-            self.max_offset()
+        let max = state.total_height().saturating_sub(viewport_height);
+        state.scroll_offset = if was_at_bottom {
+            max
         } else {
-            self.scroll_offset.min(self.max_offset())
+            state.scroll_offset.min(max)
         };
     }
 }
@@ -586,5 +703,108 @@ mod tests {
         // Assert: never exceeds the cap; cursor sits at the end.
         assert_eq!(app.input().chars().count(), MAX_INPUT);
         assert_eq!(app.input_cursor(), MAX_INPUT);
+    }
+
+    // ----- multi-channel routing -----
+
+    fn chan_msg(server: &str, channel: &str, text: &str) -> ChatMessage {
+        ChatMessage {
+            server: server.to_string(),
+            channel: channel.to_string(),
+            nick: "u".to_string(),
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn open_channel_registers_and_routes() {
+        // Arrange
+        let mut app = App::new(40, 10);
+        app.open_channel("srv", "#osu");
+
+        // Act
+        app.push_message(chan_msg("srv", "#osu", "hi"));
+
+        // Assert
+        assert_eq!(app.channel_count(), 1);
+        assert_eq!(app.messages().len(), 1);
+        assert_eq!(app.active_channel(), ("srv", "#osu"));
+    }
+
+    #[test]
+    fn open_channel_is_idempotent_ignoring_case() {
+        let mut app = App::new(40, 10);
+        app.open_channel("srv", "#osu");
+        app.open_channel("srv", "#OSU");
+        assert_eq!(app.channel_count(), 1);
+    }
+
+    #[test]
+    fn push_routes_to_channel_ignoring_case() {
+        // Arrange
+        let mut app = App::new(40, 10);
+        app.open_channel("srv", "#osu");
+        app.open_channel("srv", "#chinese");
+
+        // Act / Assert: "#OSU" from "SRV" hits the active #osu channel.
+        app.push_message(chan_msg("SRV", "#OSU", "a"));
+        assert_eq!(app.messages().len(), 1);
+        // #chinese is background: its history grows, the view stays #osu.
+        app.push_message(chan_msg("srv", "#chinese", "b"));
+        assert_eq!(app.messages().len(), 1);
+        app.select_channel(1);
+        assert_eq!(app.messages().len(), 1);
+    }
+
+    #[test]
+    fn push_to_unopened_channel_is_dropped() {
+        let mut app = App::new(40, 10);
+        app.open_channel("srv", "#osu");
+        app.push_message(chan_msg("srv", "#other", "x"));
+        assert_eq!(app.messages().len(), 0);
+    }
+
+    #[test]
+    fn switching_channel_switches_history_and_back_preserves_scroll() {
+        // Arrange
+        let mut app = App::new(40, 3);
+        app.open_channel("srv", "#a");
+        app.open_channel("srv", "#b");
+        for i in 0..6 {
+            app.push_message(chan_msg("srv", "#a", &format!("m{i}")));
+        }
+        app.scroll_page_up();
+        let offset = app.scroll_offset();
+        assert!(offset < app.max_offset());
+
+        // Act
+        app.select_channel(1);
+        assert_eq!(app.active_channel().1, "#b");
+        assert_eq!(app.messages().len(), 0);
+        app.push_message(chan_msg("srv", "#b", "bee"));
+        app.select_channel(0);
+
+        // Assert: #a's history and scroll position are intact.
+        assert_eq!(app.active_channel().1, "#a");
+        assert_eq!(app.messages().len(), 6);
+        assert_eq!(app.scroll_offset(), offset);
+    }
+
+    #[test]
+    fn background_push_leaves_active_layout_stable() {
+        // Arrange
+        let mut app = App::new(40, 3);
+        app.open_channel("srv", "#a");
+        app.open_channel("srv", "#b");
+        app.push_message(chan_msg("srv", "#a", "m"));
+        let height = app.total_height();
+
+        // Act: pushes to the background channel.
+        for i in 0..5 {
+            app.push_message(chan_msg("srv", "#b", &format!("b{i}")));
+        }
+
+        // Assert
+        assert_eq!(app.total_height(), height);
     }
 }
