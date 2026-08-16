@@ -22,8 +22,7 @@ use ratatui::{
     widgets::Paragraph,
 };
 
-use crate::app::App;
-use crate::config::Config;
+use crate::app::{App, Focus};
 
 const NICK_STYLE: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
 
@@ -65,16 +64,18 @@ const SEPARATOR: Color = Color::Rgb(0x55, 0x55, 0x55);
 /// Color of the composer's left accent `┃` (pale green), drawn on the global
 /// background (no composer-panel background behind it).
 const INPUT_LINE: Color = Color::Rgb(0x9a, 0xd9, 0x9a);
-/// Accent color for the active channel in the sidebar.
-const ACCENT: Color = Color::Magenta;
-const ACCENT_STYLE: Style = Style::new().fg(ACCENT).add_modifier(Modifier::BOLD);
+/// The composer accent when the composer does not have focus (dimmed).
+const INPUT_LINE_DIM: Color = Color::Rgb(0x4a, 0x6a, 0x4a);
+/// Background of the sidebar row under the cursor.
+const SIDEBAR_CURSOR_BG: Color = Color::Rgb(0x20, 0x20, 0x20);
+/// Background of the sidebar's active channel row.
+const SIDEBAR_ACTIVE_BG: Color = Color::Rgb(0x2e, 0x2e, 0x2e);
+/// Background highlight of the selected message in the message pane.
+const MESSAGE_SELECT_BG: Color = Color::Rgb(0x24, 0x24, 0x24);
 const DIM_STYLE: Style = Style::new().fg(Color::Rgb(0x70, 0x70, 0x70));
 
-/// Render-only chrome state: what to show outside the message scrollback.
+/// Render-only chrome state: everything the renderer needs beyond the App.
 pub struct Chrome<'a> {
-    pub config: &'a Config,
-    pub active_server: &'a str,
-    pub active_channel: &'a str,
     pub status: &'a str,
 }
 
@@ -117,12 +118,14 @@ pub fn draw(frame: &mut Frame, app: &App, chrome: &Chrome<'_>) {
         Constraint::Min(0),                // main column
     ])
     .split(frame.area());
-    render_sidebar(frame, columns[0], chrome);
+    render_sidebar(frame, columns[0], app);
     render_separator(frame, columns[1]);
 
     // The composer's wrapped input lines drive its height.
     let (_, input_text_width) = input_text_geometry(frame.area().width);
-    let input_lines = build_wrapped_input_lines(app.input(), app.input_cursor(), input_text_width);
+    let focused = app.focus() == Focus::Composer;
+    let input_lines =
+        build_wrapped_input_lines(app.input(), app.input_cursor(), input_text_width, focused);
     let input_height = composer_height(input_lines.len());
 
     let rows = Layout::vertical([
@@ -136,21 +139,24 @@ pub fn draw(frame: &mut Frame, app: &App, chrome: &Chrome<'_>) {
 
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            chrome.active_channel,
+            app.active_channel().1,
             Style::new().add_modifier(Modifier::BOLD),
         ))),
         inset(rows[0], HORIZONTAL_PAD),
     );
+    let message_rect = inset(rows[1], HORIZONTAL_PAD);
     frame.render_widget(
         Paragraph::new(build_text(app)).scroll((app.scroll_offset(), 0)),
-        inset(rows[1], HORIZONTAL_PAD),
+        message_rect,
     );
+    render_selection(frame, message_rect, app);
     render_composer(
         frame,
         rows[3],
         frame.area().width,
         input_lines,
         chrome.status,
+        app,
     );
     render_gap(frame, rows[4], frame.area().width);
 }
@@ -164,31 +170,68 @@ fn render_separator(frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(Text::from(lines)), col);
 }
 
-/// Render the server/channel sidebar from the config, highlighting the active
-/// channel.
-fn render_sidebar(frame: &mut Frame, area: Rect, chrome: &Chrome<'_>) {
-    let mut lines: Vec<Line<'_>> = Vec::new();
-    for (name, server) in chrome.config.servers.iter() {
-        lines.push(Line::from(Span::styled(
-            name.as_str(),
-            Style::new().add_modifier(Modifier::BOLD),
-        )));
-        for channel in &server.channels {
-            let active =
-                name.as_str() == chrome.active_server && channel.as_str() == chrome.active_channel;
-            let (marker, style) = if active {
-                ("▶ ", ACCENT_STYLE)
-            } else {
-                ("  ", DIM_STYLE)
-            };
-            lines.push(Line::from(vec![
+/// Render the server/channel sidebar from the app's row model: a fold marker
+/// per server, its channels beneath, the active channel row with a brighter
+/// background, and (while the sidebar has focus) a cursor row with a slightly
+/// brighter background plus a block cursor at its start.
+fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
+    let inner = inset(area, 1);
+    let focused = app.focus() == Focus::Sidebar;
+    let cursor = app.sidebar_cursor();
+    let active_channel = app.active_channel().1;
+    let rows = app.sidebar_rows();
+
+    for (i, row) in rows.iter().enumerate() {
+        let y = inner.y + i as u16;
+        if y >= inner.y + inner.height {
+            break;
+        }
+        let is_cursor = focused && cursor == Some(i);
+        let is_active = row.channel.as_deref() == Some(active_channel);
+
+        // Row background: the active channel row is brightest; a cursor row is
+        // slightly brighter than the plain background.
+        let bg = if is_active {
+            SIDEBAR_ACTIVE_BG
+        } else if is_cursor {
+            SIDEBAR_CURSOR_BG
+        } else {
+            Color::Reset
+        };
+        let row_rect = Rect::new(inner.x, y, inner.width, 1);
+        if bg != Color::Reset {
+            frame.buffer_mut().set_style(row_rect, Style::new().bg(bg));
+        }
+
+        // Row text: a leading space reserves room for the block cursor.
+        let line = match &row.channel {
+            None => Line::from(vec![
+                Span::raw(" "),
+                Span::raw(if app.server_collapsed(&row.server) {
+                    "▸ "
+                } else {
+                    "▾ "
+                }),
+                Span::styled(
+                    row.server.as_str(),
+                    Style::new().add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Some(channel) => Line::from(vec![
+                Span::raw(" "),
                 Span::raw("  "),
-                Span::raw(marker),
-                Span::styled(channel.as_str(), style),
-            ]));
+                Span::styled(channel.as_str(), DIM_STYLE),
+            ]),
+        };
+        frame.render_widget(Paragraph::new(line), row_rect);
+
+        // Block cursor at the start of the focused row.
+        if is_cursor {
+            frame.buffer_mut()[(inner.x, y)]
+                .set_symbol(" ")
+                .set_style(Style::new().fg(INPUT_BG).bg(Color::White));
         }
     }
-    frame.render_widget(Paragraph::new(Text::from(lines)), inset(area, 1));
 }
 
 /// The composer accent column: right after the sidebar separator gap.
@@ -208,10 +251,15 @@ pub fn composer_height(input_lines: usize) -> u16 {
     input_lines as u16 + INPUT_FIXED_ROWS
 }
 
-/// Build the composer's input lines: hard-wrap `text` to `width` columns and
-/// render a reverse-video cursor at the `cursor` char index (a solid block when
-/// the cursor sits at the end of the text).
-fn build_wrapped_input_lines(text: &str, cursor: usize, width: u16) -> Vec<Line<'static>> {
+/// Build the composer's input lines: hard-wrap `text` to `width` columns; when
+/// `show_cursor` is set, render a reverse-video cursor at the `cursor` char
+/// index (a solid block when the cursor sits at the end of the text).
+fn build_wrapped_input_lines(
+    text: &str,
+    cursor: usize,
+    width: u16,
+    show_cursor: bool,
+) -> Vec<Line<'static>> {
     let width = usize::from(width.max(1));
     let chars: Vec<char> = text.chars().collect();
     let total = chars.len();
@@ -228,7 +276,7 @@ fn build_wrapped_input_lines(text: &str, cursor: usize, width: u16) -> Vec<Line<
         segments.push(Vec::new());
     }
     // A cursor at the end of a full line needs its own line to sit on.
-    if cursor == total && total > 0 && total.is_multiple_of(width) {
+    if show_cursor && cursor == total && total > 0 && total.is_multiple_of(width) {
         segments.push(Vec::new());
     }
 
@@ -240,18 +288,22 @@ fn build_wrapped_input_lines(text: &str, cursor: usize, width: u16) -> Vec<Line<
         let mut before = String::new();
         let mut cursor_str: Option<String> = None;
         let mut after = String::new();
-        for (j, &c) in seg.iter().enumerate() {
-            let gidx = base + j;
-            if gidx == cursor && cursor_str.is_none() {
-                cursor_str = Some(c.to_string());
-            } else if cursor_str.is_none() {
-                before.push(c);
-            } else {
-                after.push(c);
+        if show_cursor {
+            for (j, &c) in seg.iter().enumerate() {
+                let gidx = base + j;
+                if gidx == cursor && cursor_str.is_none() {
+                    cursor_str = Some(c.to_string());
+                } else if cursor_str.is_none() {
+                    before.push(c);
+                } else {
+                    after.push(c);
+                }
             }
-        }
-        if cursor_str.is_none() && cursor == base + seg.len() && is_last {
-            cursor_str = Some(" ".to_string());
+            if cursor_str.is_none() && cursor == base + seg.len() && is_last {
+                cursor_str = Some(" ".to_string());
+            }
+        } else {
+            before = seg.iter().collect();
         }
         let mut spans: Vec<Span<'static>> = Vec::new();
         if !before.is_empty() {
@@ -272,12 +324,14 @@ fn build_wrapped_input_lines(text: &str, cursor: usize, width: u16) -> Vec<Line<
 /// Render the composer: an INPUT_BG panel with a pale-green `┃` accent on its
 /// left (standing on the global background), the wrapped input lines with a
 /// reverse-video cursor, and a tips row. Rows: blank / text×N / blank / tips.
+/// When the composer is not focused the accent dims and no cursor is shown.
 fn render_composer(
     frame: &mut Frame,
     area: Rect,
     screen_w: u16,
     input_lines: Vec<Line<'static>>,
     status: &str,
+    app: &App,
 ) {
     let panel_left = COMPOSER_ACCENT_X + 1;
     let panel_w = screen_w
@@ -289,8 +343,14 @@ fn render_composer(
         Style::new().bg(INPUT_BG),
     );
 
-    // ┃ accent at the composer's left edge, spanning all its rows.
-    let accent = Span::styled("┃", Style::new().fg(INPUT_LINE));
+    // ┃ accent at the composer's left edge, spanning all its rows. Dimmed
+    // while another region holds the focus.
+    let accent_color = if app.focus() == Focus::Composer {
+        INPUT_LINE
+    } else {
+        INPUT_LINE_DIM
+    };
+    let accent = Span::styled("┃", Style::new().fg(accent_color));
     let accent_lines: Vec<Line<'static>> = (0..area.height)
         .map(|_| Line::from(accent.clone()))
         .collect();
@@ -315,6 +375,93 @@ fn render_composer(
         Paragraph::new(tips),
         Rect::new(text_left, area.y + n + 2, text_width, 1),
     );
+}
+
+/// Overlay the selected-message highlight while the message pane has focus:
+/// the selected message's rows get the highlight background, the separator row
+/// above becomes a lower-half block (`▄`) and the one below an upper-half
+/// block (`▀`) in the highlight color, and a pale-green `┃` accent runs down
+/// the front of the whole block (like the composer's).
+fn render_selection(frame: &mut Frame, msg_rect: Rect, app: &App) {
+    if app.focus() != Focus::Messages {
+        return;
+    }
+    let Some((start, height)) = app.selected_span() else {
+        return;
+    };
+    let off = i64::from(app.scroll_offset());
+    let first = i64::from(start) - off;
+    let last = first + i64::from(height) - 1;
+    let vh = i64::from(msg_rect.height);
+    if last < 0 || first >= vh {
+        return; // selection entirely off-screen
+    }
+    let total = i64::from(app.total_height());
+    let has_above = i64::from(start) > 0; // a separator row exists above
+    let has_below = i64::from(start) + i64::from(height) < total;
+
+    // 1. Highlight background on the message's own rows (clipped to the pane).
+    let top = first.max(0);
+    let bottom = last.min(vh - 1);
+    frame.buffer_mut().set_style(
+        Rect::new(
+            msg_rect.x,
+            msg_rect.y + top as u16,
+            msg_rect.width,
+            (bottom - top + 1) as u16,
+        ),
+        Style::new().bg(MESSAGE_SELECT_BG),
+    );
+
+    // 2. Half-block separator rows: ▄ above, ▀ below (fg = highlight color,
+    //    background untouched).
+    let buf = frame.buffer_mut();
+    if has_above && first > 0 && first - 1 < vh {
+        fill_half_block_row(
+            buf,
+            msg_rect.x,
+            msg_rect.y + (first - 1) as u16,
+            msg_rect.width,
+            "▄",
+            MESSAGE_SELECT_BG,
+        );
+    }
+    if has_below && last + 1 >= 0 && last + 1 < vh {
+        fill_half_block_row(
+            buf,
+            msg_rect.x,
+            msg_rect.y + (last + 1) as u16,
+            msg_rect.width,
+            "▀",
+            MESSAGE_SELECT_BG,
+        );
+    }
+
+    // 3. ┃ accent down the front of the selection block (separator rows
+    //    included when present), at the same column as the composer's.
+    let accent_top = if has_above { first - 1 } else { first };
+    let accent_bottom = if has_below { last + 1 } else { last };
+    for row in accent_top.max(0)..=accent_bottom.min(vh - 1) {
+        buf[(COMPOSER_ACCENT_X, msg_rect.y + row as u16)]
+            .set_symbol("┃")
+            .set_style(Style::new().fg(INPUT_LINE));
+    }
+}
+
+/// Fill one row with a half-block character in the given color.
+fn fill_half_block_row(
+    buf: &mut ratatui::buffer::Buffer,
+    x: u16,
+    y: u16,
+    width: u16,
+    symbol: &str,
+    color: Color,
+) {
+    for col in x..x + width {
+        buf[(col, y)]
+            .set_symbol(symbol)
+            .set_style(Style::new().fg(color));
+    }
 }
 
 /// Render the gap below the composer: the `┃` accent tapers into a `╹` and the
@@ -354,39 +501,26 @@ mod tests {
 
     fn msg(nick: &str, text: &str) -> ChatMessage {
         ChatMessage {
-            server: "srv".to_string(),
-            channel: "#c".to_string(),
+            server: "osu_irc".to_string(),
+            channel: "#osu".to_string(),
             nick: nick.to_string(),
             text: text.to_string(),
         }
     }
 
-    /// A config with one server and two channels; "#osu" is the active channel.
-    fn test_config() -> Config {
-        Config::parse(
-            r##"
-[servers.osu_irc]
-username = "alice"
-nickname = "alice"
-password = "secret"
-server = "irc.example.org"
-port = 6667
-channels = ["#osu", "#chinese"]
-"##,
-        )
-        .unwrap()
+    /// An app with both channels of the test config registered; "#osu" active.
+    fn test_app(width: u16, height: u16) -> App {
+        let mut app = App::new(width, height);
+        app.open_channel("osu_irc", "#osu");
+        app.open_channel("osu_irc", "#chinese");
+        app
     }
 
     /// Render into a headless terminal. The message viewport is sized to match
     /// what `main.rs` would compute: main column width minus 2*HORIZONTAL_PAD,
-    /// height minus TITLE_ROWS and INPUT_ROWS.
-    fn render_sized(app: &App, config: &Config, status: &str, w: u16, h: u16) -> Buffer {
-        let chrome = Chrome {
-            config,
-            active_server: "osu_irc",
-            active_channel: "#osu",
-            status,
-        };
+    /// height minus the fixed chrome rows.
+    fn render_sized(app: &App, status: &str, w: u16, h: u16) -> Buffer {
+        let chrome = Chrome { status };
         let backend = TestBackend::new(w, h);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, app, &chrome)).unwrap();
@@ -407,12 +541,11 @@ channels = ["#osu", "#chinese"]
     #[test]
     fn channel_name_shown_on_top_row_and_no_border() {
         // Arrange: 50x10 terminal -> sidebar 22, main 28; viewport 24x5.
-        let mut app = App::new(22, 3);
+        let mut app = test_app(22, 3);
         app.push_message(msg("alice", "hi"));
-        let config = test_config();
 
         // Act
-        let buffer = render_sized(&app, &config, "", 50, 10);
+        let buffer = render_sized(&app, "", 50, 10);
 
         // Assert: channel name on the top row at the main column's content start.
         assert_eq!(buffer.cell((MAIN_COL_X, 0)).unwrap().symbol(), "#");
@@ -437,10 +570,9 @@ channels = ["#osu", "#chinese"]
         // Arrange
         let mut app = App::new(22, 3);
         app.push_message(msg("alice", "hello"));
-        let config = test_config();
 
         // Act
-        let buffer = render_sized(&app, &config, "", 50, 10);
+        let buffer = render_sized(&app, "", 50, 10);
 
         // Assert: first message row (row 1) starts at the main content column.
         assert_eq!(buffer.cell((MAIN_COL_X, 1)).unwrap().symbol(), "a");
@@ -453,10 +585,9 @@ channels = ["#osu", "#chinese"]
         // 7 columns, body width 11; "one two three four" -> "one two" / "three four".
         let mut app = App::new(18, 3);
         app.push_message(msg("alice", "one two three four"));
-        let config = test_config();
 
         // Act
-        let buffer = render_sized(&app, &config, "", 46, 10);
+        let buffer = render_sized(&app, "", 46, 10);
 
         // Assert: row 2 is blank under the nick, body resumes at the next column.
         let nick_end = MAIN_COL_X + 7; // "alice: " is 7 columns
@@ -479,10 +610,9 @@ channels = ["#osu", "#chinese"]
         let mut app = App::new(22, 3);
         app.push_message(msg("a", "first"));
         app.push_message(msg("b", "second"));
-        let config = test_config();
 
         // Act
-        let buffer = render_sized(&app, &config, "", 50, 11);
+        let buffer = render_sized(&app, "", 50, 11);
 
         // Assert: in the main content area, the row between the messages is
         // blank (the sidebar separator `│` sits in the pad column to its left);
@@ -505,10 +635,9 @@ channels = ["#osu", "#chinese"]
             app.push_message(msg("u", &format!("m{i}")));
         }
         app.set_scroll_offset(2);
-        let config = test_config();
 
         // Act
-        let buffer = render_sized(&app, &config, "", 50, 10);
+        let buffer = render_sized(&app, "", 50, 10);
 
         // Assert: offset 2 puts content row 2 ("m1") on the first visible row.
         let row = buffer_line(&buffer, 1);
@@ -518,43 +647,149 @@ channels = ["#osu", "#chinese"]
     #[test]
     fn sidebar_lists_configured_servers_and_channels() {
         // Arrange
-        let app = App::new(22, 3);
-        let config = test_config();
+        let app = test_app(22, 3);
 
         // Act
-        let buffer = render_sized(&app, &config, "", 50, 10);
+        let buffer = render_sized(&app, "", 50, 10);
 
-        // Assert: server and both channels appear in the sidebar.
+        // Assert: server (with expand marker) and both channels in the sidebar.
         assert!(buffer_line(&buffer, 0).contains("osu_irc"));
+        assert!(buffer_line(&buffer, 0).contains("▾"));
         assert!(buffer_line(&buffer, 1).contains("#osu"));
         assert!(buffer_line(&buffer, 2).contains("#chinese"));
     }
 
     #[test]
-    fn sidebar_highlights_active_channel() {
+    fn sidebar_highlights_active_channel_row() {
         // Arrange
-        let app = App::new(22, 3);
-        let config = test_config();
+        let app = test_app(22, 3);
 
         // Act
-        let buffer = render_sized(&app, &config, "", 50, 10);
+        let buffer = render_sized(&app, "", 50, 10);
 
-        // Assert: the active "#osu" row has the ▶ marker and accent color; the
-        // inactive "#chinese" row has neither.
-        assert!(buffer_line(&buffer, 1).contains("▶"));
-        assert_eq!(buffer.cell((5, 1)).unwrap().fg, ACCENT); // '#' of "#osu"
-        assert!(!buffer_line(&buffer, 2).contains("▶"));
-        assert_ne!(buffer.cell((5, 2)).unwrap().fg, ACCENT); // '#' of "#chinese"
+        // Assert: the active "#osu" row (row 1) has the brighter background,
+        // the inactive "#chinese" row (row 2) does not. Column 10 is inside
+        // the sidebar's inner area.
+        let active_bg = buffer.cell((10, 1)).unwrap().bg;
+        let inactive_bg = buffer.cell((10, 2)).unwrap().bg;
+        assert_eq!(active_bg, SIDEBAR_ACTIVE_BG);
+        assert_ne!(inactive_bg, SIDEBAR_ACTIVE_BG);
+    }
+
+    #[test]
+    fn sidebar_cursor_row_gets_cursor_bg_and_block_cursor() {
+        // Arrange: focus the sidebar; the cursor starts on row 0 (the server).
+        let mut app = test_app(22, 3);
+
+        app.tab();
+        assert_eq!(app.focus(), Focus::Sidebar);
+        assert_eq!(app.sidebar_cursor(), Some(0));
+
+        // Act
+        let buffer = render_sized(&app, "", 50, 10);
+
+        // Assert: row 0 (sidebar inner starts at col 1) shows the reverse-video
+        // block cursor and the cursor-row background.
+        let cursor_cell = buffer.cell((1, 0)).unwrap();
+        assert_eq!(cursor_cell.bg, Color::White);
+        let inner_cell = buffer.cell((10, 0)).unwrap();
+        assert_eq!(inner_cell.bg, SIDEBAR_CURSOR_BG);
+        // Row 1 (a channel row, not under the cursor) keeps the plain bg.
+        assert_ne!(buffer.cell((10, 1)).unwrap().bg, SIDEBAR_CURSOR_BG);
+    }
+
+    #[test]
+    fn sidebar_collapsed_server_shows_fold_marker() {
+        // Arrange: collapse the server, then check the marker and hidden rows.
+        let mut app = test_app(22, 3);
+
+        app.tab();
+        app.sidebar_enter(); // collapse osu_irc
+
+        // Act
+        let buffer = render_sized(&app, "", 50, 10);
+
+        // Assert: ▸ marker on the server row; channel rows hidden.
+        assert!(buffer_line(&buffer, 0).contains("▸"));
+        assert!(!buffer_line(&buffer, 1).contains("#osu"));
+    }
+
+    #[test]
+    fn composer_dims_and_hides_cursor_when_not_focused() {
+        // Arrange: type text, then move focus to the messages pane.
+        let mut app = test_app(22, 3);
+        app.type_char('h');
+        app.tab(); // sidebar
+        app.tab(); // messages -> composer unfocused
+
+        // Act
+        let buffer = render_sized(&app, "", 50, 10);
+
+        // Assert: the ┃ accent is dimmed and the input row has no cursor block.
+        let accent = buffer.cell((INPUT_X, 5)).unwrap();
+        assert_eq!(accent.fg, INPUT_LINE_DIM);
+        assert_ne!(buffer.cell((MAIN_COL_X, 5)).unwrap().bg, Color::White);
+    }
+
+    #[test]
+    fn selected_message_gets_highlight_half_blocks_and_accent() {
+        // Arrange: 3 one-line messages in a 4-row viewport (terminal 50x12).
+        // Spans: m0=(0) sep m1=(2) sep m2=(4); auto-follow scrolls to offset 1,
+        // so the default selection is m2. One k selects m1 (span row 2), which
+        // lands on screen row 2 with separators at screen rows 1 and 3.
+        let mut app = test_app(22, 4);
+        app.push_message(msg("a", "one"));
+        app.push_message(msg("b", "two"));
+        app.push_message(msg("c", "three"));
+        app.tab();
+        app.tab(); // messages focused -> selects m2
+        app.select_prev(); // -> m1
+
+        // Act
+        let buffer = render_sized(&app, "", 50, 12);
+
+        // Assert: the selected message row is highlighted...
+        assert_eq!(buffer.cell((MAIN_COL_X, 2)).unwrap().bg, MESSAGE_SELECT_BG);
+        // ...the separator above renders ▄ and the one below ▀ in that color...
+        let above = buffer.cell((MAIN_COL_X, 1)).unwrap();
+        assert_eq!(above.symbol(), "▄");
+        assert_eq!(above.fg, MESSAGE_SELECT_BG);
+        let below = buffer.cell((MAIN_COL_X, 3)).unwrap();
+        assert_eq!(below.symbol(), "▀");
+        assert_eq!(below.fg, MESSAGE_SELECT_BG);
+        // ...and a pale-green ┃ runs down the front of the block.
+        for y in 1..=3 {
+            let accent = buffer.cell((INPUT_X, y)).unwrap();
+            assert_eq!(accent.symbol(), "┃", "accent missing on row {y}");
+            assert_eq!(accent.fg, INPUT_LINE);
+        }
+    }
+
+    #[test]
+    fn selection_not_rendered_when_messages_unfocused() {
+        // Arrange: same setup but WITHOUT focusing the message pane.
+        let mut app = test_app(22, 4);
+        app.push_message(msg("a", "one"));
+        app.push_message(msg("b", "two"));
+        app.push_message(msg("c", "three"));
+
+        // Act
+        let buffer = render_sized(&app, "", 50, 12);
+
+        // Assert: no highlight, half-blocks, or accent anywhere in the pane.
+        for y in 1..=4 {
+            assert_ne!(buffer.cell((MAIN_COL_X, y)).unwrap().bg, MESSAGE_SELECT_BG);
+            assert_ne!(buffer.cell((INPUT_X, y)).unwrap().symbol(), "┃");
+        }
     }
 
     #[test]
     fn input_area_has_background_and_accent_column() {
         // Arrange: 50x10 -> input occupies rows 4..=7 (above the 2-row gap).
         let app = App::new(22, 3);
-        let config = test_config();
 
         // Act
-        let buffer = render_sized(&app, &config, "", 50, 10);
+        let buffer = render_sized(&app, "", 50, 10);
 
         // Assert: each input row has the `┃` accent at the composer's left edge
         // (col INPUT_X) in pale green, standing on the global bg (no panel bg
@@ -575,10 +810,9 @@ channels = ["#osu", "#chinese"]
     fn input_area_shows_tips_on_last_row() {
         // Arrange: a wide terminal so the full status + tips line fits.
         let app = App::new(72, 3);
-        let config = test_config();
 
         // Act
-        let buffer = render_sized(&app, &config, "connected to irc.example.org", 100, 10);
+        let buffer = render_sized(&app, "connected to irc.example.org", 100, 10);
 
         // Assert: the input's last row (row 7) carries status plus key hints.
         let tips = buffer_line(&buffer, 7);
@@ -595,10 +829,9 @@ channels = ["#osu", "#chinese"]
         let mut app = App::new(22, 3);
         app.type_char('h');
         app.type_char('i');
-        let config = test_config();
 
         // Act
-        let buffer = render_sized(&app, &config, "", 50, 10);
+        let buffer = render_sized(&app, "", 50, 10);
 
         // Assert: the input line (row 5) shows the text and a reverse-video cursor.
         let row = buffer_line(&buffer, 5);
@@ -611,10 +844,9 @@ channels = ["#osu", "#chinese"]
     fn separator_uninterrupted_full_height() {
         // Arrange
         let app = App::new(22, 3);
-        let config = test_config();
 
         // Act
-        let buffer = render_sized(&app, &config, "", 50, 10);
+        let buffer = render_sized(&app, "", 50, 10);
 
         // Assert: the gray `│` runs the full height (every row) at col SIDEBAR_WIDTH,
         // no longer overridden by the composer (the `┃` now sits at col INPUT_X).
@@ -637,10 +869,9 @@ channels = ["#osu", "#chinese"]
     fn fade_row_uses_heavy_up_taper() {
         // Arrange
         let app = App::new(22, 3);
-        let config = test_config();
 
         // Act
-        let buffer = render_sized(&app, &config, "", 50, 10);
+        let buffer = render_sized(&app, "", 50, 10);
 
         // Assert: on the fade row (row 8), the composer's `┃` tapers via `╹`
         // (pale green, on the global bg); the rest of the row is the `▀` fade.
@@ -657,10 +888,9 @@ channels = ["#osu", "#chinese"]
     fn separator_and_background_colors() {
         // Arrange
         let app = App::new(22, 3);
-        let config = test_config();
 
         // Act
-        let buffer = render_sized(&app, &config, "", 50, 10);
+        let buffer = render_sized(&app, "", 50, 10);
 
         // Assert: a thin gray `│` separates sidebar and main on the message rows;
         // col SIDEBAR_WIDTH+1 is the 1-char blank gap (global bg).
@@ -681,10 +911,9 @@ channels = ["#osu", "#chinese"]
         let mut app = App::new(22, 3);
         app.type_char('h');
         app.type_char('i');
-        let config = test_config();
 
         // Act
-        let buffer = render_sized(&app, &config, "", 50, 10);
+        let buffer = render_sized(&app, "", 50, 10);
         let row = 5; // the input text row
 
         // Assert: panel right edge is 3 columns from the screen edge.
@@ -702,10 +931,9 @@ channels = ["#osu", "#chinese"]
         // Arrange: H=11 with empty input -> messages rows 1-3, spacer row 4,
         // composer rows 5-8.
         let app = App::new(22, 3);
-        let config = test_config();
 
         // Act
-        let buffer = render_sized(&app, &config, "", 50, 11);
+        let buffer = render_sized(&app, "", 50, 11);
 
         // Assert: the spacer row is blank with the global background across the
         // main column, and the composer ┃ starts on the row below it.
@@ -725,10 +953,9 @@ channels = ["#osu", "#chinese"]
         for _ in 0..25 {
             app.type_char('x');
         }
-        let config = test_config();
 
         // Act
-        let buffer = render_sized(&app, &config, "", 50, 11);
+        let buffer = render_sized(&app, "", 50, 11);
 
         // Assert: the ┃ spans all 5 composer rows, both wrapped text lines are
         // shown, and the tips row moved down to row 8.
@@ -744,9 +971,9 @@ channels = ["#osu", "#chinese"]
     fn multiline_input_squeezes_the_message_pane() {
         // Arrange / Act: empty input -> composer 4 rows (┃ top at row 5 for H=11);
         // 2-line input -> composer 5 rows (┃ top moves up to row 4).
-        let config = test_config();
+
         let app_empty = App::new(22, 3);
-        let buf_empty = render_sized(&app_empty, &config, "", 50, 11);
+        let buf_empty = render_sized(&app_empty, "", 50, 11);
         assert_eq!(buf_empty.cell((INPUT_X, 5)).unwrap().symbol(), "┃");
         assert_eq!(buf_empty.cell((INPUT_X, 4)).unwrap().symbol(), " ");
 
@@ -754,7 +981,7 @@ channels = ["#osu", "#chinese"]
         for _ in 0..25 {
             app_full.type_char('x');
         }
-        let buf_full = render_sized(&app_full, &config, "", 50, 11);
+        let buf_full = render_sized(&app_full, "", 50, 11);
 
         // Assert: the composer's top edge moved up one row.
         assert_eq!(buf_full.cell((INPUT_X, 4)).unwrap().symbol(), "┃");
