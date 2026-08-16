@@ -1,12 +1,12 @@
-//! termirc binary: load config, start the IRC thread, run the TUI loop.
+//! termirc binary: load config, start one IRC thread per server, run the TUI.
 
 use std::time::Duration;
 
 use anyhow::Context;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
-use termirc::app::App;
-use termirc::config::{Config, ServerConfig};
+use termirc::app::{App, Focus};
+use termirc::config::Config;
 use termirc::irc::{IrcEvent, spawn_irc};
 use termirc::ui;
 
@@ -27,15 +27,12 @@ fn main() -> anyhow::Result<()> {
             config_path.display()
         )
     })?;
-
-    let (server_name, server) = config.first_server().context("config has no servers")?;
-    let channel = server
-        .first_channel()
-        .with_context(|| format!("server '{server_name}' has no channels"))?
-        .to_string();
+    if config.first_server().is_none() {
+        anyhow::bail!("config has no servers");
+    }
 
     let mut terminal = ratatui::try_init()?;
-    let result = run(&mut terminal, server.clone(), channel, &config, server_name);
+    let result = run(&mut terminal, &config);
     ratatui::restore();
     result
 }
@@ -50,81 +47,95 @@ fn install_panic_hook() {
     }));
 }
 
-fn run(
-    terminal: &mut ratatui::DefaultTerminal,
-    server: ServerConfig,
-    channel: String,
-    config: &Config,
-    server_name: &str,
-) -> anyhow::Result<()> {
+fn run(terminal: &mut ratatui::DefaultTerminal, config: &Config) -> anyhow::Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
-    // IRC threads are deliberately not joined: they block on network I/O and
-    // are reaped when the process exits.
-    let channels = server.channels.clone();
-    let _irc_thread = spawn_irc(server, server_name.to_string(), channels, tx);
+    // One IRC thread per configured server, joining all of its channels.
+    // Threads are deliberately not joined: they block on network I/O and are
+    // reaped when the process exits.
+    for (name, server) in config.servers.iter() {
+        let _ = spawn_irc(
+            server.clone(),
+            name.clone(),
+            server.channels.clone(),
+            tx.clone(),
+        );
+    }
+    drop(tx);
 
     let s = terminal.size()?;
     let mut term_size = (s.width, s.height);
     let mut app = App::new(1, 1);
+    // Register every server's channels in config order; the first is viewed.
+    for (name, server) in config.servers.iter() {
+        for channel in &server.channels {
+            app.open_channel(name, channel);
+        }
+    }
     fit_app(&mut app, term_size);
-    let mut status = format!("connecting to {channel}…");
+    let mut status = "connecting…".to_string();
 
     while app.is_running() {
-        let chrome = ui::Chrome {
-            config,
-            active_server: server_name,
-            active_channel: &channel,
-            status: &status,
-        };
+        let chrome = ui::Chrome { status: &status };
         terminal.draw(|frame| ui::draw(frame, &app, &chrome))?;
 
         if event::poll(POLL_INTERVAL)? {
             let mut relayout = false;
+            let composer_focused = app.focus() == Focus::Composer;
             match event::read()? {
                 // Windows also emits Release/Repeat events - handle presses only.
-                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-                    KeyCode::PageUp => app.scroll_page_up(),
-                    KeyCode::PageDown => app.scroll_page_down(),
-                    // Quit: Esc or Ctrl+C. (`q` now types into the composer.)
-                    KeyCode::Esc => app.quit(),
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        app.quit()
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                    match key.code {
+                        KeyCode::Tab => app.tab(),
+                        KeyCode::PageUp => app.scroll_page_up(),
+                        KeyCode::PageDown => app.scroll_page_down(),
+                        // Quit: Esc or Ctrl+C.
+                        KeyCode::Esc => app.quit(),
+                        KeyCode::Char('c') if ctrl => app.quit(),
+                        // j/k navigate the focused pane (or type when composing).
+                        KeyCode::Char('j') if !ctrl => match app.focus() {
+                            Focus::Sidebar => app.sidebar_down(),
+                            Focus::Messages => app.select_next(),
+                            Focus::Composer => {
+                                app.type_char('j');
+                                relayout = true;
+                            }
+                        },
+                        KeyCode::Char('k') if !ctrl => match app.focus() {
+                            Focus::Sidebar => app.sidebar_up(),
+                            Focus::Messages => app.select_prev(),
+                            Focus::Composer => {
+                                app.type_char('k');
+                                relayout = true;
+                            }
+                        },
+                        // Enter interacts with the sidebar row under its cursor;
+                        // the composer has no send action yet.
+                        KeyCode::Enter => {
+                            if app.focus() == Focus::Sidebar {
+                                app.sidebar_enter();
+                            }
+                        }
+                        // Composer-only editing keys.
+                        KeyCode::Char(c) if composer_focused && !ctrl && !c.is_control() => {
+                            app.type_char(c);
+                            relayout = true;
+                        }
+                        KeyCode::Backspace if composer_focused => {
+                            app.backspace();
+                            relayout = true;
+                        }
+                        KeyCode::Delete if composer_focused => {
+                            app.delete();
+                            relayout = true;
+                        }
+                        KeyCode::Left if composer_focused => app.cursor_left(),
+                        KeyCode::Right if composer_focused => app.cursor_right(),
+                        KeyCode::Home if composer_focused => app.cursor_home(),
+                        KeyCode::End if composer_focused => app.cursor_end(),
+                        _ => {}
                     }
-                    // Composer input (receive-only: Enter does not send). Any
-                    // edit can change the composer's line count, so re-fit.
-                    KeyCode::Char(c)
-                        if !key.modifiers.contains(KeyModifiers::CONTROL) && !c.is_control() =>
-                    {
-                        app.type_char(c);
-                        relayout = true;
-                    }
-                    KeyCode::Backspace => {
-                        app.backspace();
-                        relayout = true;
-                    }
-                    KeyCode::Delete => {
-                        app.delete();
-                        relayout = true;
-                    }
-                    KeyCode::Left => {
-                        app.cursor_left();
-                        relayout = true;
-                    }
-                    KeyCode::Right => {
-                        app.cursor_right();
-                        relayout = true;
-                    }
-                    KeyCode::Home => {
-                        app.cursor_home();
-                        relayout = true;
-                    }
-                    KeyCode::End => {
-                        app.cursor_end();
-                        relayout = true;
-                    }
-                    KeyCode::Enter => {}
-                    _ => {}
-                },
+                }
                 Event::Resize(width, height) => {
                     term_size = (width, height);
                     relayout = true;
@@ -140,7 +151,7 @@ fn run(
             match irc_event {
                 IrcEvent::Message(message) => app.push_message(message),
                 IrcEvent::Status(text) => status = text,
-                IrcEvent::Error(text) => status = format!("error: {text}"),
+                IrcEvent::Error(text) => status = text,
             }
         }
     }

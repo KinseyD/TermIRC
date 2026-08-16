@@ -36,15 +36,25 @@ and edits text but `Enter` does not send.
 
 ## Keys
 
-| Key | Action |
-|-----|--------|
-| `PgUp` | scroll up by ⅓ of the window height |
-| `PgDn` | scroll down by ⅓ of the window height |
-| printable chars | type into the composer |
-| `Backspace` / `Delete` | delete behind / at the cursor |
-| `Left` / `Right` / `Home` / `End` | move the composer cursor |
-| `Enter` | (no-op — sending is not implemented) |
-| `Esc` / `Ctrl+C` | quit |
+Focus cycles between the three panes with `Tab`:
+
+| Key | Sidebar focused | Messages focused | Composer focused |
+|-----|-----------------|------------------|------------------|
+| `j` / `k` | move the cursor down / up | select the next / previous message | type `j` / `k` |
+| `Enter` | collapse/expand a server row, or switch to the channel under the cursor | (no-op) | (no send yet) |
+| printable chars | — | — | type into the composer |
+| `Backspace`/`Delete`/arrows | — | — | edit the composer input |
+| `PgUp` / `PgDn` | scroll the message pane by ⅓ of its height | same | same |
+| `Esc` / `Ctrl+C` | quit | quit | quit |
+
+While the sidebar has focus its cursor row is slightly highlighted (with a
+block cursor) and the viewed channel row is brighter; `Enter` on a channel
+switches the message pane and returns focus to the composer. While the
+message pane has focus one message is always selected: its rows are
+highlighted, the blank rows above/below render as half blocks, and a pale
+green `┃` accent marks its front edge; `j`/`k` move the selection (auto
+scrolling minimally to reveal it) and incoming messages do not disturb the
+view. The composer's accent dims while another pane has focus.
 
 Connection status is shown on the composer's bottom (tips) row. If the server
 drops the connection, the status changes to `disconnected from …` (or an error
