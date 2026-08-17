@@ -158,7 +158,7 @@ pub fn draw(frame: &mut Frame, app: &App, chrome: &Chrome<'_>) {
         chrome.status,
         app,
     );
-    render_gap(frame, rows[4], frame.area().width);
+    render_gap(frame, rows[4], frame.area().width, app);
 }
 
 /// Render the thin gray vertical line that separates the sidebar from the main
@@ -466,13 +466,18 @@ fn fill_half_block_row(
 
 /// Render the gap below the composer: the `┃` accent tapers into a `╹` and the
 /// composer panel fades out via `▀` across its width.
-fn render_gap(frame: &mut Frame, area: Rect, screen_w: u16) {
+fn render_gap(frame: &mut Frame, area: Rect, screen_w: u16, app: &App) {
     let panel_left = COMPOSER_ACCENT_X + 1;
     let panel_w = screen_w
         .saturating_sub(INPUT_RIGHT_GAP)
         .saturating_sub(panel_left);
+    let taper_color = if app.focus() == Focus::Composer {
+        INPUT_LINE
+    } else {
+        INPUT_LINE_DIM
+    };
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled("╹", Style::new().fg(INPUT_LINE)))),
+        Paragraph::new(Line::from(Span::styled("╹", Style::new().fg(taper_color)))),
         Rect::new(COMPOSER_ACCENT_X, area.y, 1, 1),
     );
     let fade = Span::styled("▀".repeat(panel_w as usize), Style::new().fg(INPUT_BG));
