@@ -398,7 +398,9 @@ fn render_composer(
 /// the selected message's rows get the highlight background, the separator row
 /// above becomes a lower-half block (`▄`) and the one below an upper-half
 /// block (`▀`) in the highlight color, and a pale-green `┃` accent runs down
-/// the front of the whole block (like the composer's).
+/// the front of the whole block (like the composer's) — starting with a
+/// lower-half stroke (`╻`) and ending with an upper-half stroke (`╹`). The
+/// highlight starts flush against the accent so no global-bg gap shows.
 fn render_selection(frame: &mut Frame, msg_rect: Rect, app: &App) {
     if app.focus() != Focus::Messages {
         return;
@@ -417,14 +419,19 @@ fn render_selection(frame: &mut Frame, msg_rect: Rect, app: &App) {
     let has_above = i64::from(start) > 0; // a separator row exists above
     let has_below = i64::from(start) + i64::from(height) < total;
 
+    // The selection block (highlight rows + half-block separators) starts
+    // flush against the ┃ accent — no global-bg gap cell in between.
+    let block_x = (COMPOSER_ACCENT_X + 1).min(msg_rect.x);
+    let block_w = msg_rect.x + msg_rect.width - block_x;
+
     // 1. Highlight background on the message's own rows (clipped to the pane).
     let top = first.max(0);
     let bottom = last.min(vh - 1);
     frame.buffer_mut().set_style(
         Rect::new(
-            msg_rect.x,
+            block_x,
             msg_rect.y + top as u16,
-            msg_rect.width,
+            block_w,
             (bottom - top + 1) as u16,
         ),
         Style::new().bg(MESSAGE_SELECT_BG),
@@ -436,9 +443,9 @@ fn render_selection(frame: &mut Frame, msg_rect: Rect, app: &App) {
     if has_above && first > 0 && first - 1 < vh {
         fill_half_block_row(
             buf,
-            msg_rect.x,
+            block_x,
             msg_rect.y + (first - 1) as u16,
-            msg_rect.width,
+            block_w,
             "▄",
             MESSAGE_SELECT_BG,
         );
@@ -446,21 +453,32 @@ fn render_selection(frame: &mut Frame, msg_rect: Rect, app: &App) {
     if has_below && last + 1 >= 0 && last + 1 < vh {
         fill_half_block_row(
             buf,
-            msg_rect.x,
+            block_x,
             msg_rect.y + (last + 1) as u16,
-            msg_rect.width,
+            block_w,
             "▀",
             MESSAGE_SELECT_BG,
         );
     }
 
     // 3. ┃ accent down the front of the selection block (separator rows
-    //    included when present), at the same column as the composer's.
+    //    included when present), at the same column as the composer's. The
+    //    top cell keeps only the lower half of the stroke (╻) and the bottom
+    //    cell only the upper half (╹), so the line tapers at both ends.
     let accent_top = if has_above { first - 1 } else { first };
     let accent_bottom = if has_below { last + 1 } else { last };
     for row in accent_top.max(0)..=accent_bottom.min(vh - 1) {
+        let symbol = if row == accent_top && row == accent_bottom {
+            "┃"
+        } else if row == accent_top {
+            "╻"
+        } else if row == accent_bottom {
+            "╹"
+        } else {
+            "┃"
+        };
         buf[(COMPOSER_ACCENT_X, msg_rect.y + row as u16)]
-            .set_symbol("┃")
+            .set_symbol(symbol)
             .set_style(Style::new().fg(INPUT_LINE));
     }
 }
@@ -833,12 +851,66 @@ mod tests {
         let below = buffer.cell((MAIN_COL_X, 3)).unwrap();
         assert_eq!(below.symbol(), "▀");
         assert_eq!(below.fg, MESSAGE_SELECT_BG);
-        // ...and a pale-green ┃ runs down the front of the block.
+        // ...and a pale-green accent runs down the front of the block,
+        // tapering at both ends (╻ … ┃ … ╹ — details in the taper test).
         for y in 1..=3 {
             let accent = buffer.cell((INPUT_X, y)).unwrap();
-            assert_eq!(accent.symbol(), "┃", "accent missing on row {y}");
-            assert_eq!(accent.fg, INPUT_LINE);
+            assert_eq!(accent.fg, INPUT_LINE, "accent missing on row {y}");
         }
+    }
+
+    #[test]
+    fn selection_highlight_starts_flush_against_the_accent() {
+        // Arrange: as in selected_message_gets_highlight_half_blocks_and_accent,
+        // the selected message lands on screen row 2 with separators at 1 and 3.
+        let mut app = test_app(22, 4);
+        app.push_message(msg("a", "one"));
+        app.push_message(msg("b", "two"));
+        app.push_message(msg("c", "three"));
+        app.tab();
+        app.tab(); // messages focused -> selects m2
+        app.select_prev(); // -> m1
+
+        // Act
+        let buffer = render_sized(&app, "", 50, 12);
+
+        // Assert: the column right after the ┃ accent is part of the highlight
+        // (no global-bg gap between accent and highlight)...
+        assert_eq!(buffer.cell((INPUT_X + 1, 2)).unwrap().bg, MESSAGE_SELECT_BG);
+        // ...and the half-block separators reach into it as well.
+        assert_eq!(buffer.cell((INPUT_X + 1, 1)).unwrap().symbol(), "▄");
+        assert_eq!(buffer.cell((INPUT_X + 1, 1)).unwrap().fg, MESSAGE_SELECT_BG);
+        assert_eq!(buffer.cell((INPUT_X + 1, 3)).unwrap().symbol(), "▀");
+        assert_eq!(buffer.cell((INPUT_X + 1, 3)).unwrap().fg, MESSAGE_SELECT_BG);
+        // The accent itself keeps standing on the global background.
+        assert_eq!(buffer.cell((INPUT_X, 2)).unwrap().bg, GLOBAL_BG);
+    }
+
+    #[test]
+    fn selection_accent_tapers_at_both_ends() {
+        // Arrange: selection block spans screen rows 1..=3 (▄ / message / ▀).
+        let mut app = test_app(22, 4);
+        app.push_message(msg("a", "one"));
+        app.push_message(msg("b", "two"));
+        app.push_message(msg("c", "three"));
+        app.tab();
+        app.tab(); // messages focused -> selects m2
+        app.select_prev(); // -> m1
+
+        // Act
+        let buffer = render_sized(&app, "", 50, 12);
+
+        // Assert: the accent starts with a lower-half stroke, runs full ┃
+        // through the middle, and ends with an upper-half stroke.
+        let top = buffer.cell((INPUT_X, 1)).unwrap();
+        assert_eq!(top.symbol(), "╻");
+        assert_eq!(top.fg, INPUT_LINE);
+        let middle = buffer.cell((INPUT_X, 2)).unwrap();
+        assert_eq!(middle.symbol(), "┃");
+        assert_eq!(middle.fg, INPUT_LINE);
+        let bottom = buffer.cell((INPUT_X, 3)).unwrap();
+        assert_eq!(bottom.symbol(), "╹");
+        assert_eq!(bottom.fg, INPUT_LINE);
     }
 
     #[test]
