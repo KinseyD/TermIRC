@@ -24,10 +24,12 @@ and edits text but `Enter` does not send.
 ```
 
 - **Sidebar** (fixed width): the configured servers and their channels; the
-  connected channel is highlighted.
+  viewed channel is highlighted.
 - **Message pane**: each message spans the pane; the nick and body each take
   their own horizontal space, and wrapped body lines are indented to the body
   column (never under the nick). Exactly one blank line separates two messages.
+  On startup a **welcome page** is shown until you open a channel from the
+  sidebar; focus starts on the sidebar.
 - **Composer** (bottom): a shaded input box with a pale-green `┃` accent on its
   left. It keeps a 3-column gap from the screen's right edge and a 2-column
   margin inside the box. When the typed text exceeds one line it wraps, the
@@ -48,13 +50,15 @@ Focus cycles between the three panes with `Tab`:
 | `Esc` / `Ctrl+C` | quit | quit | quit |
 
 While the sidebar has focus its cursor row is slightly highlighted (with a
-block cursor) and the viewed channel row is brighter; `Enter` on a channel
-switches the message pane and returns focus to the composer. While the
-message pane has focus one message is always selected: its rows are
-highlighted, the blank rows above/below render as half blocks, and a pale
-green `┃` accent marks its front edge; `j`/`k` move the selection (auto
-scrolling minimally to reveal it) and incoming messages do not disturb the
-view. The composer's accent dims while another pane has focus.
+block cursor) and the viewed channel row is brighter; moving focus into the
+sidebar snaps the cursor onto the viewed channel's row (or the first row when
+the welcome page is up). `Enter` on a channel switches the message pane and
+returns focus to the composer. While the message pane has focus one message
+is always selected: its rows are highlighted, the blank rows above/below
+render as half blocks, and a pale green `┃` accent marks its front edge;
+`j`/`k` move the selection (auto scrolling minimally to reveal it) and
+incoming messages do not disturb the view. The composer's accent dims while
+another pane has focus.
 
 Connection status is shown on the composer's bottom (tips) row. If the server
 drops the connection, the status changes to `disconnected from …` (or an error

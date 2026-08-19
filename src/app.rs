@@ -69,9 +69,10 @@ pub struct SidebarRow {
 }
 
 pub struct App {
-    /// Registered channels in sidebar order; `active` indexes the viewed one.
+    /// Registered channels in sidebar order; `active` indexes the viewed one
+    /// (`None` = no channel open yet: the message pane shows a welcome page).
     channels: Vec<ChannelState>,
-    active: usize,
+    active: Option<usize>,
     focus: Focus,
     /// Sidebar cursor (visible-row index), present only while the sidebar is focused.
     sidebar_cursor: Option<usize>,
@@ -96,9 +97,9 @@ impl App {
     fn with_caps(width: u16, viewport_height: u16, message_cap: usize, line_cap: usize) -> App {
         App {
             channels: Vec::new(),
-            active: 0,
-            focus: Focus::Composer,
-            sidebar_cursor: None,
+            active: None,
+            focus: Focus::Sidebar,
+            sidebar_cursor: Some(0),
             collapsed: std::collections::BTreeSet::new(),
             width,
             viewport_height,
@@ -112,8 +113,9 @@ impl App {
 
     // ----- channels -----
 
-    /// Register a channel (idempotent, matched case-insensitively). The first
-    /// registered channel is the initially viewed one.
+    /// Register a channel (idempotent, matched case-insensitively).
+    /// Registering does not view the channel — that happens through
+    /// `select_channel` (the sidebar's Enter).
     pub fn open_channel(&mut self, server: &str, channel: &str) {
         if self.find_channel(server, channel).is_none() {
             self.channels
@@ -126,19 +128,19 @@ impl App {
         self.channels.len()
     }
 
-    /// The `(server, channel)` currently being viewed.
-    pub fn active_channel(&self) -> (&str, &str) {
-        match self.channels.get(self.active) {
-            Some(state) => (&state.server, &state.channel),
-            None => ("", ""),
-        }
+    /// The `(server, channel)` currently being viewed, or `None` while the
+    /// welcome page is shown (no channel opened yet).
+    pub fn active_channel(&self) -> Option<(&str, &str)> {
+        self.active
+            .and_then(|i| self.channels.get(i))
+            .map(|s| (s.server.as_str(), s.channel.as_str()))
     }
 
     /// Switch the message pane to a registered channel, keeping that channel's
     /// scroll position (non-following).
     pub fn select_channel(&mut self, index: usize) {
         if index < self.channels.len() {
-            self.active = index;
+            self.active = Some(index);
             self.relayout_active(false);
         }
     }
@@ -147,6 +149,14 @@ impl App {
         self.channels.iter().position(|state| {
             state.server.eq_ignore_ascii_case(server) && state.channel.eq_ignore_ascii_case(channel)
         })
+    }
+
+    fn active_state(&self) -> Option<&ChannelState> {
+        self.active.and_then(|i| self.channels.get(i))
+    }
+
+    fn active_state_mut(&mut self) -> Option<&mut ChannelState> {
+        self.active.and_then(|i| self.channels.get_mut(i))
     }
 
     // ----- messages -----
@@ -164,12 +174,12 @@ impl App {
                     message.server.clone(),
                     message.channel.clone(),
                 ));
-                self.active = 0;
+                self.active = Some(0);
                 0
             }
             None => return,
         };
-        if idx == self.active {
+        if Some(idx) == self.active {
             // Auto-follow is paused while the message pane has a selection, so
             // the selected message stays put instead of being nudged by a new one.
             let was_at_bottom = self.is_at_bottom()
@@ -199,7 +209,7 @@ impl App {
     /// Scroll up by one third of the viewport height (at least one line).
     pub fn scroll_page_up(&mut self) {
         let step = self.page_step();
-        if let Some(state) = self.channels.get_mut(self.active) {
+        if let Some(state) = self.active_state_mut() {
             state.scroll_offset = state.scroll_offset.saturating_sub(step);
         }
     }
@@ -208,7 +218,7 @@ impl App {
     pub fn scroll_page_down(&mut self) {
         let step = self.page_step();
         let viewport_height = self.viewport_height;
-        if let Some(state) = self.channels.get_mut(self.active) {
+        if let Some(state) = self.active_state_mut() {
             let max = state.total_height().saturating_sub(viewport_height);
             state.scroll_offset = state.scroll_offset.saturating_add(step).min(max);
         }
@@ -217,7 +227,7 @@ impl App {
     /// Set the scroll offset, clamped to the valid range.
     pub fn set_scroll_offset(&mut self, offset: u16) {
         let viewport_height = self.viewport_height;
-        if let Some(state) = self.channels.get_mut(self.active) {
+        if let Some(state) = self.active_state_mut() {
             let max = state.total_height().saturating_sub(viewport_height);
             state.scroll_offset = offset.min(max);
         }
@@ -225,17 +235,12 @@ impl App {
 
     /// First visible content row.
     pub fn scroll_offset(&self) -> u16 {
-        self.channels
-            .get(self.active)
-            .map(|s| s.scroll_offset)
-            .unwrap_or(0)
+        self.active_state().map_or(0, |s| s.scroll_offset)
     }
 
     /// Total height of the laid-out content, in rows.
     pub fn total_height(&self) -> u16 {
-        self.channels
-            .get(self.active)
-            .map_or(0, |s| s.total_height())
+        self.active_state().map_or(0, |s| s.total_height())
     }
 
     /// Largest valid scroll offset for the current content and viewport.
@@ -250,12 +255,12 @@ impl App {
 
     /// The laid-out rows to render.
     pub fn lines(&self) -> &[LayoutLine] {
-        self.channels.get(self.active).map_or(&[], |s| &s.lines)
+        self.active_state().map_or(&[], |s| &s.lines)
     }
 
     /// The stored messages of the viewed channel, oldest first.
     pub fn messages(&self) -> &[ChatMessage] {
-        self.channels.get(self.active).map_or(&[], |s| &s.messages)
+        self.active_state().map_or(&[], |s| &s.messages)
     }
 
     /// The current message viewport size `(width, height)`.
@@ -352,7 +357,10 @@ impl App {
         let width = self.width;
         let line_cap = self.line_cap;
         let viewport_height = self.viewport_height;
-        let state = &mut self.channels[self.active];
+        let Some(active) = self.active else {
+            return;
+        };
+        let state = &mut self.channels[active];
         state.lines = layout_messages(&state.messages, width);
         // Bound the row count so the u16 scroll model stays valid: drop the
         // oldest messages until the layout fits the line cap.
@@ -375,16 +383,15 @@ impl App {
 
     /// The selected message index, when one is selected.
     pub fn selected(&self) -> Option<usize> {
-        self.channels[self.active].selected
+        self.active_state().and_then(|s| s.selected)
     }
 
     /// The selected message's row span `(start, height)` in the laid-out
     /// coordinate system, or `None` when nothing is selected.
     pub fn selected_span(&self) -> Option<(u16, u16)> {
-        let idx = self.channels[self.active].selected?;
-        message_spans(&self.channels[self.active].messages, self.width)
-            .get(idx)
-            .copied()
+        let state = self.active_state()?;
+        let idx = state.selected?;
+        message_spans(&state.messages, self.width).get(idx).copied()
     }
 
     /// Move the selection to the next (newer) message, revealing it with the
@@ -394,15 +401,21 @@ impl App {
             return;
         }
         self.ensure_selection();
-        let len = self.channels[self.active].messages.len();
+        let Some(len) = self.active_state().map(|s| s.messages.len()) else {
+            return;
+        };
         if len == 0 {
             return;
         }
-        let next = self.channels[self.active]
+        let next = self
+            .active_state_mut()
+            .unwrap()
             .selected
             .unwrap_or(0)
             .min(len - 1);
-        self.channels[self.active].selected = Some((next + 1).min(len - 1));
+        if let Some(state) = self.active_state_mut() {
+            state.selected = Some((next + 1).min(len - 1));
+        }
         self.reveal_selection();
     }
 
@@ -413,8 +426,10 @@ impl App {
             return;
         }
         self.ensure_selection();
-        let cur = self.channels[self.active].selected.unwrap_or(0);
-        self.channels[self.active].selected = Some(cur.saturating_sub(1));
+        let cur = self.active_state().map_or(0, |s| s.selected.unwrap_or(0));
+        if let Some(state) = self.active_state_mut() {
+            state.selected = Some(cur.saturating_sub(1));
+        }
         self.reveal_selection();
     }
 
@@ -423,7 +438,10 @@ impl App {
     fn ensure_selection(&mut self) {
         let width = self.width;
         let viewport_height = self.viewport_height;
-        let state = &self.channels[self.active];
+        let Some(active) = self.active else {
+            return;
+        };
+        let state = &self.channels[active];
         if state.selected.is_some_and(|i| i < state.messages.len()) {
             return;
         }
@@ -439,24 +457,27 @@ impl App {
                 start >= off && start + h <= off + viewport_height
             })
             .unwrap_or(spans.len() - 1);
-        self.channels[self.active].selected = Some(chosen);
+        self.channels[active].selected = Some(chosen);
     }
 
     /// Scroll the minimum amount so the selected message is fully visible, and
     /// clamp the offset once the layout is stable.
     fn reveal_selection(&mut self) {
-        let idx = self.channels[self.active].selected;
+        let Some(active) = self.active else {
+            return;
+        };
+        let idx = self.channels[active].selected;
         let Some(idx) = idx else {
             return;
         };
         let width = self.width;
         let viewport_height = self.viewport_height;
-        let spans = message_spans(&self.channels[self.active].messages, width);
+        let spans = message_spans(&self.channels[active].messages, width);
         let Some(&(start, height)) = spans.get(idx) else {
             return;
         };
         let end = start + height;
-        let state = &mut self.channels[self.active];
+        let state = &mut self.channels[active];
         if start < state.scroll_offset {
             state.scroll_offset = start;
         } else if end > state.scroll_offset + viewport_height {
@@ -481,9 +502,9 @@ impl App {
                 if self.channels.is_empty() {
                     Focus::Composer // nothing to navigate without channels
                 } else {
-                    if self.sidebar_cursor.is_none() {
-                        self.sidebar_cursor = Some(0);
-                    }
+                    // Entering the sidebar snaps the cursor onto the viewed
+                    // channel's row (or the first row when none is open).
+                    self.sidebar_cursor = Some(self.active_sidebar_row());
                     Focus::Sidebar
                 }
             }
@@ -586,6 +607,21 @@ impl App {
         if let Some(cursor) = self.sidebar_cursor {
             self.sidebar_cursor = Some(cursor.min(len - 1));
         }
+    }
+
+    /// The sidebar row index of the viewed channel (0 when none is open).
+    fn active_sidebar_row(&self) -> usize {
+        let Some(active) = self.active else {
+            return 0;
+        };
+        let target = &self.channels[active];
+        self.sidebar_rows()
+            .iter()
+            .position(|row| {
+                row.server.eq_ignore_ascii_case(&target.server)
+                    && row.channel.as_deref() == Some(target.channel.as_str())
+            })
+            .unwrap_or(0)
     }
 
     fn move_sidebar_cursor(&mut self, step: impl Fn(usize, usize) -> usize) {
@@ -986,6 +1022,7 @@ mod tests {
         // Arrange
         let mut app = App::new(40, 10);
         app.open_channel("srv", "#osu");
+        app.select_channel(0);
 
         // Act
         app.push_message(chan_msg("srv", "#osu", "hi"));
@@ -993,7 +1030,7 @@ mod tests {
         // Assert
         assert_eq!(app.channel_count(), 1);
         assert_eq!(app.messages().len(), 1);
-        assert_eq!(app.active_channel(), ("srv", "#osu"));
+        assert_eq!(app.active_channel(), Some(("srv", "#osu")));
     }
 
     #[test]
@@ -1010,6 +1047,7 @@ mod tests {
         let mut app = App::new(40, 10);
         app.open_channel("srv", "#osu");
         app.open_channel("srv", "#chinese");
+        app.select_channel(0);
 
         // Act / Assert: "#OSU" from "SRV" hits the active #osu channel.
         app.push_message(chan_msg("SRV", "#OSU", "a"));
@@ -1035,6 +1073,7 @@ mod tests {
         let mut app = App::new(40, 3);
         app.open_channel("srv", "#a");
         app.open_channel("srv", "#b");
+        app.select_channel(0);
         for i in 0..6 {
             app.push_message(chan_msg("srv", "#a", &format!("m{i}")));
         }
@@ -1044,13 +1083,13 @@ mod tests {
 
         // Act
         app.select_channel(1);
-        assert_eq!(app.active_channel().1, "#b");
+        assert_eq!(app.active_channel().map(|(_, c)| c), Some("#b"));
         assert_eq!(app.messages().len(), 0);
         app.push_message(chan_msg("srv", "#b", "bee"));
         app.select_channel(0);
 
         // Assert: #a's history and scroll position are intact.
-        assert_eq!(app.active_channel().1, "#a");
+        assert_eq!(app.active_channel().map(|(_, c)| c), Some("#a"));
         assert_eq!(app.messages().len(), 6);
         assert_eq!(app.scroll_offset(), offset);
     }
@@ -1061,6 +1100,7 @@ mod tests {
         let mut app = App::new(40, 3);
         app.open_channel("srv", "#a");
         app.open_channel("srv", "#b");
+        app.select_channel(0);
         app.push_message(chan_msg("srv", "#a", "m"));
         let height = app.total_height();
 
@@ -1076,29 +1116,47 @@ mod tests {
     // ----- focus & sidebar -----
 
     #[test]
-    fn tab_cycles_composer_sidebar_messages() {
+    fn tab_cycles_sidebar_messages_composer() {
         let mut app = App::new(40, 10);
         app.open_channel("srv", "#a");
 
+        // Fresh start: sidebar focused, no channel viewed.
+        assert_eq!(app.focus(), Focus::Sidebar);
+        assert_eq!(app.active_channel(), None);
+        app.tab();
+        assert_eq!(app.focus(), Focus::Messages);
+        app.tab();
         assert_eq!(app.focus(), Focus::Composer);
         app.tab();
         assert_eq!(app.focus(), Focus::Sidebar);
-        app.tab();
-        assert_eq!(app.focus(), Focus::Messages);
-        app.tab();
-        assert_eq!(app.focus(), Focus::Composer);
     }
 
     #[test]
-    fn tab_into_sidebar_places_cursor_on_first_row() {
+    fn startup_focuses_sidebar_with_cursor_on_first_row() {
+        // Fresh start: no channel open -> cursor on the first row.
         let mut app = App::new(40, 10);
         app.open_channel("srv", "#a");
-        app.tab();
+        assert_eq!(app.focus(), Focus::Sidebar);
         assert_eq!(app.sidebar_cursor(), Some(0));
-        // Leaving the sidebar keeps the cursor position for the next visit.
+    }
+
+    #[test]
+    fn tab_into_sidebar_snaps_cursor_to_active_channel_row() {
+        // Arrange: open both channels, view #b (row 2), focus ends on Composer.
+        let mut app = App::new(40, 10);
+        app.open_channel("srv", "#a");
+        app.open_channel("srv", "#b");
+        app.select_channel(1); // view #b
+        app.tab(); // Sidebar -> Messages
+        app.tab(); // Messages -> Composer
+        assert_eq!(app.focus(), Focus::Composer);
+
+        // Act: tab back into the sidebar.
         app.tab();
-        assert_eq!(app.focus(), Focus::Messages);
-        assert_eq!(app.sidebar_cursor(), Some(0));
+
+        // Assert: the cursor sits on #b's row.
+        assert_eq!(app.focus(), Focus::Sidebar);
+        assert_eq!(app.sidebar_cursor(), Some(2));
     }
 
     #[test]
@@ -1107,9 +1165,8 @@ mod tests {
         let mut app = App::new(40, 10);
         app.open_channel("srv", "#a");
         app.open_channel("srv", "#b");
-        app.tab();
 
-        // Act / Assert
+        // Act / Assert (focus starts on the sidebar)
         app.sidebar_down();
         assert_eq!(app.sidebar_cursor(), Some(1));
         app.sidebar_down();
@@ -1126,8 +1183,10 @@ mod tests {
     fn sidebar_jk_ignored_when_sidebar_not_focused() {
         let mut app = App::new(40, 10);
         app.open_channel("srv", "#a");
-        app.sidebar_down(); // focus is Composer - no-op
-        assert_eq!(app.sidebar_cursor(), None);
+        app.tab(); // Sidebar -> Messages: the sidebar is no longer focused
+        let before = app.sidebar_cursor();
+        app.sidebar_down();
+        assert_eq!(app.sidebar_cursor(), before);
     }
 
     #[test]
@@ -1136,9 +1195,8 @@ mod tests {
         let mut app = App::new(40, 10);
         app.open_channel("srv", "#a");
         app.open_channel("srv", "#b");
-        app.tab();
 
-        // Act: collapse, then expand.
+        // Act: collapse, then expand (focus starts on the sidebar).
         app.sidebar_enter();
         assert!(app.server_collapsed("srv"));
         assert_eq!(app.sidebar_rows().len(), 1); // only the server row remains
@@ -1153,7 +1211,6 @@ mod tests {
         let mut app = App::new(40, 10);
         app.open_channel("srv", "#a");
         app.open_channel("srv", "#b");
-        app.tab();
         assert_eq!(app.sidebar_cursor(), Some(0));
 
         // Act: collapse via Enter on the server row.
@@ -1171,7 +1228,6 @@ mod tests {
         let mut app = App::new(40, 10);
         app.open_channel("s1", "#a");
         app.open_channel("s2", "#b");
-        app.tab();
         app.sidebar_down();
         app.sidebar_down();
         app.sidebar_down();
@@ -1195,7 +1251,6 @@ mod tests {
         app.open_channel("srv", "#a");
         app.open_channel("srv", "#b");
         app.push_message(chan_msg("srv", "#a", "hello a"));
-        app.tab();
         app.sidebar_down();
         app.sidebar_down();
 
@@ -1203,7 +1258,7 @@ mod tests {
         app.sidebar_enter();
 
         // Assert: view switched to #b, focus returned to the composer.
-        assert_eq!(app.active_channel(), ("srv", "#b"));
+        assert_eq!(app.active_channel(), Some(("srv", "#b")));
         assert_eq!(app.messages().len(), 0);
         assert_eq!(app.focus(), Focus::Composer);
         assert_eq!(app.sidebar_cursor(), None);
@@ -1216,7 +1271,6 @@ mod tests {
         let mut app = App::new(40, 10);
         app.open_channel("srv", "#a");
         app.tab();
-        app.tab();
         assert_eq!(app.focus(), Focus::Messages);
         assert_eq!(app.selected(), None);
     }
@@ -1228,13 +1282,13 @@ mod tests {
         // fully-visible ones are m3 and m4, so m4 is selected.
         let mut app = App::new(40, 3);
         app.open_channel("srv", "#a");
+        app.select_channel(0);
         for i in 0..5 {
             app.push_message(chan_msg("srv", "#a", &format!("m{i}")));
         }
         assert_eq!(app.scroll_offset(), app.max_offset());
 
         // Act
-        app.tab();
         app.tab();
 
         // Assert
@@ -1248,10 +1302,10 @@ mod tests {
         // Arrange: as above, selected m4 (span (8,1)), offset 6.
         let mut app = App::new(40, 3);
         app.open_channel("srv", "#a");
+        app.select_channel(0);
         for i in 0..5 {
             app.push_message(chan_msg("srv", "#a", &format!("m{i}")));
         }
-        app.tab();
         app.tab();
         assert_eq!(app.selected(), Some(4));
 
@@ -1276,10 +1330,10 @@ mod tests {
     fn select_next_moves_down_and_clamps_at_newest() {
         let mut app = App::new(40, 3);
         app.open_channel("srv", "#a");
+        app.select_channel(0);
         for i in 0..5 {
             app.push_message(chan_msg("srv", "#a", &format!("m{i}")));
         }
-        app.tab();
         app.tab();
         for _ in 0..4 {
             app.select_prev();
@@ -1303,10 +1357,10 @@ mod tests {
         // Arrange
         let mut app = App::new(40, 3);
         app.open_channel("srv", "#a");
+        app.select_channel(0);
         for i in 0..4 {
             app.push_message(chan_msg("srv", "#a", &format!("m{i}")));
         }
-        app.tab();
         app.tab();
         let selected = app.selected().unwrap();
         let offset = app.scroll_offset();
@@ -1325,7 +1379,7 @@ mod tests {
         let mut app = App::new(40, 3);
         app.open_channel("srv", "#a");
         app.push_message(chan_msg("srv", "#a", "m0"));
-        assert_eq!(app.focus(), Focus::Composer);
+        assert_eq!(app.focus(), Focus::Sidebar);
 
         // Act
         app.select_prev();

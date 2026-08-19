@@ -137,19 +137,34 @@ pub fn draw(frame: &mut Frame, app: &App, chrome: &Chrome<'_>) {
     ])
     .split(columns[2]);
 
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            app.active_channel().1,
-            Style::new().add_modifier(Modifier::BOLD),
-        ))),
-        inset(rows[0], HORIZONTAL_PAD),
-    );
     let message_rect = inset(rows[1], HORIZONTAL_PAD);
-    frame.render_widget(
-        Paragraph::new(build_text(app)).scroll((app.scroll_offset(), 0)),
-        message_rect,
-    );
-    render_selection(frame, message_rect, app);
+    match app.active_channel() {
+        None => {
+            // Welcome page: no channel opened yet (fresh start).
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "termirc",
+                    Style::new().add_modifier(Modifier::BOLD),
+                ))),
+                inset(rows[0], HORIZONTAL_PAD),
+            );
+            render_welcome(frame, message_rect);
+        }
+        Some((_, channel)) => {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    channel,
+                    Style::new().add_modifier(Modifier::BOLD),
+                ))),
+                inset(rows[0], HORIZONTAL_PAD),
+            );
+            frame.render_widget(
+                Paragraph::new(build_text(app)).scroll((app.scroll_offset(), 0)),
+                message_rect,
+            );
+            render_selection(frame, message_rect, app);
+        }
+    }
     render_composer(
         frame,
         rows[3],
@@ -178,7 +193,7 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
     let inner = inset(area, 1);
     let focused = app.focus() == Focus::Sidebar;
     let cursor = app.sidebar_cursor();
-    let active_channel = app.active_channel().1;
+    let active = app.active_channel();
     let rows = app.sidebar_rows();
 
     for (i, row) in rows.iter().enumerate() {
@@ -187,7 +202,9 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
             break;
         }
         let is_cursor = focused && cursor == Some(i);
-        let is_active = row.channel.as_deref() == Some(active_channel);
+        let is_active = active.is_some_and(|(srv, ch)| {
+            row.server.eq_ignore_ascii_case(srv) && row.channel.as_deref() == Some(ch)
+        });
 
         // Row background: the active channel row is brightest; a cursor row is
         // slightly brighter than the plain background.
@@ -448,6 +465,34 @@ fn render_selection(frame: &mut Frame, msg_rect: Rect, app: &App) {
     }
 }
 
+/// Render the welcome page shown before any channel is opened.
+fn render_welcome(frame: &mut Frame, area: Rect) {
+    let lines = vec![
+        Line::from(Span::styled(
+            "Welcome to termirc",
+            Style::new().fg(INPUT_LINE).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  j / k      move the channel-list cursor",
+            Style::new(),
+        )),
+        Line::from(Span::styled(
+            "  Enter      open the channel under the cursor",
+            Style::new(),
+        )),
+        Line::from(Span::styled(
+            "  Tab        cycle focus: channels · messages · composer",
+            Style::new(),
+        )),
+        Line::from(Span::styled(
+            "  PgUp/PgDn  scroll the messages · Esc quit",
+            Style::new(),
+        )),
+    ];
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
 /// Fill one row with a half-block character in the given color.
 fn fill_half_block_row(
     buf: &mut ratatui::buffer::Buffer,
@@ -513,11 +558,15 @@ mod tests {
         }
     }
 
-    /// An app with both channels of the test config registered; "#osu" active.
+    /// An app with both channels of the test config registered, viewing #osu,
+    /// with focus moved off the sidebar (as if the user opened a channel).
     fn test_app(width: u16, height: u16) -> App {
         let mut app = App::new(width, height);
         app.open_channel("osu_irc", "#osu");
         app.open_channel("osu_irc", "#chinese");
+        app.select_channel(0);
+        app.tab(); // Sidebar -> Messages
+        app.tab(); // Messages -> Composer
         app
     }
 
@@ -650,6 +699,27 @@ mod tests {
     }
 
     #[test]
+    fn welcome_page_shown_when_no_channel_is_open() {
+        // Arrange: channels registered but none viewed; focus starts on the
+        // sidebar (fresh-start state).
+        let mut app = App::new(22, 6);
+        app.open_channel("osu_irc", "#osu");
+        app.open_channel("osu_irc", "#chinese");
+        assert_eq!(app.active_channel(), None);
+
+        // Act: a 50x14 terminal gives the message pane 6 rows for the welcome.
+        let buffer = render_sized(&app, "", 50, 14);
+
+        // Assert: the title row shows the program name and the pane shows the
+        // welcome text instead of any channel content.
+        assert!(buffer_line(&buffer, 0).contains("termirc"));
+        assert!(!buffer_line(&buffer, 0).contains("#osu"));
+        let pane = buffer_line(&buffer, 1);
+        assert!(pane.contains("Welcome"), "pane was: {pane:?}");
+        assert!(buffer_line(&buffer, 4).contains("Enter"));
+    }
+
+    #[test]
     fn sidebar_lists_configured_servers_and_channels() {
         // Arrange
         let app = test_app(22, 3);
@@ -684,31 +754,32 @@ mod tests {
     #[test]
     fn sidebar_cursor_row_gets_cursor_bg_and_block_cursor() {
         // Arrange: focus the sidebar; the cursor starts on row 0 (the server).
+        // Arrange: focus the sidebar; the cursor snaps onto the viewed
+        // channel's row (#osu, row 1).
         let mut app = test_app(22, 3);
-
-        app.tab();
+        app.tab(); // Composer -> Sidebar
         assert_eq!(app.focus(), Focus::Sidebar);
-        assert_eq!(app.sidebar_cursor(), Some(0));
+        assert_eq!(app.sidebar_cursor(), Some(1));
 
         // Act
         let buffer = render_sized(&app, "", 50, 10);
 
-        // Assert: row 0 (sidebar inner starts at col 1) shows the reverse-video
-        // block cursor and the cursor-row background.
-        let cursor_cell = buffer.cell((1, 0)).unwrap();
+        // Assert: row 1 shows the reverse-video block cursor; its background
+        // is the (brighter) active-channel one, which takes precedence.
+        let cursor_cell = buffer.cell((1, 1)).unwrap();
         assert_eq!(cursor_cell.bg, Color::White);
-        let inner_cell = buffer.cell((10, 0)).unwrap();
-        assert_eq!(inner_cell.bg, SIDEBAR_CURSOR_BG);
-        // Row 1 (a channel row, not under the cursor) keeps the plain bg.
-        assert_ne!(buffer.cell((10, 1)).unwrap().bg, SIDEBAR_CURSOR_BG);
+        let inner_cell = buffer.cell((10, 1)).unwrap();
+        assert_eq!(inner_cell.bg, SIDEBAR_ACTIVE_BG);
+        // Row 0 (server row, not under the cursor) keeps the plain bg.
+        assert_ne!(buffer.cell((10, 0)).unwrap().bg, SIDEBAR_ACTIVE_BG);
     }
 
     #[test]
     fn sidebar_collapsed_server_shows_fold_marker() {
         // Arrange: collapse the server, then check the marker and hidden rows.
         let mut app = test_app(22, 3);
-
-        app.tab();
+        app.tab(); // Composer -> Sidebar (cursor onto #osu, row 1)
+        app.sidebar_up(); // walk to the server header row
         app.sidebar_enter(); // collapse osu_irc
 
         // Act
@@ -791,7 +862,7 @@ mod tests {
     #[test]
     fn input_area_has_background_and_accent_column() {
         // Arrange: 50x10 -> input occupies rows 4..=7 (above the 2-row gap).
-        let app = App::new(22, 3);
+        let app = test_app(22, 3);
 
         // Act
         let buffer = render_sized(&app, "", 50, 10);
@@ -831,7 +902,7 @@ mod tests {
     #[test]
     fn input_row_shows_typed_text_and_cursor() {
         // Arrange
-        let mut app = App::new(22, 3);
+        let mut app = test_app(22, 3);
         app.type_char('h');
         app.type_char('i');
 
@@ -873,7 +944,7 @@ mod tests {
     #[test]
     fn fade_row_uses_heavy_up_taper() {
         // Arrange
-        let app = App::new(22, 3);
+        let app = test_app(22, 3);
 
         // Act
         let buffer = render_sized(&app, "", 50, 10);
