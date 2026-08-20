@@ -33,7 +33,7 @@ Constraint to respect when touching this boundary: the async `irc` crate cannot 
 
 ### Pre-wrapped layout, not ratatui `Wrap`
 
-[src/layout.rs](src/layout.rs) turns each `ChatMessage` into one or more `LayoutLine`s: a nick column (`nick: `), a body column, and one blank separator between messages (never trailing). Continuation lines are indented to the body column so wrapped text never runs under the nick. [src/ui.rs](src/ui.rs) renders these as a `Paragraph` **without** `Wrap`, borrowing row bodies to keep per-frame allocations flat. Widths are measured with `unicode-width`; a 2-column (CJK/full-width) char that doesn't fit moves to the next line rather than overflowing.
+[src/layout.rs](src/layout.rs) turns each `ChatMessage` into one or more `LayoutLine`s: a nick column (`nick: `), a body column, and one blank separator between messages. The whole list is **framed** by one more separator row above the first and below the last message - these replace the old title row and composer spacer, scroll with the content, and render as half-blocks when the adjacent message is selected. An empty channel lays out to no rows. Continuation lines are indented to the body column so wrapped text never runs under the nick. [src/ui.rs](src/ui.rs) renders these as a `Paragraph` **without** `Wrap`, borrowing row bodies to keep per-frame allocations flat. Widths are measured with `unicode-width`; a 2-column (CJK/full-width) char that doesn't fit moves to the next line rather than overflowing.
 
 ### Scroll model and the `u16` cap
 

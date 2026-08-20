@@ -160,8 +160,9 @@ fn run(terminal: &mut ratatui::DefaultTerminal, config: &Config) -> anyhow::Resu
 }
 
 /// Resize the app's message viewport to fit the terminal, leaving room for the
-/// title, the message/composer spacer, the (variable-height) composer, and the
-/// gap below it. No-op when the computed size is unchanged.
+/// (variable-height) composer and the gap below it. The message stream frames
+/// itself with separator rows, so no other chrome exists. No-op when the
+/// computed size is unchanged.
 fn fit_app(app: &mut App, (w, h): (u16, u16)) {
     let message_width = w
         .saturating_sub(ui::SIDEBAR_WIDTH)
@@ -171,8 +172,6 @@ fn fit_app(app: &mut App, (w, h): (u16, u16)) {
     let input_lines =
         termirc::layout::input_line_count(app.input(), app.input_cursor(), input_text_width);
     let message_height = h
-        .saturating_sub(ui::TITLE_ROWS)
-        .saturating_sub(ui::MESSAGE_INPUT_SPACER)
         .saturating_sub(ui::composer_height(input_lines))
         .saturating_sub(ui::GAP_ROWS);
     if app.size() != (message_width, message_height) {

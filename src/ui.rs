@@ -33,11 +33,6 @@ pub const SIDEBAR_WIDTH: u16 = 22;
 pub const SEPARATOR_GAP: u16 = 2;
 /// Blank padding (each side) between a region's edge and its content.
 pub const HORIZONTAL_PAD: u16 = 2;
-/// Rows taken by the channel title at the top of the main column.
-pub const TITLE_ROWS: u16 = 1;
-/// A single blank row (global background) between the message pane and the
-/// composer.
-pub const MESSAGE_INPUT_SPACER: u16 = 1;
 /// Fixed rows of the composer besides the typed text: a blank row above, a
 /// blank row below, and the tips row.
 pub const INPUT_FIXED_ROWS: u16 = 3;
@@ -103,8 +98,9 @@ pub fn build_text(app: &App) -> Text<'_> {
     Text::from(lines)
 }
 
-/// Render the whole screen: sidebar on the left, main column (channel title /
-/// messages / composer) on the right.
+/// Render the whole screen: sidebar on the left, main column (messages /
+/// composer) on the right. There is no title row - the message stream frames
+/// itself with separator rows above the first and below the last message.
 pub fn draw(frame: &mut Frame, app: &App, chrome: &Chrome<'_>) {
     // Fill the screen with the global background.
     frame.render_widget(
@@ -129,51 +125,32 @@ pub fn draw(frame: &mut Frame, app: &App, chrome: &Chrome<'_>) {
     let input_height = composer_height(input_lines.len());
 
     let rows = Layout::vertical([
-        Constraint::Length(TITLE_ROWS),           // channel title
-        Constraint::Min(0),                       // messages
-        Constraint::Length(MESSAGE_INPUT_SPACER), // blank row between messages & composer
-        Constraint::Length(input_height),         // composer
-        Constraint::Length(GAP_ROWS),             // fade + blank below the composer
+        Constraint::Min(0), // messages (framing separators live in the stream)
+        Constraint::Length(input_height), // composer
+        Constraint::Length(GAP_ROWS), // fade + blank below the composer
     ])
     .split(columns[2]);
 
-    let message_rect = inset(rows[1], HORIZONTAL_PAD);
-    match app.active_channel() {
-        None => {
-            // Welcome page: no channel opened yet (fresh start).
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    "termirc",
-                    Style::new().add_modifier(Modifier::BOLD),
-                ))),
-                inset(rows[0], HORIZONTAL_PAD),
-            );
-            render_welcome(frame, message_rect);
-        }
-        Some((_, channel)) => {
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    channel,
-                    Style::new().add_modifier(Modifier::BOLD),
-                ))),
-                inset(rows[0], HORIZONTAL_PAD),
-            );
-            frame.render_widget(
-                Paragraph::new(build_text(app)).scroll((app.scroll_offset(), 0)),
-                message_rect,
-            );
-            render_selection(frame, message_rect, app);
-        }
+    let message_rect = inset(rows[0], HORIZONTAL_PAD);
+    if app.active_channel().is_none() {
+        // Welcome page: no channel opened yet (fresh start).
+        render_welcome(frame, message_rect);
+    } else {
+        frame.render_widget(
+            Paragraph::new(build_text(app)).scroll((app.scroll_offset(), 0)),
+            message_rect,
+        );
+        render_selection(frame, message_rect, app);
     }
     render_composer(
         frame,
-        rows[3],
+        rows[1],
         frame.area().width,
         input_lines,
         chrome.status,
         app,
     );
-    render_gap(frame, rows[4], frame.area().width, app);
+    render_gap(frame, rows[2], frame.area().width, app);
 }
 
 /// Render the thin gray vertical line that separates the sidebar from the main
@@ -394,13 +371,16 @@ fn render_composer(
     );
 }
 
-/// Overlay the selected-message highlight while the message pane has focus:
-/// the selected message's rows get the highlight background, the separator row
-/// above becomes a lower-half block (`▄`) and the one below an upper-half
-/// block (`▀`) in the highlight color, and a pale-green `┃` accent runs down
-/// the front of the whole block (like the composer's) — starting with a
-/// lower-half stroke (`╻`) and ending with an upper-half stroke (`╹`). The
-/// highlight starts flush against the accent so no global-bg gap shows.
+/// Overlay the selected-message highlight while the message pane has focus.
+/// The layout frames the message list with separator rows (above the first and
+/// below the last message), so the selection block is always bracketed by
+/// them: the selected message's rows get the highlight background, the
+/// separator row above becomes a lower-half block (`▄`) and the one below an
+/// upper-half block (`▀`) in the highlight color, and a pale-green `┃` accent
+/// runs down the front of the whole block (like the composer's) — starting
+/// with a lower-half stroke (`╻`) and ending with an upper-half stroke (`╹`).
+/// The highlight starts flush against the accent so no global-bg gap shows;
+/// rows scrolled out of the pane are simply clipped.
 fn render_selection(frame: &mut Frame, msg_rect: Rect, app: &App) {
     if app.focus() != Focus::Messages {
         return;
@@ -415,9 +395,6 @@ fn render_selection(frame: &mut Frame, msg_rect: Rect, app: &App) {
     if last < 0 || first >= vh {
         return; // selection entirely off-screen
     }
-    let total = i64::from(app.total_height());
-    let has_above = i64::from(start) > 0; // a separator row exists above
-    let has_below = i64::from(start) + i64::from(height) < total;
 
     // The selection block (highlight rows + half-block separators) starts
     // flush against the ┃ accent — no global-bg gap cell in between.
@@ -437,10 +414,10 @@ fn render_selection(frame: &mut Frame, msg_rect: Rect, app: &App) {
         Style::new().bg(MESSAGE_SELECT_BG),
     );
 
-    // 2. Half-block separator rows: ▄ above, ▀ below (fg = highlight color,
-    //    background untouched).
+    // 2. Half-block separator rows (clipped to the pane): ▄ above, ▀ below
+    //    (fg = highlight color, background untouched).
     let buf = frame.buffer_mut();
-    if has_above && first > 0 && first - 1 < vh {
+    if first > 0 {
         fill_half_block_row(
             buf,
             block_x,
@@ -450,7 +427,7 @@ fn render_selection(frame: &mut Frame, msg_rect: Rect, app: &App) {
             MESSAGE_SELECT_BG,
         );
     }
-    if has_below && last + 1 >= 0 && last + 1 < vh {
+    if last + 1 < vh {
         fill_half_block_row(
             buf,
             block_x,
@@ -461,12 +438,12 @@ fn render_selection(frame: &mut Frame, msg_rect: Rect, app: &App) {
         );
     }
 
-    // 3. ┃ accent down the front of the selection block (separator rows
-    //    included when present), at the same column as the composer's. The
-    //    top cell keeps only the lower half of the stroke (╻) and the bottom
-    //    cell only the upper half (╹), so the line tapers at both ends.
-    let accent_top = if has_above { first - 1 } else { first };
-    let accent_bottom = if has_below { last + 1 } else { last };
+    // 3. ┃ accent down the front of the selection block, at the same column
+    //    as the composer's. The top cell keeps only the lower half of the
+    //    stroke (╻) and the bottom cell only the upper half (╹), so the line
+    //    tapers at both ends.
+    let accent_top = first - 1; // the ▄ separator row above
+    let accent_bottom = last + 1; // the ▀ separator row below
     for row in accent_top.max(0)..=accent_bottom.min(vh - 1) {
         let symbol = if row == accent_top && row == accent_bottom {
             "┃"
@@ -611,18 +588,33 @@ mod tests {
     }
 
     #[test]
-    fn channel_name_shown_on_top_row_and_no_border() {
-        // Arrange: 50x10 terminal -> sidebar 22, main 28; viewport 24x5.
+    fn no_title_row_leading_separator_occupies_the_top() {
+        // Arrange: 50x10 terminal; one message lays out to 3 stream rows
+        // (framing blank, message, framing blank) with the view at the bottom.
         let mut app = test_app(22, 3);
         app.push_message(msg("alice", "hi"));
 
         // Act
         let buffer = render_sized(&app, "", 50, 10);
 
-        // Assert: channel name on the top row at the main column's content start.
-        assert_eq!(buffer.cell((MAIN_COL_X, 0)).unwrap().symbol(), "#");
-        assert!(buffer_line(&buffer, 0).contains("#osu"));
-        assert!(!buffer_line(&buffer, 0).contains("termirc"));
+        // Assert: no channel-name title anywhere in the main column — the top
+        // row is the leading separator (blank) and the message follows at the
+        // next row.
+        let main_row: String = (SIDEBAR_WIDTH + SEPARATOR_GAP..buffer.area.width)
+            .map(|x| buffer.cell((x, 1)).unwrap().symbol())
+            .collect();
+        assert!(
+            !main_row.contains("#osu"),
+            "channel name leaked into the message area"
+        );
+        let main_slice: String = (SIDEBAR_WIDTH + HORIZONTAL_PAD..buffer.area.width)
+            .map(|x| buffer.cell((x, 0)).unwrap().symbol())
+            .collect();
+        assert!(
+            main_slice.chars().all(|c| c == ' '),
+            "top row should be the leading separator, got: {main_slice:?}"
+        );
+        assert!(buffer_line(&buffer, 1).contains("alice: hi"));
 
         // Assert: no box-drawing characters anywhere except the thin gray `│`
         // separator (and the heavy `┃` accent) - no corners/tees/horizontals.
@@ -661,42 +653,44 @@ mod tests {
         // Act
         let buffer = render_sized(&app, "", 46, 10);
 
-        // Assert: row 2 is blank under the nick, body resumes at the next column.
+        // Assert: the continuation row (screen row 1) is blank under the nick,
+        // body resumes at the next column.
         let nick_end = MAIN_COL_X + 7; // "alice: " is 7 columns
         for x in MAIN_COL_X..nick_end {
             assert_eq!(
-                buffer.cell((x, 2)).unwrap().symbol(),
+                buffer.cell((x, 1)).unwrap().symbol(),
                 " ",
                 "column {x} not blank"
             );
         }
-        assert_eq!(buffer.cell((nick_end, 2)).unwrap().symbol(), "t");
-        assert!(buffer_line(&buffer, 2).contains("three four"));
+        assert_eq!(buffer.cell((nick_end, 1)).unwrap().symbol(), "t");
+        assert!(buffer_line(&buffer, 1).contains("three four"));
     }
 
     #[test]
-    fn blank_separator_between_messages_but_not_after_last() {
-        // Arrange: terminal 50x11 -> message area is 3 rows (title + spacer +
-        // composer + gap take the other 8), so two messages and their blank
-        // separator all fit.
-        let mut app = App::new(22, 3);
+    fn blank_separators_frame_the_list_and_separate_messages() {
+        // Arrange: terminal 50x13 -> message viewport 7 rows; two messages lay
+        // out to 5 stream rows, so the whole list fits on one screen.
+        let mut app = App::new(22, 5);
         app.push_message(msg("a", "first"));
         app.push_message(msg("b", "second"));
 
         // Act
-        let buffer = render_sized(&app, "", 50, 11);
+        let buffer = render_sized(&app, "", 50, 13);
 
-        // Assert: in the main content area, the row between the messages is
-        // blank (the sidebar separator `│` sits in the pad column to its left);
-        // the row after it carries the second message.
-        let main_slice: String = (SIDEBAR_WIDTH + HORIZONTAL_PAD..buffer.area.width)
-            .map(|x| buffer.cell((x, 2)).unwrap().symbol())
-            .collect();
-        assert!(
-            main_slice.chars().all(|c| c == ' '),
-            "expected blank main-column row, got: {main_slice:?}"
-        );
+        // Assert: leading framing blank, first message, between-separator
+        // blank, second message, trailing framing blank.
+        assert!(buffer_line(&buffer, 1).contains("a: first"));
         assert!(buffer_line(&buffer, 3).contains("b: second"));
+        for y in [0, 2, 4] {
+            let slice: String = (SIDEBAR_WIDTH + HORIZONTAL_PAD..buffer.area.width)
+                .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                .collect();
+            assert!(
+                slice.chars().all(|c| c == ' '),
+                "expected blank separator row at {y}, got: {slice:?}"
+            );
+        }
     }
 
     #[test]
@@ -725,16 +719,15 @@ mod tests {
         app.open_channel("osu_irc", "#chinese");
         assert_eq!(app.active_channel(), None);
 
-        // Act: a 50x14 terminal gives the message pane 6 rows for the welcome.
+        // Act: a 50x14 terminal gives the message viewport 8 rows for the
+        // welcome page (no title row anymore).
         let buffer = render_sized(&app, "", 50, 14);
 
-        // Assert: the title row shows the program name and the pane shows the
-        // welcome text instead of any channel content.
-        assert!(buffer_line(&buffer, 0).contains("termirc"));
+        // Assert: the welcome text starts at the top row of the message pane.
         assert!(!buffer_line(&buffer, 0).contains("#osu"));
-        let pane = buffer_line(&buffer, 1);
+        let pane = buffer_line(&buffer, 0);
         assert!(pane.contains("Welcome"), "pane was: {pane:?}");
-        assert!(buffer_line(&buffer, 4).contains("Enter"));
+        assert!(buffer_line(&buffer, 3).contains("Enter"));
     }
 
     #[test]
@@ -828,16 +821,16 @@ mod tests {
     #[test]
     fn selected_message_gets_highlight_half_blocks_and_accent() {
         // Arrange: 3 one-line messages in a 4-row viewport (terminal 50x12).
-        // Spans: m0=(0) sep m1=(2) sep m2=(4); auto-follow scrolls to offset 1,
-        // so the default selection is m2. One k selects m1 (span row 2), which
-        // lands on screen row 2 with separators at screen rows 1 and 3.
+        // Spans (framing row shifts all down one): m0=(1) sep m1=(3) sep
+        // m2=(5) + trailing frame = 7 rows; auto-follow scrolls to offset 3,
+        // so the default selection is m2, which lands on screen row 2 with its
+        // separator rows at screen rows 1 and 3.
         let mut app = test_app(22, 4);
         app.push_message(msg("a", "one"));
         app.push_message(msg("b", "two"));
         app.push_message(msg("c", "three"));
         app.tab();
         app.tab(); // messages focused -> selects m2
-        app.select_prev(); // -> m1
 
         // Act
         let buffer = render_sized(&app, "", 50, 12);
@@ -869,7 +862,6 @@ mod tests {
         app.push_message(msg("c", "three"));
         app.tab();
         app.tab(); // messages focused -> selects m2
-        app.select_prev(); // -> m1
 
         // Act
         let buffer = render_sized(&app, "", 50, 12);
@@ -895,7 +887,6 @@ mod tests {
         app.push_message(msg("c", "three"));
         app.tab();
         app.tab(); // messages focused -> selects m2
-        app.select_prev(); // -> m1
 
         // Act
         let buffer = render_sized(&app, "", 50, 12);
@@ -914,6 +905,39 @@ mod tests {
     }
 
     #[test]
+    fn first_and_last_message_blocks_are_framed_by_separators() {
+        // Arrange: 3 one-line messages, message pane focused. The layout frames
+        // the list with separator rows above the first and below the last
+        // message, so selecting those must put the half-block (and the taper)
+        // on the framing row — never on the message row itself.
+        let mut app = test_app(22, 4);
+        app.push_message(msg("a", "one"));
+        app.push_message(msg("b", "two"));
+        app.push_message(msg("c", "three"));
+        app.tab();
+        app.tab(); // messages focused -> selects m2 (span 5)
+
+        // Act / Assert (last message): scroll to the very bottom so the
+        // trailing framing row is visible below it.
+        app.set_scroll_offset(app.max_offset());
+        let buffer = render_sized(&app, "", 50, 12);
+        assert_eq!(buffer.cell((INPUT_X, 2)).unwrap().symbol(), "┃");
+        assert_eq!(buffer.cell((INPUT_X, 3)).unwrap().symbol(), "╹");
+        assert_eq!(buffer.cell((MAIN_COL_X, 3)).unwrap().symbol(), "▀");
+
+        // Act / Assert (first message): select it and scroll to the very top
+        // so the leading framing row is visible above it.
+        app.select_prev(); // -> m1
+        app.select_prev(); // -> m0 (span 1)
+        app.set_scroll_offset(0);
+        let buffer = render_sized(&app, "", 50, 12);
+        assert_eq!(buffer.cell((MAIN_COL_X, 0)).unwrap().symbol(), "▄");
+        assert_eq!(buffer.cell((INPUT_X, 0)).unwrap().symbol(), "╻");
+        assert_eq!(buffer.cell((INPUT_X, 1)).unwrap().symbol(), "┃");
+        assert_eq!(buffer.cell((MAIN_COL_X, 1)).unwrap().bg, MESSAGE_SELECT_BG);
+    }
+
+    #[test]
     fn selection_not_rendered_when_messages_unfocused() {
         // Arrange: same setup but WITHOUT focusing the message pane.
         let mut app = test_app(22, 4);
@@ -925,9 +949,9 @@ mod tests {
         let buffer = render_sized(&app, "", 50, 12);
 
         // Assert: no highlight, half-blocks, or accent anywhere in the pane.
-        for y in 1..=4 {
+        for y in 0..=4 {
             assert_ne!(buffer.cell((MAIN_COL_X, y)).unwrap().bg, MESSAGE_SELECT_BG);
-            assert_ne!(buffer.cell((INPUT_X, y)).unwrap().symbol(), "┃");
+            assert!(!["┃", "╻", "╹"].contains(&buffer.cell((INPUT_X, y)).unwrap().symbol()));
         }
     }
 
@@ -1075,16 +1099,20 @@ mod tests {
     }
 
     #[test]
-    fn blank_spacer_row_between_messages_and_composer() {
-        // Arrange: H=11 with empty input -> messages rows 1-3, spacer row 4,
-        // composer rows 5-8.
-        let app = App::new(22, 3);
+    fn message_viewport_extends_down_to_the_composer() {
+        // Arrange: H=11 with empty input -> the message viewport owns rows
+        // 0..=4 (the old static spacer row is now the trailing separator in
+        // the stream), composer rows 5..=8. An empty channel lays out to no
+        // rows, so the pane is blank.
+        let mut app = App::new(22, 3);
+        app.open_channel("osu_irc", "#osu");
+        app.select_channel(0);
 
         // Act
         let buffer = render_sized(&app, "", 50, 11);
 
-        // Assert: the spacer row is blank with the global background across the
-        // main column, and the composer ┃ starts on the row below it.
+        // Assert: the pane's bottom row is blank with the global background
+        // across the main column, and the composer ┃ starts on the row below.
         for x in INPUT_X..50 {
             assert_eq!(buffer.cell((x, 4)).unwrap().symbol(), " ", "col {x}");
             assert_eq!(buffer.cell((x, 4)).unwrap().bg, GLOBAL_BG, "col {x}");

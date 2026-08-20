@@ -671,9 +671,10 @@ mod tests {
             assert!(app.is_at_bottom(), "not at bottom after push {i}");
             assert_eq!(app.scroll_offset(), app.max_offset());
         }
-        // 6 messages = 6 rows + 5 separators = 11 rows; max offset = 11 - 3.
-        assert_eq!(app.total_height(), 11);
-        assert_eq!(app.scroll_offset(), 8);
+        // 6 messages = 6 rows + 5 separators + 2 framing rows = 13 rows;
+        // max offset = 13 - 3.
+        assert_eq!(app.total_height(), 13);
+        assert_eq!(app.scroll_offset(), 10);
     }
 
     #[test]
@@ -683,7 +684,7 @@ mod tests {
         for i in 0..5 {
             app.push_message(msg("u", &format!("m{i}")));
         }
-        assert_eq!(app.max_offset(), 6);
+        assert_eq!(app.max_offset(), 8);
         app.set_scroll_offset(0);
         assert!(!app.is_at_bottom());
 
@@ -702,14 +703,14 @@ mod tests {
             app.push_message(msg("u", &format!("m{i}")));
         }
         app.set_scroll_offset(app.max_offset());
-        assert_eq!(app.scroll_offset(), 6);
+        assert_eq!(app.scroll_offset(), 8);
 
         // Act
         app.push_message(msg("u", "new"));
 
         // Assert: boundary counts as "at bottom" -> follows to the new max.
-        assert_eq!(app.max_offset(), 8);
-        assert_eq!(app.scroll_offset(), 8);
+        assert_eq!(app.max_offset(), 10);
+        assert_eq!(app.scroll_offset(), 10);
     }
 
     #[test]
@@ -725,18 +726,19 @@ mod tests {
 
     #[test]
     fn page_up_decrements_by_one_third_viewport() {
-        // Arrange: viewport height 9 -> step 3; 8 messages -> max offset 6.
+        // Arrange: viewport height 9 -> step 3; 8 messages -> 8 rows + 7
+        // separators + 2 framing rows = 17 -> max offset 8.
         let mut app = App::new(40, 9);
         for i in 0..8 {
             app.push_message(msg("u", &format!("m{i}")));
         }
-        assert_eq!(app.max_offset(), 6);
+        assert_eq!(app.max_offset(), 8);
 
         // Act
         app.scroll_page_up();
 
         // Assert
-        assert_eq!(app.scroll_offset(), 3);
+        assert_eq!(app.scroll_offset(), 5);
     }
 
     #[test]
@@ -762,13 +764,13 @@ mod tests {
         for i in 0..8 {
             app.push_message(msg("u", &format!("m{i}")));
         }
-        app.set_scroll_offset(5);
+        app.set_scroll_offset(7);
 
-        // Act: step 3 would exceed max offset 6.
+        // Act: step 3 would exceed max offset 8.
         app.scroll_page_down();
 
         // Assert
-        assert_eq!(app.scroll_offset(), 6);
+        assert_eq!(app.scroll_offset(), 8);
     }
 
     #[test]
@@ -803,12 +805,12 @@ mod tests {
         // Assert: still glued to the bottom, at the recomputed max.
         assert!(app.is_at_bottom());
         assert_eq!(app.scroll_offset(), app.max_offset());
-        assert_eq!(app.total_height(), 5); // 2+2 rows + 1 separator
+        assert_eq!(app.total_height(), 7); // 2+2 rows + 1 separator + 2 framing
     }
 
     #[test]
     fn resize_while_scrolled_up_preserves_offset_clamped() {
-        // Arrange: 8 short messages -> height 15; with h=10 max offset is 5.
+        // Arrange: 8 short messages -> height 17; with h=10 max offset is 7.
         let mut app = App::new(30, 10);
         for _ in 0..8 {
             app.push_message(msg("u", "x"));
@@ -816,13 +818,13 @@ mod tests {
         app.set_scroll_offset(2);
         assert!(!app.is_at_bottom());
 
-        // Act & Assert: growing the viewport shrinks max to 3, still >= 2.
+        // Act & Assert: growing the viewport shrinks max to 5, still >= 2.
         app.resize(30, 12);
-        assert_eq!(app.max_offset(), 3);
+        assert_eq!(app.max_offset(), 5);
         assert_eq!(app.scroll_offset(), 2);
 
         // Act & Assert: growing further shrinks max to 1 -> offset clamps down.
-        app.resize(30, 14);
+        app.resize(30, 16);
         assert_eq!(app.max_offset(), 1);
         assert_eq!(app.scroll_offset(), 1);
     }
@@ -854,8 +856,9 @@ mod tests {
     #[test]
     fn line_cap_evicts_oldest_to_keep_height_bounded() {
         // Arrange: width 10 -> nick "u" takes 3 columns, body width 7;
-        // "aa bb cc N" wraps into 2 rows, so n messages occupy 3n-1 rows.
-        // With a line cap of 8, at most 3 messages fit (3*3-1 = 8).
+        // "aa bb cc N" wraps into 2 rows, so n messages occupy 3n+1 rows
+        // (with the framing separators). With a line cap of 8, at most 2
+        // messages fit (3*2+1 = 7).
         let mut app = App::with_caps(10, 5, 1000, 8);
 
         // Act
@@ -863,29 +866,29 @@ mod tests {
             app.push_message(msg("u", &format!("aa bb cc {i}")));
         }
 
-        // Assert: height stays at the cap and the oldest messages were dropped.
-        assert_eq!(app.total_height(), 8);
-        assert_eq!(app.messages().len(), 3);
-        assert_eq!(app.messages().first().unwrap().text, "aa bb cc 7");
+        // Assert: height stays under the cap and the oldest were dropped.
+        assert_eq!(app.total_height(), 7);
+        assert_eq!(app.messages().len(), 2);
+        assert_eq!(app.messages().first().unwrap().text, "aa bb cc 8");
     }
 
     #[test]
     fn eviction_while_scrolled_up_keeps_offset_clamped() {
-        // Arrange: exactly at the line cap, then scrolled to the top.
-        let mut app = App::with_caps(10, 3, 1000, 8);
+        // Arrange: exactly under the line cap, then scrolled to the top.
+        let mut app = App::with_caps(10, 3, 1000, 11);
         for i in 0..3 {
             app.push_message(msg("u", &format!("aa bb cc {i}")));
         }
-        assert_eq!(app.total_height(), 8);
+        assert_eq!(app.total_height(), 10);
         app.set_scroll_offset(0);
         assert!(!app.is_at_bottom());
 
-        // Act: a fourth message forces eviction back down to the cap.
+        // Act: a fourth message forces eviction back down under the cap.
         app.push_message(msg("u", "aa bb cc 3"));
 
         // Assert: m0 evicted, height bounded, offset still valid and unmoved.
         assert_eq!(app.messages().first().unwrap().text, "aa bb cc 1");
-        assert_eq!(app.total_height(), 8);
+        assert_eq!(app.total_height(), 10);
         assert!(app.scroll_offset() <= app.max_offset());
         assert_eq!(app.scroll_offset(), 0);
     }
@@ -1277,9 +1280,10 @@ mod tests {
 
     #[test]
     fn focusing_messages_selects_lowest_fully_visible() {
-        // Arrange: 5 one-line messages in a 3-row viewport (total 9 rows, max 6).
-        // Spans: m0=(0) m1=(2) m2=(4) m3=(6) m4=(8); at the bottom (off=6) the
-        // fully-visible ones are m3 and m4, so m4 is selected.
+        // Arrange: 5 one-line messages in a 3-row viewport (total 11 rows,
+        // max 8). Spans (framing row shifts everything down by one):
+        // m0=(1) m1=(3) m2=(5) m3=(7) m4=(9); at the bottom (off=8) the only
+        // fully-visible message is m4, so it is selected.
         let mut app = App::new(40, 3);
         app.open_channel("srv", "#a");
         app.select_channel(0);
@@ -1294,12 +1298,12 @@ mod tests {
         // Assert
         assert_eq!(app.focus(), Focus::Messages);
         assert_eq!(app.selected(), Some(4));
-        assert_eq!(app.selected_span(), Some((8, 1)));
+        assert_eq!(app.selected_span(), Some((9, 1)));
     }
 
     #[test]
     fn select_prev_moves_up_and_reveals_with_minimal_scroll() {
-        // Arrange: as above, selected m4 (span (8,1)), offset 6.
+        // Arrange: as above, selected m4 (span (9,1)), offset 8.
         let mut app = App::new(40, 3);
         app.open_channel("srv", "#a");
         app.select_channel(0);
@@ -1309,19 +1313,20 @@ mod tests {
         app.tab();
         assert_eq!(app.selected(), Some(4));
 
-        // Act / Assert
-        app.select_prev(); // -> m3 (span 6), fully visible, no scroll
+        // Act / Assert: each step scrolls up just enough to reveal the top of
+        // the newly selected message (offset lands on its span start).
+        app.select_prev(); // -> m3 (span 7)
         assert_eq!(app.selected(), Some(3));
-        assert_eq!(app.scroll_offset(), 6);
-        app.select_prev(); // -> m2 (span 4), scroll up to reveal its top
+        assert_eq!(app.scroll_offset(), 7);
+        app.select_prev(); // -> m2 (span 5)
         assert_eq!(app.selected(), Some(2));
-        assert_eq!(app.scroll_offset(), 4);
+        assert_eq!(app.scroll_offset(), 5);
         app.select_prev(); // -> m1
         assert_eq!(app.selected(), Some(1));
-        assert_eq!(app.scroll_offset(), 2);
+        assert_eq!(app.scroll_offset(), 3);
         app.select_prev(); // -> m0
         assert_eq!(app.selected(), Some(0));
-        assert_eq!(app.scroll_offset(), 0);
+        assert_eq!(app.scroll_offset(), 1);
         app.select_prev(); // clamped at oldest
         assert_eq!(app.selected(), Some(0));
     }
@@ -1344,12 +1349,14 @@ mod tests {
         assert_eq!(app.selected(), Some(1));
         app.select_next();
         assert_eq!(app.selected(), Some(2));
-        // jump repeatedly past the end clamps at the newest
+        // jump repeatedly past the end clamps at the newest, fully visible
         for _ in 0..10 {
             app.select_next();
         }
         assert_eq!(app.selected(), Some(4));
-        assert_eq!(app.scroll_offset(), app.max_offset());
+        let (start, height) = app.selected_span().unwrap();
+        assert!(start >= app.scroll_offset());
+        assert!(start + height <= app.scroll_offset() + 3);
     }
 
     #[test]

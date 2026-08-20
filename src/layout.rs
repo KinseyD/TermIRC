@@ -4,8 +4,11 @@
 //! - the first line carries the nick and the first chunk of the body;
 //! - continuation lines are indented so the body starts in the same column,
 //!   never underneath the nick;
-//! - between two messages there is exactly one blank separator line
-//!   (never after the last message).
+//! - between two messages there is exactly one blank separator line, and the
+//!   whole list is framed by one more separator row above the first and below
+//!   the last message (these replace a title row and a composer spacer — they
+//!   scroll with the content and render as half-blocks when the adjacent
+//!   message is selected). An empty message list lays out to no rows.
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -84,11 +87,13 @@ pub fn wrap_body(text: &str, width: u16) -> Vec<String> {
 }
 
 /// Row span `(start, height)` of each message in the same coordinate system as
-/// `layout_messages` (i.e. including the blank separator rows between messages).
-/// The total row count implied by the spans equals `layout_messages(...).len()`.
+/// `layout_messages` (i.e. including the framing separator row above the first
+/// message and the separator rows between messages). The total row count is
+/// the last span end plus one (the trailing framing row), matching
+/// `layout_messages(...).len()` — an empty list yields no spans.
 pub fn message_spans(messages: &[ChatMessage], width: u16) -> Vec<(u16, u16)> {
     let mut spans = Vec::with_capacity(messages.len());
-    let mut row = 0u16;
+    let mut row = 1u16; // the framing separator row above the first message
     for (i, message) in messages.iter().enumerate() {
         if i > 0 {
             row += 1; // blank separator row before this message
@@ -103,15 +108,23 @@ pub fn message_spans(messages: &[ChatMessage], width: u16) -> Vec<(u16, u16)> {
 }
 
 /// Lay out all messages for a viewport `width` columns wide.
+///
+/// The list is framed by one blank separator row above the first and below the
+/// last message; an empty message list lays out to no rows at all.
 pub fn layout_messages(messages: &[ChatMessage], width: u16) -> Vec<LayoutLine> {
     let mut lines = Vec::new();
+    if messages.is_empty() {
+        return lines;
+    }
+    let separator = || LayoutLine {
+        indent: 0,
+        nick: None,
+        body: String::new(),
+    };
+    lines.push(separator()); // framing row above the first message
     for (i, message) in messages.iter().enumerate() {
         if i > 0 {
-            lines.push(LayoutLine {
-                indent: 0,
-                nick: None,
-                body: String::new(),
-            });
+            lines.push(separator());
         }
         let indent = nick_column_width(&message.nick).min(width.saturating_sub(1));
         let body_width = width.saturating_sub(indent).max(1);
@@ -131,6 +144,7 @@ pub fn layout_messages(messages: &[ChatMessage], width: u16) -> Vec<LayoutLine> 
             }
         }
     }
+    lines.push(separator()); // framing row below the last message
     lines
 }
 
@@ -171,15 +185,37 @@ mod tests {
         // Act
         let lines = layout_messages(&messages, 40);
 
-        // Assert
+        // Assert: the message row is framed by a separator above and below.
+        assert_eq!(lines.len(), 3);
         assert_eq!(
-            lines,
-            vec![LayoutLine {
+            lines[1],
+            LayoutLine {
                 indent: 0,
                 nick: Some("alice".to_string()),
                 body: "hi".to_string(),
-            }]
+            }
         );
+        for framing in [lines.first().unwrap(), lines.last().unwrap()] {
+            assert_eq!(
+                framing,
+                &LayoutLine {
+                    indent: 0,
+                    nick: None,
+                    body: String::new(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn empty_message_list_lays_out_to_no_rows() {
+        // Arrange & Act
+        let lines = layout_messages(&[], 40);
+        let spans = message_spans(&[], 40);
+
+        // Assert: no framing rows without messages.
+        assert!(lines.is_empty());
+        assert!(spans.is_empty());
     }
 
     #[test]
@@ -190,34 +226,39 @@ mod tests {
         // Act
         let lines = layout_messages(&messages, 20);
 
-        // Assert
-        assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0].nick, Some("alice".to_string()));
-        assert_eq!(lines[0].indent, 0);
-        assert_eq!(lines[0].body, "one two three");
-        assert_eq!(lines[1].nick, None);
-        assert_eq!(lines[1].indent, 7);
-        assert_eq!(lines[1].body, "four five");
-        assert!(7 + UnicodeWidthStr::width(lines[1].body.as_str()) <= 20);
+        // Assert: framing blank, then the two message rows.
+        assert_eq!(lines.len(), 4);
+        assert!(lines[0].body.is_empty() && lines[0].nick.is_none());
+        assert_eq!(lines[1].nick, Some("alice".to_string()));
+        assert_eq!(lines[1].indent, 0);
+        assert_eq!(lines[1].body, "one two three");
+        assert_eq!(lines[2].nick, None);
+        assert_eq!(lines[2].indent, 7);
+        assert_eq!(lines[2].body, "four five");
+        assert!(7 + UnicodeWidthStr::width(lines[2].body.as_str()) <= 20);
+        assert!(lines[3].body.is_empty() && lines[3].nick.is_none());
     }
 
     #[test]
-    fn separator_count_equals_messages_minus_one_and_no_trailing_blank() {
+    fn separators_frame_the_list_and_separate_messages() {
         // Arrange
         let messages = vec![msg("a", "one"), msg("b", "two"), msg("c", "three")];
 
         // Act
         let lines = layout_messages(&messages, 40);
 
-        // Assert: exactly two blank separators, last line is real content.
+        // Assert: two separators between the three messages plus one framing
+        // row at each end; first and last rows are the framing blanks.
         let blanks = lines
             .iter()
             .filter(|l| l.nick.is_none() && l.body.is_empty())
             .count();
-        assert_eq!(blanks, 2);
-        let last = lines.last().unwrap();
-        assert_eq!(last.body, "three");
-        assert_eq!(last.nick, Some("c".to_string()));
+        assert_eq!(blanks, 4);
+        assert!(lines.first().unwrap().body.is_empty());
+        assert!(lines.last().unwrap().body.is_empty());
+        assert_eq!(lines[1].nick, Some("a".to_string()));
+        assert_eq!(lines[3].nick, Some("b".to_string()));
+        assert_eq!(lines[5].nick, Some("c".to_string()));
     }
 
     #[test]
@@ -233,8 +274,8 @@ mod tests {
         // Act
         let lines = layout_messages(&messages, 12);
 
-        // Assert: 3 + 2 lines + 1 separator = 6.
-        assert_eq!(lines.len(), 6);
+        // Assert: 3 + 2 lines + 1 separator + 2 framing rows = 8.
+        assert_eq!(lines.len(), 8);
     }
 
     #[test]
@@ -339,15 +380,17 @@ mod tests {
 
     #[test]
     fn message_spans_account_for_separator_rows() {
-        // Arrange: three one-line messages -> 3 rows + 2 separators = 5 rows.
+        // Arrange: three one-line messages -> 3 rows + 2 separators + 2 framing
+        // rows = 7 rows.
         let messages = vec![msg("a", "one"), msg("b", "two"), msg("c", "three")];
 
         // Act
         let spans = message_spans(&messages, 40);
 
-        // Assert: each message is one row, two separator rows between them.
-        assert_eq!(spans, vec![(0, 1), (2, 1), (4, 1)]);
-        assert_eq!(layout_messages(&messages, 40).len(), 5);
+        // Assert: each message is one row; the leading framing row shifts every
+        // span down by one.
+        assert_eq!(spans, vec![(1, 1), (3, 1), (5, 1)]);
+        assert_eq!(layout_messages(&messages, 40).len(), 7);
     }
 
     #[test]
@@ -358,9 +401,10 @@ mod tests {
         // Act
         let spans = message_spans(&messages, 20);
 
-        // Assert: one span with height 2, matching the 2 laid-out lines.
-        assert_eq!(spans, vec![(0, 2)]);
-        assert_eq!(layout_messages(&messages, 20).len(), 2);
+        // Assert: one span with height 2 below the framing row; the trailing
+        // framing row makes the layout 4 rows tall.
+        assert_eq!(spans, vec![(1, 2)]);
+        assert_eq!(layout_messages(&messages, 20).len(), 4);
     }
 
     #[test]
@@ -376,7 +420,7 @@ mod tests {
         let spans = message_spans(&messages, 24);
         let total: u16 = spans.last().map(|&(s, h)| s + h).unwrap_or(0);
 
-        // Assert
-        assert_eq!(total as usize, layout_messages(&messages, 24).len());
+        // Assert: the trailing framing row adds one row past the last span end.
+        assert_eq!(total as usize + 1, layout_messages(&messages, 24).len());
     }
 }
