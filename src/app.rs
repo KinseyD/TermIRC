@@ -33,6 +33,9 @@ struct ChannelState {
     scroll_offset: u16,
     /// Selected message index (used while the message pane has focus).
     selected: Option<usize>,
+    /// Whether this channel has been viewed at least once. The first view
+    /// snaps to the newest history; later views keep the scroll position.
+    viewed: bool,
 }
 
 impl ChannelState {
@@ -44,6 +47,7 @@ impl ChannelState {
             lines: Vec::new(),
             scroll_offset: 0,
             selected: None,
+            viewed: false,
         }
     }
 
@@ -136,12 +140,16 @@ impl App {
             .map(|s| (s.server.as_str(), s.channel.as_str()))
     }
 
-    /// Switch the message pane to a registered channel, keeping that channel's
-    /// scroll position (non-following).
+    /// Switch the message pane to a registered channel. The first view of a
+    /// channel snaps to its newest history (so opening a busy channel from
+    /// the sidebar lands on the live messages); switching back to a channel
+    /// keeps the scroll position it was left at.
     pub fn select_channel(&mut self, index: usize) {
         if index < self.channels.len() {
+            let first_view = !self.channels[index].viewed;
+            self.channels[index].viewed = true;
             self.active = Some(index);
-            self.relayout_active(false);
+            self.relayout_active(first_view);
         }
     }
 
@@ -174,6 +182,7 @@ impl App {
                     message.server.clone(),
                     message.channel.clone(),
                 ));
+                self.channels[0].viewed = true;
                 self.active = Some(0);
                 0
             }
@@ -1068,6 +1077,50 @@ mod tests {
         app.open_channel("srv", "#osu");
         app.push_message(chan_msg("srv", "#other", "x"));
         assert_eq!(app.messages().len(), 0);
+    }
+
+    #[test]
+    fn first_view_of_a_channel_snaps_to_its_newest_history() {
+        // Arrange: history accumulates in the background while the welcome
+        // page is up (no channel viewed yet); 5 one-line messages lay out to
+        // 11 stream rows, so a 3-row viewport has max offset 8.
+        let mut app = App::new(40, 3);
+        app.open_channel("srv", "#a");
+        for i in 0..5 {
+            app.push_message(chan_msg("srv", "#a", &format!("m{i}")));
+        }
+
+        // Act: open the channel from the sidebar for the first time.
+        app.select_channel(0);
+
+        // Assert: the view lands on the newest messages, with the trailing
+        // framing separator as the pane's bottom row (blank row above the
+        // composer) - not on the top of the history.
+        assert_eq!(app.max_offset(), 8);
+        assert_eq!(app.scroll_offset(), app.max_offset());
+        assert!(app.messages().last().unwrap().text == "m4");
+    }
+
+    #[test]
+    fn revisiting_a_scrolled_channel_preserves_its_position() {
+        // Arrange: view #a, scroll up, switch away and back.
+        let mut app = App::new(40, 3);
+        app.open_channel("srv", "#a");
+        app.open_channel("srv", "#b");
+        app.select_channel(0);
+        for i in 0..5 {
+            app.push_message(chan_msg("srv", "#a", &format!("m{i}")));
+        }
+        app.scroll_page_up();
+        let offset = app.scroll_offset();
+        assert!(offset < app.max_offset());
+
+        // Act
+        app.select_channel(1);
+        app.select_channel(0);
+
+        // Assert: the scrolled position survives the round trip.
+        assert_eq!(app.scroll_offset(), offset);
     }
 
     #[test]
