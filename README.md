@@ -73,6 +73,18 @@ Two expectations worth setting: opening a channel jumps to its newest
 messages and the view follows new ones while you stay at the bottom; and
 TermIRC never auto-reconnects — after a drop, restart it.
 
+## Roadmap
+
+- [ ] Mouse support
+- [ ] Adaptive, flexible layout
+- [ ] Dynamic shortcut hints
+- [ ] Logging
+- [ ] Persistent chat history
+- [ ] Show system messages (joins, parts, notices)
+- [ ] More complete IRC protocol support
+- [ ] Web previews / images in the terminal
+- [ ] Polished keybinding behavior
+
 ## Troubleshooting
 
 - **`failed to load config from …`** — create
