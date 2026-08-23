@@ -469,8 +469,9 @@ impl App {
         self.channels[active].selected = Some(chosen);
     }
 
-    /// Scroll the minimum amount so the selected message is fully visible, and
-    /// clamp the offset once the layout is stable.
+    /// Scroll the minimum amount so the selected message AND its bounding
+    /// separator rows (which render as half blocks and carry the tapered
+    /// accent ends) are fully visible, and clamp the offset to the layout.
     fn reveal_selection(&mut self) {
         let Some(active) = self.active else {
             return;
@@ -485,12 +486,15 @@ impl App {
         let Some(&(start, height)) = spans.get(idx) else {
             return;
         };
-        let end = start + height;
+        // The selection block: the separator row above the message through the
+        // separator row below it (both always exist thanks to the framing).
+        let block_top = start.saturating_sub(1);
+        let block_bottom = start + height; // exclusive end == the row below
         let state = &mut self.channels[active];
-        if start < state.scroll_offset {
-            state.scroll_offset = start;
-        } else if end > state.scroll_offset + viewport_height {
-            state.scroll_offset = end.saturating_sub(viewport_height);
+        if block_top < state.scroll_offset {
+            state.scroll_offset = block_top;
+        } else if block_bottom >= state.scroll_offset + viewport_height {
+            state.scroll_offset = (block_bottom + 1).saturating_sub(viewport_height);
         }
         let max = state.total_height().saturating_sub(viewport_height);
         state.scroll_offset = state.scroll_offset.min(max);
@@ -1366,20 +1370,21 @@ mod tests {
         app.tab();
         assert_eq!(app.selected(), Some(4));
 
-        // Act / Assert: each step scrolls up just enough to reveal the top of
-        // the newly selected message (offset lands on its span start).
-        app.select_prev(); // -> m3 (span 7)
+        // Act / Assert: each step scrolls up just enough to reveal the
+        // separator row above the newly selected message too (offset lands on
+        // the block top, one row above the span start).
+        app.select_prev(); // -> m3 (span 7, block top 6)
         assert_eq!(app.selected(), Some(3));
-        assert_eq!(app.scroll_offset(), 7);
-        app.select_prev(); // -> m2 (span 5)
+        assert_eq!(app.scroll_offset(), 6);
+        app.select_prev(); // -> m2 (span 5, block top 4)
         assert_eq!(app.selected(), Some(2));
-        assert_eq!(app.scroll_offset(), 5);
+        assert_eq!(app.scroll_offset(), 4);
         app.select_prev(); // -> m1
         assert_eq!(app.selected(), Some(1));
-        assert_eq!(app.scroll_offset(), 3);
-        app.select_prev(); // -> m0
+        assert_eq!(app.scroll_offset(), 2);
+        app.select_prev(); // -> m0: the leading framing row enters view
         assert_eq!(app.selected(), Some(0));
-        assert_eq!(app.scroll_offset(), 1);
+        assert_eq!(app.scroll_offset(), 0);
         app.select_prev(); // clamped at oldest
         assert_eq!(app.selected(), Some(0));
     }
@@ -1397,19 +1402,21 @@ mod tests {
             app.select_prev();
         }
         assert_eq!(app.selected(), Some(0));
+        assert_eq!(app.scroll_offset(), 0);
 
-        app.select_next();
+        app.select_next(); // -> m1: block spans rows 2..=4 -> offset 2
         assert_eq!(app.selected(), Some(1));
-        app.select_next();
+        assert_eq!(app.scroll_offset(), 2);
+        app.select_next(); // -> m2: block spans rows 4..=6 -> offset 4
         assert_eq!(app.selected(), Some(2));
-        // jump repeatedly past the end clamps at the newest, fully visible
+        assert_eq!(app.scroll_offset(), 4);
+        // jump repeatedly past the end clamps at the newest; the trailing
+        // framing row stays visible below it (offset == max).
         for _ in 0..10 {
             app.select_next();
         }
         assert_eq!(app.selected(), Some(4));
-        let (start, height) = app.selected_span().unwrap();
-        assert!(start >= app.scroll_offset());
-        assert!(start + height <= app.scroll_offset() + 3);
+        assert_eq!(app.scroll_offset(), app.max_offset());
     }
 
     #[test]

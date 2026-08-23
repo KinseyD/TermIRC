@@ -917,19 +917,17 @@ mod tests {
         app.tab();
         app.tab(); // messages focused -> selects m2 (span 5)
 
-        // Act / Assert (last message): scroll to the very bottom so the
-        // trailing framing row is visible below it.
-        app.set_scroll_offset(app.max_offset());
+        // Act / Assert (last message): already at the bottom after the
+        // default selection, so the trailing framing row is visible below it.
         let buffer = render_sized(&app, "", 50, 12);
         assert_eq!(buffer.cell((INPUT_X, 2)).unwrap().symbol(), "┃");
         assert_eq!(buffer.cell((INPUT_X, 3)).unwrap().symbol(), "╹");
         assert_eq!(buffer.cell((MAIN_COL_X, 3)).unwrap().symbol(), "▀");
 
-        // Act / Assert (first message): select it and scroll to the very top
-        // so the leading framing row is visible above it.
+        // Act / Assert (first message): selecting it scrolls up until the
+        // leading framing row is visible above it.
         app.select_prev(); // -> m1
-        app.select_prev(); // -> m0 (span 1)
-        app.set_scroll_offset(0);
+        app.select_prev(); // -> m0 (span 1): the reveal reaches the block top
         let buffer = render_sized(&app, "", 50, 12);
         assert_eq!(buffer.cell((MAIN_COL_X, 0)).unwrap().symbol(), "▄");
         assert_eq!(buffer.cell((INPUT_X, 0)).unwrap().symbol(), "╻");
