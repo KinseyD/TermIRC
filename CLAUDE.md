@@ -19,6 +19,8 @@ cargo fmt --check                              # format check (run `cargo fmt` t
 
 The app requires a config at `~/.config/termirc/config.toml`; `test.toml` in the repo root is the local sample — copy it there to run.
 
+CI runs on GitHub Actions on push/PR (fmt, clippy, test × ubuntu/windows/macos); pushing a `v*` tag builds multi-platform release binaries.
+
 ## Architecture
 
 A library (`src/lib.rs` re-exports `app`, `config`, `irc`, `layout`, `message`, `ui`) plus a thin binary (`src/main.rs`) that wires them together. All logic lives in the library so unit and integration tests can reach it.

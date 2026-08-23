@@ -1,5 +1,7 @@
 # TermIRC
 
+[![CI](https://github.com/KinseyD/TermIRC/actions/workflows/ci.yml/badge.svg)](https://github.com/KinseyD/TermIRC/actions/workflows/ci.yml)
+
 A terminal IRC client written in Rust. TermIRC reads your servers from a
 TOML config file, opens one connection per server — joining every
 configured channel — and gives you a scrollable chat pane, a
