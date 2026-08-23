@@ -1,12 +1,11 @@
 # termirc
 
-A receive-only terminal TUI IRC client written in Rust.
+A terminal TUI IRC client written in Rust.
 
-It reads your server list from a TOML config file, connects to the **first
-server's first channel**, and displays incoming chat messages in a scrollable
-pane beside a server/channel sidebar, with a composer along the bottom.
-Sending messages is intentionally not implemented (yet) — the composer accepts
-and edits text but `Enter` does not send.
+It reads your server list from a TOML config file, opens one connection per
+server (joining all of its channels), and displays incoming chat messages in a
+scrollable pane beside a server/channel sidebar. Type in the composer and
+press `Enter` to send to the viewed channel.
 
 ## Layout
 
@@ -45,7 +44,7 @@ Focus cycles between the three panes with `Tab`:
 | Key | Sidebar focused | Messages focused | Composer focused |
 |-----|-----------------|------------------|------------------|
 | `j` / `k` | move the cursor down / up | select the next / previous message | type `j` / `k` |
-| `Enter` | collapse/expand a server row, or switch to the channel under the cursor | (no-op) | (no send yet) |
+| `Enter` | collapse/expand a server row, or switch to the channel under the cursor | (no-op) | send the text to the viewed channel |
 | printable chars | — | — | type into the composer |
 | `Backspace`/`Delete`/arrows | — | — | edit the composer input |
 | `PgUp` / `PgDn` | scroll the message pane by ⅓ of its height | same | same |

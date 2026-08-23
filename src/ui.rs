@@ -364,9 +364,9 @@ fn render_composer(
         Rect::new(text_left, area.y + 1, text_width, n),
     );
     let tips = if status.is_empty() {
-        "Esc quit · PgUp/PgDn scroll".to_string()
+        "Esc quit · Enter send · PgUp/PgDn scroll".to_string()
     } else {
-        format!("{status}  ·  Esc quit · PgUp/PgDn scroll")
+        format!("{status}  ·  Esc quit · Enter send · PgUp/PgDn scroll")
     };
     frame.render_widget(
         Paragraph::new(tips),
@@ -1035,6 +1035,7 @@ mod tests {
             "tips: {tips:?}"
         );
         assert!(tips.contains("Esc quit"), "tips: {tips:?}");
+        assert!(tips.contains("Enter send"), "tips: {tips:?}");
     }
 
     #[test]

@@ -2,8 +2,9 @@
 //!
 //! The async `irc` crate needs a tokio runtime; we confine it to a single
 //! background thread with a cheap current-thread runtime and forward events
-//! to the synchronous UI loop over an `mpsc` channel. One thread is spawned
-//! per configured server, each joining all of that server's channels.
+//! to the synchronous UI loop over an `mpsc` channel. Sending goes the other
+//! way through a bounded tokio channel (`OutgoingMessage`). One thread is
+//! spawned per configured server, each joining all of that server's channels.
 
 use std::sync::mpsc;
 use std::thread;
@@ -25,6 +26,21 @@ pub enum IrcEvent {
     Error(String),
 }
 
+/// A message the user wants to send through one of our connections.
+///
+/// `server` is the config key used by the UI to pick the right connection;
+/// the IRC thread sends `text` to `target` over its own server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutgoingMessage {
+    pub server: String,
+    pub target: String,
+    pub text: String,
+}
+
+/// How many messages may wait in flight to a connection before `try_send`
+/// starts failing (the UI never blocks on a send).
+const OUTGOING_CAPACITY: usize = 64;
+
 /// Map our server settings onto the irc crate's client configuration,
 /// joining every channel in `channels`.
 pub fn build_client_config(server: &ServerConfig, channels: &[String]) -> IrcClientConfig {
@@ -44,17 +60,22 @@ pub fn build_client_config(server: &ServerConfig, channels: &[String]) -> IrcCli
 /// Spawn the IRC client thread for one server; events arrive on `tx`.
 ///
 /// `server_label` is the config key identifying the server in events and
-/// statuses. The thread connects, registers, joins all channels, and forwards
-/// chat messages until the connection ends. A terminal event is ALWAYS emitted
-/// on exit — `Status` for a clean close, `Error` otherwise — so the UI never
-/// keeps claiming "connected" to a dead feed.
+/// statuses. The thread connects, registers, joins all channels, forwards
+/// chat messages, and sends whatever the returned `Sender` receives until
+/// the connection ends. A terminal event is ALWAYS emitted on exit — `Status`
+/// for a clean close, `Error` otherwise — so the UI never keeps claiming
+/// "connected" to a dead feed.
 pub fn spawn_irc(
     server: ServerConfig,
     server_label: String,
     channels: Vec<String>,
     tx: mpsc::Sender<IrcEvent>,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
+) -> (
+    thread::JoinHandle<()>,
+    tokio::sync::mpsc::Sender<OutgoingMessage>,
+) {
+    let (out_tx, out_rx) = tokio::sync::mpsc::channel(OUTGOING_CAPACITY);
+    let handle = thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -70,7 +91,7 @@ pub fn spawn_irc(
 
         let host = server.server.clone();
         let label = server_label.clone();
-        let result = runtime.block_on(run_client(server, &server_label, &channels, &tx));
+        let result = runtime.block_on(run_client(server, &server_label, &channels, &tx, out_rx));
         // `send` failing means the receiver is gone — the UI has quit and the
         // process is about to reap this thread; nothing to report anywhere.
         match result {
@@ -83,7 +104,8 @@ pub fn spawn_irc(
                 let _ = tx.send(IrcEvent::Error(format!("{label}: {e}")));
             }
         }
-    })
+    });
+    (handle, out_tx)
 }
 
 async fn run_client(
@@ -91,6 +113,7 @@ async fn run_client(
     server_label: &str,
     channels: &[String],
     tx: &mpsc::Sender<IrcEvent>,
+    mut out_rx: tokio::sync::mpsc::Receiver<OutgoingMessage>,
 ) -> anyhow::Result<()> {
     let mut client = Client::from_config(build_client_config(&server, channels)).await?;
     client.identify()?;
@@ -100,17 +123,30 @@ async fn run_client(
         server.server
     )));
 
-    while let Some(result) = stream.next().await {
-        match result {
-            Ok(message) => {
-                if let Some(chat) = ChatMessage::from_proto(&message, server_label, channels) {
-                    let _ = tx.send(IrcEvent::Message(chat));
+    loop {
+        tokio::select! {
+            outgoing = out_rx.recv() => {
+                match outgoing {
+                    // The UI is shutting down (all senders dropped): stop.
+                    None => return Ok(()),
+                    Some(message) => client.send_privmsg(&message.target, &message.text)?,
                 }
             }
-            Err(e) => return Err(e.into()),
+            item = stream.next() => {
+                match item {
+                    Some(Ok(message)) => {
+                        if let Some(chat) =
+                            ChatMessage::from_proto(&message, server_label, channels)
+                        {
+                            let _ = tx.send(IrcEvent::Message(chat));
+                        }
+                    }
+                    Some(Err(e)) => return Err(e.into()),
+                    None => return Ok(()),
+                }
+            }
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]

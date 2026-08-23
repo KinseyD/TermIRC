@@ -6,6 +6,7 @@
 //! user has scrolled up so that line leaves the window, the viewport stays put
 //! until they scroll back to the bottom.
 
+use crate::irc::OutgoingMessage;
 use crate::layout::{LayoutLine, layout_messages, message_spans};
 use crate::message::ChatMessage;
 
@@ -354,6 +355,35 @@ impl App {
 
     pub fn cursor_end(&mut self) {
         self.input_cursor = self.input.chars().count();
+    }
+
+    /// Submit the composer: take the typed text as a message to the viewed
+    /// channel and clear the input. Whitespace-only input sends nothing (but
+    /// is still cleared); with no channel open the input is kept.
+    pub fn submit_input(&mut self) -> Option<OutgoingMessage> {
+        let (server, target) = self.active_channel()?;
+        let text = self.input.trim().to_string();
+        let server = server.to_string();
+        let target = target.to_string();
+        if text.is_empty() {
+            self.input.clear();
+            self.input_cursor = 0;
+            return None;
+        }
+        self.input.clear();
+        self.input_cursor = 0;
+        Some(OutgoingMessage {
+            server,
+            target,
+            text,
+        })
+    }
+
+    /// Put text back into the composer (with the cursor at its end), e.g.
+    /// after a send failed.
+    pub fn restore_input(&mut self, text: String) {
+        self.input_cursor = text.chars().count();
+        self.input = text;
     }
 
     fn page_step(&self) -> u16 {
@@ -1020,6 +1050,85 @@ mod tests {
         // Assert: never exceeds the cap; cursor sits at the end.
         assert_eq!(app.input().chars().count(), MAX_INPUT);
         assert_eq!(app.input_cursor(), MAX_INPUT);
+    }
+
+    // ----- sending -----
+
+    #[test]
+    fn submit_input_returns_active_channel_and_clears_the_composer() {
+        // Arrange: viewing #a with text typed in the composer.
+        let mut app = App::new(40, 10);
+        app.open_channel("srv", "#a");
+        app.select_channel(0);
+        app.type_char('h');
+        app.type_char('i');
+
+        // Act
+        let outgoing = app.submit_input();
+
+        // Assert: the message targets the viewed channel and the composer
+        // is reset.
+        assert_eq!(
+            outgoing,
+            Some(OutgoingMessage {
+                server: "srv".to_string(),
+                target: "#a".to_string(),
+                text: "hi".to_string(),
+            })
+        );
+        assert_eq!(app.input(), "");
+        assert_eq!(app.input_cursor(), 0);
+    }
+
+    #[test]
+    fn submit_input_trims_and_blanks_send_nothing() {
+        // Arrange: whitespace-only input is not a message.
+        let mut app = App::new(40, 10);
+        app.open_channel("srv", "#a");
+        app.select_channel(0);
+        app.type_char(' ');
+        app.type_char(' ');
+
+        // Act
+        let outgoing = app.submit_input();
+
+        // Assert: nothing is sent, but the blank input is cleared.
+        assert_eq!(outgoing, None);
+        assert_eq!(app.input(), "");
+    }
+
+    #[test]
+    fn submit_input_without_a_channel_keeps_the_input() {
+        // Arrange: the welcome page has no channel to send to.
+        let mut app = App::new(40, 10);
+        app.open_channel("srv", "#a");
+        app.type_char('h');
+
+        // Act
+        let outgoing = app.submit_input();
+
+        // Assert: no message, and the typed text survives.
+        assert_eq!(outgoing, None);
+        assert_eq!(app.input(), "h");
+    }
+
+    #[test]
+    fn restore_input_puts_text_back_with_cursor_at_end() {
+        // Arrange: a submitted message whose send failed.
+        let mut app = App::new(40, 10);
+        app.open_channel("srv", "#a");
+        app.select_channel(0);
+        app.type_char('h');
+        app.type_char('i');
+        let outgoing = app.submit_input().unwrap();
+        assert_eq!(app.input(), "");
+
+        // Act: the UI puts the text back after a failed send.
+        app.restore_input(outgoing.text);
+
+        // Assert
+        assert_eq!(app.input(), "hi");
+        assert_eq!(app.input_cursor(), 2);
     }
 
     // ----- multi-channel routing -----

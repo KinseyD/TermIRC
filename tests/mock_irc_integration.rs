@@ -11,7 +11,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use termirc::config::ServerConfig;
-use termirc::irc::{IrcEvent, spawn_irc};
+use termirc::irc::{IrcEvent, OutgoingMessage, spawn_irc};
 use termirc::message::ChatMessage;
 
 const RECV_TIMEOUT: Duration = Duration::from_secs(5);
@@ -324,4 +324,34 @@ fn reports_error_when_connection_is_refused() {
         Ok(IrcEvent::Error(_)) => {}
         other => panic!("expected IrcEvent::Error, got {other:?}"),
     }
+}
+
+#[test]
+fn outgoing_message_is_sent_as_privmsg_on_the_wire() {
+    // Arrange: connect to the mock and wait for the JOIN to land.
+    let (port, lines_rx) = spawn_mock_server();
+    let (tx, _rx) = mpsc::channel();
+    let (_handle, sender) = spawn_irc(
+        server_config_for(port),
+        "osu_irc".to_string(),
+        server_config_for(port).channels,
+        tx,
+    );
+    let _ = collect_client_lines_until(&lines_rx, |l| l.starts_with("JOIN"));
+
+    // Act: submit a message through the outgoing channel.
+    sender
+        .blocking_send(OutgoingMessage {
+            server: "osu_irc".to_string(),
+            target: "#test".to_string(),
+            text: "hello world".to_string(),
+        })
+        .unwrap();
+    let lines = collect_client_lines_until(&lines_rx, |l| l.starts_with("PRIVMSG"));
+
+    // Assert: the message went out addressed to the channel.
+    assert!(
+        lines.iter().any(|l| l == "PRIVMSG #test :hello world"),
+        "no PRIVMSG #test in {lines:?}"
+    );
 }

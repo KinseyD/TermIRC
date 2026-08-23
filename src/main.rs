@@ -7,7 +7,8 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers
 
 use termirc::app::{App, Focus};
 use termirc::config::Config;
-use termirc::irc::{IrcEvent, spawn_irc};
+use termirc::irc::{IrcEvent, OutgoingMessage, spawn_irc};
+use termirc::message::ChatMessage;
 use termirc::ui;
 
 /// How often the event loop wakes up to pump IRC events and redraw.
@@ -49,16 +50,22 @@ fn install_panic_hook() {
 
 fn run(terminal: &mut ratatui::DefaultTerminal, config: &Config) -> anyhow::Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
-    // One IRC thread per configured server, joining all of its channels.
+    // One IRC thread per configured server, joining all of its channels, plus
+    // the sender half of each connection's outgoing-message channel.
     // Threads are deliberately not joined: they block on network I/O and are
     // reaped when the process exits.
+    let mut outgoing: std::collections::HashMap<
+        String,
+        tokio::sync::mpsc::Sender<OutgoingMessage>,
+    > = std::collections::HashMap::new();
     for (name, server) in config.servers.iter() {
-        let _ = spawn_irc(
+        let (_handle, sender) = spawn_irc(
             server.clone(),
             name.clone(),
             server.channels.clone(),
             tx.clone(),
         );
+        outgoing.insert(name.clone(), sender);
     }
     drop(tx);
 
@@ -109,13 +116,40 @@ fn run(terminal: &mut ratatui::DefaultTerminal, config: &Config) -> anyhow::Resu
                                 relayout = true;
                             }
                         },
-                        // Enter interacts with the sidebar row under its cursor;
-                        // the composer has no send action yet.
-                        KeyCode::Enter => {
-                            if app.focus() == Focus::Sidebar {
-                                app.sidebar_enter();
+                        // Enter interacts with the sidebar row under its cursor,
+                        // or sends the composer's text to the viewed channel.
+                        KeyCode::Enter => match app.focus() {
+                            Focus::Sidebar => app.sidebar_enter(),
+                            Focus::Composer => {
+                                if let Some(out) = app.submit_input() {
+                                    let nickname = nickname_of(config, &out.server);
+                                    match outgoing.get(&out.server).map(|s| s.try_send(out.clone()))
+                                    {
+                                        Some(Ok(())) => {
+                                            // Echo our own line locally (IRC
+                                            // servers do not send it back).
+                                            app.push_message(ChatMessage {
+                                                server: out.server,
+                                                channel: out.target,
+                                                nick: nickname,
+                                                text: out.text,
+                                            });
+                                        }
+                                        _ => {
+                                            // Connection gone or queue full:
+                                            // put the text back, explain.
+                                            app.restore_input(out.text);
+                                            status = format!(
+                                                "failed to send ({} disconnected or busy)",
+                                                out.server
+                                            );
+                                        }
+                                    }
+                                }
+                                relayout = true; // the composer may shrink
                             }
-                        }
+                            Focus::Messages => {}
+                        },
                         // Composer-only editing keys.
                         KeyCode::Char(c) if composer_focused && !ctrl && !c.is_control() => {
                             app.type_char(c);
@@ -157,6 +191,17 @@ fn run(terminal: &mut ratatui::DefaultTerminal, config: &Config) -> anyhow::Resu
     }
 
     Ok(())
+}
+
+/// The configured nickname for a server (matched case-insensitively by its
+/// config key), for echoing our own sent messages.
+fn nickname_of(config: &Config, server: &str) -> String {
+    config
+        .servers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(server))
+        .map(|(_, server)| server.nickname.clone())
+        .unwrap_or_else(|| server.to_string())
 }
 
 /// Resize the app's message viewport to fit the terminal, leaving room for the
