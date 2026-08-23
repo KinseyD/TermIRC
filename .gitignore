@@ -4,3 +4,5 @@ test.toml
 
 CLAUDE.md
 AGENT.md
+
+.claude/
