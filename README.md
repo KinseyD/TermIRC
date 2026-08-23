@@ -31,8 +31,8 @@ and edits text but `Enter` does not send.
   and the list is framed by one more blank separator row above the first and
   below the last message (these scroll with the content; there is no title
   row and no static spacer above the composer). On startup a **welcome page**
-  is shown until you open a channel from the sidebar; focus starts on the
-  sidebar.
+  takes the whole main column - just the centered termirc logo, no composer -
+  until you open a channel from the sidebar; focus starts on the sidebar.
 - **Composer** (bottom): a shaded input box with a pale-green `┃` accent on its
   left. It keeps a 3-column gap from the screen's right edge and a 2-column
   margin inside the box. When the typed text exceeds one line it wraps, the

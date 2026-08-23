@@ -3,16 +3,17 @@
 //! Screen layout (no box frames):
 //! ```text
 //!  sidebar (fixed)  │  main column
-//!  osu_irc           │  #osu                       <- title row
+//!  osu_irc           │  (blank separator)          <- framing separator rows
 //!    ▶ #osu         │  alice: hello ...            <- messages (scroll)
 //!      #chinese     │
 //!                    │  ┃                          <- input (4 rows, bg-shaded,
 //!                    │  ┃   (empty input)               accent ┃ on the left)
 //!                    │  ┃  connected · q quit …    <- tips row
 //! ```
-//! Lines are pre-wrapped by `layout`, so the messages `Paragraph` is rendered
-//! without `Wrap`: continuation rows already carry their own indentation,
-//! keeping the message body clear of the nick column.
+//! Before any channel is opened the main column shows only the centered logo -
+//! no composer. Lines are pre-wrapped by `layout`, so the messages `Paragraph`
+//! is rendered without `Wrap`: continuation rows already carry their own
+//! indentation, keeping the message body clear of the nick column.
 
 use ratatui::{
     Frame,
@@ -117,6 +118,13 @@ pub fn draw(frame: &mut Frame, app: &App, chrome: &Chrome<'_>) {
     render_sidebar(frame, columns[0], app);
     render_separator(frame, columns[1]);
 
+    // Welcome page (no channel opened yet): the logo centered in the whole
+    // main column - no composer on this page.
+    if app.active_channel().is_none() {
+        render_welcome(frame, inset(columns[2], HORIZONTAL_PAD));
+        return;
+    }
+
     // The composer's wrapped input lines drive its height.
     let (_, input_text_width) = input_text_geometry(frame.area().width);
     let focused = app.focus() == Focus::Composer;
@@ -132,16 +140,11 @@ pub fn draw(frame: &mut Frame, app: &App, chrome: &Chrome<'_>) {
     .split(columns[2]);
 
     let message_rect = inset(rows[0], HORIZONTAL_PAD);
-    if app.active_channel().is_none() {
-        // Welcome page: no channel opened yet (fresh start).
-        render_welcome(frame, message_rect);
-    } else {
-        frame.render_widget(
-            Paragraph::new(build_text(app)).scroll((app.scroll_offset(), 0)),
-            message_rect,
-        );
-        render_selection(frame, message_rect, app);
-    }
+    frame.render_widget(
+        Paragraph::new(build_text(app)).scroll((app.scroll_offset(), 0)),
+        message_rect,
+    );
+    render_selection(frame, message_rect, app);
     render_composer(
         frame,
         rows[1],
@@ -460,32 +463,38 @@ fn render_selection(frame: &mut Frame, msg_rect: Rect, app: &App) {
     }
 }
 
-/// Render the welcome page shown before any channel is opened.
+/// The welcome-page logo: "termirc" in box-drawing block letters. Every row is
+/// the same width, so the block centers as a unit.
+const WELCOME_LOGO: [&str; 6] = [
+    "████████╗███████╗██████╗ ███╗   ███╗██╗██████╗  ██████╗",
+    "╚══██╔══╝██╔════╝██╔══██╗████╗ ████║██║██╔══██╗██╔════╝",
+    "   ██║   █████╗  ██████╔╝██╔████╔██║██║██████╔╝██║     ",
+    "   ██║   ██╔══╝  ██╔══██╗██║╚██╔╝██║██║██╔══██╗██║     ",
+    "   ██║   ███████╗██║  ██║██║ ╚═╝ ██║██║██║  ██║╚██████╗",
+    "   ╚═╝   ╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝╚═╝  ╚═╝ ╚═════╝",
+];
+
+/// Render the welcome page shown before any channel is opened: the logo
+/// centered in the pane, in the composer-accent color. The composer is not
+/// shown on this page - the logo gets the whole main column.
 fn render_welcome(frame: &mut Frame, area: Rect) {
-    let lines = vec![
-        Line::from(Span::styled(
-            "Welcome to termirc",
-            Style::new().fg(INPUT_LINE).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  j / k      move the channel-list cursor",
-            Style::new(),
-        )),
-        Line::from(Span::styled(
-            "  Enter      open the channel under the cursor",
-            Style::new(),
-        )),
-        Line::from(Span::styled(
-            "  Tab        cycle focus: channels · messages · composer",
-            Style::new(),
-        )),
-        Line::from(Span::styled(
-            "  PgUp/PgDn  scroll the messages · Esc quit",
-            Style::new(),
-        )),
-    ];
-    frame.render_widget(Paragraph::new(Text::from(lines)), area);
+    let logo_w = WELCOME_LOGO
+        .iter()
+        .map(|row| row.chars().count())
+        .max()
+        .unwrap_or(0) as u16;
+    let logo_h = WELCOME_LOGO.len() as u16;
+    let top = area.y + area.height.saturating_sub(logo_h) / 2;
+    let left = area.x + area.width.saturating_sub(logo_w) / 2;
+    let style = Style::new().fg(INPUT_LINE).add_modifier(Modifier::BOLD);
+    let art: Vec<Line<'_>> = WELCOME_LOGO
+        .iter()
+        .map(|row| Line::from(Span::styled(*row, style)))
+        .collect();
+    frame.render_widget(
+        Paragraph::new(Text::from(art)),
+        Rect::new(left, top, logo_w.min(area.width), logo_h.min(area.height)),
+    );
 }
 
 /// Fill one row with a half-block character in the given color.
@@ -562,6 +571,15 @@ mod tests {
         app.select_channel(0);
         app.tab(); // Sidebar -> Messages
         app.tab(); // Messages -> Composer
+        app
+    }
+
+    /// An app with #osu open and viewed (so the composer is rendered, unlike
+    /// on the welcome page).
+    fn viewing_app(width: u16, height: u16) -> App {
+        let mut app = App::new(width, height);
+        app.open_channel("osu_irc", "#osu");
+        app.select_channel(0);
         app
     }
 
@@ -711,7 +729,7 @@ mod tests {
     }
 
     #[test]
-    fn welcome_page_shown_when_no_channel_is_open() {
+    fn welcome_page_shows_centered_logo_and_no_composer() {
         // Arrange: channels registered but none viewed; focus starts on the
         // sidebar (fresh-start state).
         let mut app = App::new(22, 6);
@@ -719,15 +737,41 @@ mod tests {
         app.open_channel("osu_irc", "#chinese");
         assert_eq!(app.active_channel(), None);
 
-        // Act: a 50x14 terminal gives the message viewport 8 rows for the
-        // welcome page (no title row anymore).
-        let buffer = render_sized(&app, "", 50, 14);
+        // Act: a 100x30 terminal gives the whole main column to the welcome
+        // page; the 6-row logo is vertically centered -> top at row 12.
+        let buffer = render_sized(&app, "", 100, 30);
 
-        // Assert: the welcome text starts at the top row of the message pane.
-        assert!(!buffer_line(&buffer, 0).contains("#osu"));
-        let pane = buffer_line(&buffer, 0);
-        assert!(pane.contains("Welcome"), "pane was: {pane:?}");
-        assert!(buffer_line(&buffer, 3).contains("Enter"));
+        // Assert: the logo art is rendered in the accent color...
+        let top_row = buffer_line(&buffer, 12);
+        assert!(top_row.contains("████████╗"), "row 12: {top_row:?}");
+        let logo_cell = buffer
+            .cell((top_row.find('█').unwrap() as u16, 12))
+            .unwrap();
+        assert_eq!(logo_cell.fg, INPUT_LINE);
+        assert!(buffer_line(&buffer, 17).contains("╚═════╝"));
+        // ...the old welcome text and key hints are gone...
+        for y in 0..30 {
+            assert!(
+                !buffer_line(&buffer, y).contains("Welcome"),
+                "old heading at row {y}"
+            );
+            assert!(!buffer_line(&buffer, y).contains("Enter"));
+        }
+        // ...and the composer is not shown at all: no input panel background
+        // in the main column and no ┃ accent or ╹ taper anywhere.
+        for y in 0..30 {
+            for x in INPUT_X..100 {
+                assert_ne!(
+                    buffer.cell((x, y)).unwrap().bg,
+                    INPUT_BG,
+                    "panel bg at ({x},{y})"
+                );
+            }
+            assert!(
+                !["┃", "╹"].contains(&buffer.cell((INPUT_X, y)).unwrap().symbol()),
+                "accent at row {y}"
+            );
+        }
     }
 
     #[test]
@@ -979,7 +1023,7 @@ mod tests {
     #[test]
     fn input_area_shows_tips_on_last_row() {
         // Arrange: a wide terminal so the full status + tips line fits.
-        let app = App::new(72, 3);
+        let app = viewing_app(72, 3);
 
         // Act
         let buffer = render_sized(&app, "connected to irc.example.org", 100, 10);
@@ -1013,7 +1057,7 @@ mod tests {
     #[test]
     fn separator_uninterrupted_full_height() {
         // Arrange
-        let app = App::new(22, 3);
+        let app = viewing_app(22, 3);
 
         // Act
         let buffer = render_sized(&app, "", 50, 10);
@@ -1057,7 +1101,7 @@ mod tests {
     #[test]
     fn separator_and_background_colors() {
         // Arrange
-        let app = App::new(22, 3);
+        let app = viewing_app(22, 3);
 
         // Act
         let buffer = render_sized(&app, "", 50, 10);
@@ -1078,7 +1122,7 @@ mod tests {
     fn composer_right_margins() {
         // Arrange: for W=50 the panel spans cols 25..=46 (right gap 47..49 is
         // global bg), and the text keeps a 2-col margin inside the panel.
-        let mut app = App::new(22, 3);
+        let mut app = viewing_app(22, 3);
         app.type_char('h');
         app.type_char('i');
 
@@ -1123,7 +1167,7 @@ mod tests {
         // Arrange: 25 chars at text width 19 wrap into 2 lines, so the composer
         // is 5 rows (blank + 2 text + blank + tips). For H=11 that puts the
         // composer on rows 4..=8.
-        let mut app = App::new(22, 2);
+        let mut app = viewing_app(22, 2);
         for _ in 0..25 {
             app.type_char('x');
         }
@@ -1146,12 +1190,12 @@ mod tests {
         // Arrange / Act: empty input -> composer 4 rows (┃ top at row 5 for H=11);
         // 2-line input -> composer 5 rows (┃ top moves up to row 4).
 
-        let app_empty = App::new(22, 3);
+        let app_empty = viewing_app(22, 3);
         let buf_empty = render_sized(&app_empty, "", 50, 11);
         assert_eq!(buf_empty.cell((INPUT_X, 5)).unwrap().symbol(), "┃");
         assert_eq!(buf_empty.cell((INPUT_X, 4)).unwrap().symbol(), " ");
 
-        let mut app_full = App::new(22, 2);
+        let mut app_full = viewing_app(22, 2);
         for _ in 0..25 {
             app_full.type_char('x');
         }
