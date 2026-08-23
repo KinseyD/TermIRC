@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-termirc is a terminal TUI IRC client in Rust (edition 2024). It reads servers from a TOML config, opens **one connection per server** (joining all of its channels), renders incoming chat in a scrollable pane with a server/channel sidebar, and sends what you type with `Enter` in the composer.
+TermIRC is a terminal TUI IRC client in Rust (edition 2024). It reads servers from a TOML config, opens **one connection per server** (joining all of its channels), renders incoming chat in a scrollable pane with a server/channel sidebar, and sends what you type with `Enter` in the composer.
 
 ## Commands
 

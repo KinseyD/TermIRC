@@ -1,123 +1,83 @@
-# termirc
+# TermIRC
 
-A terminal TUI IRC client written in Rust.
+A terminal IRC client written in Rust. TermIRC reads your servers from a
+TOML config file, opens one connection per server — joining every
+configured channel — and gives you a scrollable chat pane, a
+server/channel sidebar, and a composer to talk with. `Enter` sends.
 
-It reads your server list from a TOML config file, opens one connection per
-server (joining all of its channels), and displays incoming chat messages in a
-scrollable pane beside a server/channel sidebar. Type in the composer and
-press `Enter` to send to the viewed channel.
+## Requirements
 
-## Layout
+- [Rust](https://rustup.rs) 1.85 or newer
+- A terminal with Unicode support; on Windows use **Windows Terminal**
+  (a CJK-capable font is needed if you read CJK channels)
 
-```text
- osu_irc          │
-   ▶ #osu        │  alice:  hello world
-     #chinese    │  bob:    a longer message that wraps
-                  │           under the body column, never
-                  │           under the nick
-                  │
-                  │  ┃ hi_                      <- composer (grows as you type)
-                  │  ┃
-                  │  ┃ connected to irc.ppy.sh · Esc quit · PgUp/PgDn scroll
-                  │  ╹▀▀▀▀▀▀▀▀▀▀
-```
+## Quick start
 
-- **Sidebar** (fixed width): the configured servers and their channels; the
-  viewed channel is highlighted.
-- **Message pane**: each message spans the pane; the nick and body each take
-  their own horizontal space, and wrapped body lines are indented to the body
-  column (never under the nick). Exactly one blank line separates two messages,
-  and the list is framed by one more blank separator row above the first and
-  below the last message (these scroll with the content; there is no title
-  row and no static spacer above the composer). On startup a **welcome page**
-  takes the whole main column - just the centered termirc logo, no composer -
-  until you open a channel from the sidebar; focus starts on the sidebar.
-- **Composer** (bottom): a shaded input box with a pale-green `┃` accent on its
-  left. It keeps a 3-column gap from the screen's right edge and a 2-column
-  margin inside the box. When the typed text exceeds one line it wraps, the
-  composer grows taller, and the message pane shrinks to match.
+1. Create the config file at `~/.config/termirc/config.toml`
+   (Windows: `C:\Users\<you>\.config\termirc\config.toml`):
 
-## Keys
+   ```toml
+   [servers.osu_irc]
+   username = "YourName"
+   nickname = "YourName"
+   password = "your-password-or-token"
+   server = "irc.ppy.sh"
+   use_tls = false
+   port = 6667
+   channels = ["#osu"]
+   ```
 
-Focus cycles between the three panes with `Tab`:
+   A filled-in sample (`test.toml`) ships in the repo root.
 
-| Key | Sidebar focused | Messages focused | Composer focused |
-|-----|-----------------|------------------|------------------|
-| `j` / `k` | move the cursor down / up | select the next / previous message | type `j` / `k` |
-| `Enter` | collapse/expand a server row, or switch to the channel under the cursor | (no-op) | send the text to the viewed channel |
-| printable chars | — | — | type into the composer |
-| `Backspace`/`Delete`/arrows | — | — | edit the composer input |
-| `PgUp` / `PgDn` | scroll the message pane by ⅓ of its height | same | same |
-| `Esc` / `Ctrl+C` | quit | quit | quit |
+2. Run:
 
-While the sidebar has focus its cursor row is slightly highlighted (with a
-block cursor) and the viewed channel row is brighter; moving focus into the
-sidebar snaps the cursor onto the viewed channel's row (or the first row when
-the welcome page is up). `Enter` on a channel switches the message pane and
-returns focus to the composer. While the message pane has focus one message
-is always selected: its rows are highlighted, the separator rows above/below
-(including the framing rows at the very top and bottom of the list) render as
-half blocks, and a pale green `┃` accent - tapered at both ends - marks its
-front edge; `j`/`k` move the selection (auto scrolling minimally to reveal
-it) and incoming messages do not disturb the view. The composer's accent dims
-while another pane has focus.
+   ```bash
+   cargo run --release
+   ```
 
-Connection status is shown on the composer's bottom (tips) row. If the server
-drops the connection, the status changes to `disconnected from …` (or an error
-message) — termirc does not auto-reconnect; quit and restart to rejoin.
-
-Auto-scroll: when a new message arrives, the view follows it **only if the
-newest message's last line is currently visible**. If you have scrolled up so
-that line has left the window, the view stays where it is until you scroll
-back to the bottom.
+3. You land on the welcome page — just the TermIRC logo. Focus starts on
+   the sidebar: move with `j`/`k`, press `Enter` on a channel, and type.
 
 ## Configuration
 
-The config file lives at `~/.config/termirc/config.toml` (on Windows that is
-`C:\Users\<you>\.config\termirc\config.toml`). Copy the sample:
+Each `[servers.<name>]` table is one connection; TermIRC connects to all
+of them in parallel and joins all of their channels. The config is read
+once at startup — restart to pick up changes.
 
-```bash
-cp test.toml ~/.config/termirc/config.toml
-chmod 600 ~/.config/termirc/config.toml   # Unix: it holds a credential
-```
+| Key        | Required | Default | Meaning                              |
+|------------|----------|---------|--------------------------------------|
+| `username` | yes      | —       | IRC username                         |
+| `nickname` | yes      | —       | the nick others see                  |
+| `password` | yes      | —       | server password / auth token         |
+| `server`   | yes      | —       | hostname                             |
+| `port`     | yes      | —       | usually 6667 (plain) or 6697 (TLS)   |
+| `use_tls`  | no       | `false` | connect over TLS                     |
+| `channels` | yes      | —       | channels to join, in order           |
 
-Format (multiple servers and channels are allowed; termirc currently uses the
-first of each):
+Security notes:
 
-```toml
-[servers.osu_irc]
-username = "YourName"
-nickname = "YourName"
-password = "your-irc-token"
-server = "irc.ppy.sh"
-use_tls = false
-port = 6667
-channels = ["#osu", "#chinese"]
-```
+- The file holds a credential — on Unix, `chmod 600` it.
+- With `use_tls = false` the password crosses the network unencrypted.
+  If your network offers TLS, set `use_tls = true` and the TLS port.
 
-The connection defaults to plaintext (`use_tls = false`, port 6667 — what
-osu! Bancho historically uses). If your network offers TLS, prefer it so the
-token does not cross the wire in clear: set `use_tls = true` and the TLS port
-(the system trust store is used; certificate and hostname are verified).
+## Using TermIRC
 
-## Running
+The gist: `Tab` cycles focus between the sidebar, the messages, and the
+composer, and the focused pane receives your keys. `j`/`k` move the
+sidebar cursor or the message selection, `Enter` opens the highlighted
+channel (sidebar) or sends your line (composer), `PgUp`/`PgDn` scroll the
+messages, and `Esc` quits — the composer's bottom row always repeats the
+essentials. The rest is there to explore.
 
-```bash
-cargo run
-```
+Two expectations worth setting: opening a channel jumps to its newest
+messages and the view follows new ones while you stay at the bottom; and
+TermIRC never auto-reconnects — after a drop, restart it.
 
-Run inside **Windows Terminal** (or any modern terminal) so CJK channels like
-`#chinese` render correctly — legacy conhost needs `chcp 65001` plus a
-CJK-capable font.
+## Troubleshooting
 
-## Development
-
-Test-driven throughout; the suite includes unit tests for every pure module
-(config, message, layout, app, ui via `TestBackend`) plus integration tests
-that run the real `irc` client against a local mock TCP server:
-
-```bash
-cargo test                       # 80 unit + 5 integration tests
-cargo clippy --all-targets -- -D warnings
-cargo fmt --check
-```
+- **`failed to load config from …`** — create
+  `~/.config/termirc/config.toml` (see [Configuration](#configuration)).
+- **CJK characters render as boxes** — use Windows Terminal (or run
+  `chcp 65001`) with a CJK font.
+- **Nothing arrives after a disconnect** — there is no auto-reconnect by
+  design; restart TermIRC.
