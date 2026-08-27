@@ -80,7 +80,7 @@ TermIRC never auto-reconnects — after a drop, restart it.
 - [ ] Mouse support
 - [ ] Adaptive, flexible layout
 - [ ] Dynamic shortcut hints
-- [ ] Logging
+- [x] Logging
 - [ ] Persistent chat history
 - [ ] Show system messages (joins, parts, notices)
 - [ ] More complete IRC protocol support
@@ -95,3 +95,5 @@ TermIRC never auto-reconnects — after a drop, restart it.
   `chcp 65001`) with a CJK font.
 - **Nothing arrives after a disconnect** — there is no auto-reconnect by
   design; restart TermIRC.
+- **Where do the logs live?** Runtime logs (connections, errors; no chat
+  content) rotate daily under `~/.config/termirc/logs/`, 7 days kept.

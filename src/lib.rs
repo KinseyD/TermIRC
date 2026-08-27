@@ -8,5 +8,6 @@ pub mod app;
 pub mod config;
 pub mod irc;
 pub mod layout;
+pub mod logging;
 pub mod message;
 pub mod ui;

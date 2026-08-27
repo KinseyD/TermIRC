@@ -17,23 +17,50 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 fn main() -> anyhow::Result<()> {
     install_panic_hook();
 
-    let config_path = dirs::home_dir()
-        .context("could not resolve the home directory")?
-        .join(".config")
-        .join("termirc")
-        .join("config.toml");
-    let config = Config::load(&config_path).with_context(|| {
-        format!(
-            "failed to load config from {} - copy your config file there (e.g. test.toml)",
-            config_path.display()
-        )
-    })?;
+    let home = dirs::home_dir().context("could not resolve the home directory")?;
+    let config_path = home.join(".config").join("termirc").join("config.toml");
+    let logs_dir = home.join(".config").join("termirc").join("logs");
+    // Logging failures are not fatal: run without logs rather than not run.
+    if let Err(e) = termirc::logging::init(&logs_dir) {
+        eprintln!("logging disabled: {e:#}");
+    }
+    let config = match Config::load(&config_path) {
+        Ok(config) => config,
+        Err(e) => {
+            let e = e.context(format!(
+                "failed to load config from {} - copy your config file there (e.g. test.toml)",
+                config_path.display()
+            ));
+            // Log the top-level context only: the toml error chain embeds
+            // the raw offending source line, which could persist a
+            // password fragment into the log file.
+            tracing::error!("{e}");
+            return Err(e);
+        }
+    };
     if config.first_server().is_none() {
+        tracing::error!("config has no servers");
         anyhow::bail!("config has no servers");
     }
+    tracing::info!(
+        "termirc v{} starting; config={}; servers={}",
+        env!("CARGO_PKG_VERSION"),
+        config_path.display(),
+        config.servers.len()
+    );
 
-    let mut terminal = ratatui::try_init()?;
+    let mut terminal = match ratatui::try_init() {
+        Ok(terminal) => terminal,
+        Err(e) => {
+            tracing::error!("failed to initialize terminal: {e:#}");
+            return Err(e.into());
+        }
+    };
     let result = run(&mut terminal, &config);
+    match &result {
+        Ok(()) => tracing::info!("termirc exiting"),
+        Err(e) => tracing::error!("termirc exiting on error: {e:#}"),
+    }
     ratatui::restore();
     result
 }
@@ -43,6 +70,7 @@ fn main() -> anyhow::Result<()> {
 fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        tracing::error!("panic: {info}");
         let _ = ratatui::try_restore();
         default_hook(info);
     }));
@@ -139,6 +167,10 @@ fn run(terminal: &mut ratatui::DefaultTerminal, config: &Config) -> anyhow::Resu
                                             // Connection gone or queue full:
                                             // put the text back, explain.
                                             app.restore_input(out.text);
+                                            tracing::warn!(
+                                                "send failed on {}: disconnected or busy",
+                                                out.server
+                                            );
                                             status = format!(
                                                 "failed to send ({} disconnected or busy)",
                                                 out.server
