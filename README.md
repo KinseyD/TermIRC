@@ -71,13 +71,18 @@ channel (sidebar) or sends your line (composer), `PgUp`/`PgDn` scroll the
 messages, and `Esc` quits — the composer's bottom row always repeats the
 essentials. The rest is there to explore.
 
+The mouse works too: the wheel scrolls the messages, resting the pointer
+on a message pre-highlights it, and a click focuses a pane — clicking a
+channel in the sidebar opens it. While TermIRC runs, hold `Shift` for the
+terminal's own text selection.
+
 Two expectations worth setting: opening a channel jumps to its newest
 messages and the view follows new ones while you stay at the bottom; and
 TermIRC never auto-reconnects — after a drop, restart it.
 
 ## Roadmap
 
-- [ ] Mouse support
+- [x] Mouse support
 - [ ] Adaptive, flexible layout
 - [ ] Dynamic shortcut hints
 - [x] Logging

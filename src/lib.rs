@@ -10,4 +10,5 @@ pub mod irc;
 pub mod layout;
 pub mod logging;
 pub mod message;
+pub mod mouse;
 pub mod ui;

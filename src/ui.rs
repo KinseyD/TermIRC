@@ -68,6 +68,9 @@ const SIDEBAR_CURSOR_BG: Color = Color::Rgb(0x20, 0x20, 0x20);
 const SIDEBAR_ACTIVE_BG: Color = Color::Rgb(0x2e, 0x2e, 0x2e);
 /// Background highlight of the selected message in the message pane.
 const MESSAGE_SELECT_BG: Color = Color::Rgb(0x24, 0x24, 0x24);
+/// Background of the hovered (pre-selected) message or sidebar row: dimmer
+/// than every formal style (`MESSAGE_SELECT_BG`, `SIDEBAR_CURSOR_BG`).
+const HOVER_BG: Color = Color::Rgb(0x1a, 0x1a, 0x1a);
 const DIM_STYLE: Style = Style::new().fg(Color::Rgb(0x70, 0x70, 0x70));
 
 /// Render-only chrome state: everything the renderer needs beyond the App.
@@ -144,6 +147,7 @@ pub fn draw(frame: &mut Frame, app: &App, chrome: &Chrome<'_>) {
         Paragraph::new(build_text(app)).scroll((app.scroll_offset(), 0)),
         message_rect,
     );
+    render_pre_selection(frame, message_rect, app);
     render_selection(frame, message_rect, app);
     render_composer(
         frame,
@@ -186,12 +190,17 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
             row.server.eq_ignore_ascii_case(srv) && row.channel.as_deref() == Some(ch)
         });
 
-        // Row background: the active channel row is brightest; a cursor row is
-        // slightly brighter than the plain background.
+        let is_hovered = !is_active && !is_cursor && app.sidebar_hovered() == Some(i);
+
+        // Row background: the active channel row is brightest; a cursor row
+        // is slightly brighter than the plain background; a hovered row is
+        // dimmer than both.
         let bg = if is_active {
             SIDEBAR_ACTIVE_BG
         } else if is_cursor {
             SIDEBAR_CURSOR_BG
+        } else if is_hovered {
+            HOVER_BG
         } else {
             Color::Reset
         };
@@ -374,6 +383,95 @@ fn render_composer(
     );
 }
 
+/// The block color one message contributes to its side of an adjacent
+/// separator row: the formal selection's color, the hover's, or the
+/// global background. Order-independent: derived from app state, not
+/// from which renderer painted last.
+fn message_block_color(app: &App, idx: usize) -> Color {
+    if app.focus() == Focus::Messages && app.selected() == Some(idx) {
+        MESSAGE_SELECT_BG
+    } else if app.hovered() == Some(idx) {
+        HOVER_BG
+    } else {
+        GLOBAL_BG
+    }
+}
+
+/// Overlay the hovered message's pre-selection highlight: exactly the
+/// formal selection's block, minus its accent column — background on the
+/// message's rows, a lower-half cap (`▄`) on the separator row above and
+/// an upper-half cap (`▀`) on the one below, all in the dimmer hover
+/// color. Rendered before `render_selection`, so the formal styling wins
+/// wherever both point at the same message.
+fn render_pre_selection(frame: &mut Frame, msg_rect: Rect, app: &App) {
+    let Some((start, height)) = app.hovered_span() else {
+        return;
+    };
+    let Some(idx) = app.hovered() else {
+        return;
+    };
+    if app.focus() == Focus::Messages && app.hovered() == app.selected() {
+        return; // same message: the formal selection styling takes over
+    }
+    let off = i64::from(app.scroll_offset());
+    let first = i64::from(start) - off;
+    let last = first + i64::from(height) - 1;
+    let vh = i64::from(msg_rect.height);
+    if last < 0 || first >= vh {
+        return; // hovered message entirely off-screen
+    }
+
+    let block_x = (COMPOSER_ACCENT_X + 1).min(msg_rect.x);
+    let block_w = msg_rect.x + msg_rect.width - block_x;
+
+    // 1. Highlight background on the message's own rows (clipped to the
+    //    pane), exactly like the formal selection.
+    let top = first.max(0);
+    let bottom = last.min(vh - 1);
+    frame.buffer_mut().set_style(
+        Rect::new(
+            block_x,
+            msg_rect.y + top as u16,
+            block_w,
+            (bottom - top + 1) as u16,
+        ),
+        Style::new().bg(HOVER_BG),
+    );
+
+    // 2. Half-block caps on the separator rows (▄ above, ▀ below): the
+    //    half touching the hovered message shows the hover color, the
+    //    other half blends toward the adjacent message's block color.
+    let buf = frame.buffer_mut();
+    if first > 0 {
+        let above = idx
+            .checked_sub(1)
+            .map_or(GLOBAL_BG, |a| message_block_color(app, a));
+        fill_half_block_row(
+            buf,
+            block_x,
+            msg_rect.y + (first - 1) as u16,
+            block_w,
+            "▄",
+            HOVER_BG,
+            above,
+        );
+    }
+    if last + 1 < vh {
+        let below = message_block_color(app, idx + 1);
+        fill_half_block_row(
+            buf,
+            block_x,
+            msg_rect.y + (last + 1) as u16,
+            block_w,
+            "▀",
+            HOVER_BG,
+            below,
+        );
+    }
+    // Deliberately nothing else: the accent column is the one decoration
+    // the pre-selection omits.
+}
+
 /// Overlay the selected-message highlight while the message pane has focus.
 /// The layout frames the message list with separator rows (above the first and
 /// below the last message), so the selection block is always bracketed by
@@ -389,6 +487,9 @@ fn render_selection(frame: &mut Frame, msg_rect: Rect, app: &App) {
         return;
     }
     let Some((start, height)) = app.selected_span() else {
+        return;
+    };
+    let Some(idx) = app.selected() else {
         return;
     };
     let off = i64::from(app.scroll_offset());
@@ -417,10 +518,15 @@ fn render_selection(frame: &mut Frame, msg_rect: Rect, app: &App) {
         Style::new().bg(MESSAGE_SELECT_BG),
     );
 
-    // 2. Half-block separator rows (clipped to the pane): ▄ above, ▀ below
-    //    (fg = highlight color, background untouched).
+    // 2. Half-block separator rows (clipped to the pane): ▄ above, ▀
+    //    below. The half touching the selected message shows the
+    //    highlight color; the other half blends toward the adjacent
+    //    message's block color (hover or global bg).
     let buf = frame.buffer_mut();
     if first > 0 {
+        let above = idx
+            .checked_sub(1)
+            .map_or(GLOBAL_BG, |a| message_block_color(app, a));
         fill_half_block_row(
             buf,
             block_x,
@@ -428,9 +534,11 @@ fn render_selection(frame: &mut Frame, msg_rect: Rect, app: &App) {
             block_w,
             "▄",
             MESSAGE_SELECT_BG,
+            above,
         );
     }
     if last + 1 < vh {
+        let below = message_block_color(app, idx + 1);
         fill_half_block_row(
             buf,
             block_x,
@@ -438,6 +546,7 @@ fn render_selection(frame: &mut Frame, msg_rect: Rect, app: &App) {
             block_w,
             "▀",
             MESSAGE_SELECT_BG,
+            below,
         );
     }
 
@@ -497,19 +606,21 @@ fn render_welcome(frame: &mut Frame, area: Rect) {
     );
 }
 
-/// Fill one row with a half-block character in the given color.
+/// Fill one row with a half-block character: the filled half in `fg`,
+/// the blank half showing `bg`.
 fn fill_half_block_row(
     buf: &mut ratatui::buffer::Buffer,
     x: u16,
     y: u16,
     width: u16,
     symbol: &str,
-    color: Color,
+    fg: Color,
+    bg: Color,
 ) {
     for col in x..x + width {
         buf[(col, y)]
             .set_symbol(symbol)
-            .set_style(Style::new().fg(color));
+            .set_style(Style::new().fg(fg).bg(bg));
     }
 }
 
@@ -1204,5 +1315,142 @@ mod tests {
 
         // Assert: the composer's top edge moved up one row.
         assert_eq!(buf_full.cell((INPUT_X, 4)).unwrap().symbol(), "┃");
+    }
+
+    #[test]
+    fn hovered_message_gets_dim_block_with_half_block_caps_sans_accent() {
+        // Arrange: 3 one-line messages, viewport 4 (offset 3 at the
+        // bottom): m1 sits on screen row 0, m2 on row 2. Focus stays on
+        // the composer so no formal selection renders at all.
+        let mut app = test_app(22, 4);
+        app.push_message(msg("a", "one"));
+        app.push_message(msg("b", "two"));
+        app.push_message(msg("c", "three"));
+        app.set_hover_message(Some(1));
+
+        // Act
+        let buffer = render_sized(&app, "", 50, 12);
+
+        // Assert: m1's row carries the hover background, flush against the
+        // accent column (same x-range as the formal selection block)...
+        assert_eq!(buffer.cell((MAIN_COL_X, 0)).unwrap().bg, HOVER_BG);
+        assert_eq!(buffer.cell((INPUT_X + 1, 0)).unwrap().bg, HOVER_BG);
+        // ...the separator row below m1 carries the block's bottom cap, an
+        // upper-half block in the hover color (fg only, exactly like the
+        // formal selection's caps); m1's above-separator is scrolled
+        // off-screen, so no top cap is visible.
+        let cap = buffer.cell((MAIN_COL_X, 1)).unwrap();
+        assert_eq!(cap.symbol(), "▀");
+        assert_eq!(cap.fg, HOVER_BG);
+        assert_eq!(cap.bg, GLOBAL_BG);
+        // ...no accent column chars anywhere...
+        for y in 0..=4 {
+            assert!(
+                !["┃", "╻", "╹"].contains(&buffer.cell((INPUT_X, y)).unwrap().symbol()),
+                "accent at row {y}"
+            );
+        }
+        // ...and no half-block symbols on any other row (the cap is row 1).
+        for y in [0, 2, 3, 4] {
+            let symbol = buffer.cell((MAIN_COL_X, y)).unwrap().symbol();
+            assert!(symbol != "▄" && symbol != "▀", "half block at row {y}");
+        }
+        // The un-hovered m2 row carries no highlight.
+        assert_ne!(buffer.cell((MAIN_COL_X, 2)).unwrap().bg, HOVER_BG);
+    }
+
+    #[test]
+    fn formal_selection_wins_over_hover_on_the_same_message() {
+        // Arrange: messages focused (m2 selected), pointer hovering the
+        // same m2.
+        let mut app = test_app(22, 4);
+        app.push_message(msg("a", "one"));
+        app.push_message(msg("b", "two"));
+        app.push_message(msg("c", "three"));
+        app.tab();
+        app.tab(); // messages focused -> selects m2
+        app.set_hover_message(app.selected());
+
+        // Act
+        let buffer = render_sized(&app, "", 50, 12);
+
+        // Assert: exactly the formal selection background on m2's row -
+        // no dim layer underneath can be distinguished.
+        assert_eq!(buffer.cell((MAIN_COL_X, 2)).unwrap().bg, MESSAGE_SELECT_BG);
+        assert_ne!(buffer.cell((MAIN_COL_X, 2)).unwrap().bg, HOVER_BG);
+    }
+
+    #[test]
+    fn hover_and_formal_selection_coexist_on_different_messages() {
+        // Arrange: m2 formally selected (pane focused), m1 hovered.
+        let mut app = test_app(22, 4);
+        app.push_message(msg("a", "one"));
+        app.push_message(msg("b", "two"));
+        app.push_message(msg("c", "three"));
+        app.tab();
+        app.tab();
+        app.set_hover_message(Some(1));
+
+        // Act
+        let buffer = render_sized(&app, "", 50, 12);
+
+        // Assert: row 0 (m1) hover, row 2 (m2) formal selection.
+        assert_eq!(buffer.cell((MAIN_COL_X, 0)).unwrap().bg, HOVER_BG);
+        assert_eq!(buffer.cell((MAIN_COL_X, 2)).unwrap().bg, MESSAGE_SELECT_BG);
+        // The shared separator row (screen row 1) blends the two adjacent
+        // blocks: the lower half follows the message below (selected m2 ->
+        // "▄" with fg = select color) and the upper half follows the message
+        // above (hovered m1 -> bg = hover color).
+        assert_eq!(buffer.cell((MAIN_COL_X, 1)).unwrap().symbol(), "▄");
+        assert_eq!(buffer.cell((MAIN_COL_X, 1)).unwrap().fg, MESSAGE_SELECT_BG);
+        assert_eq!(buffer.cell((MAIN_COL_X, 1)).unwrap().bg, HOVER_BG);
+    }
+
+    #[test]
+    fn adjacent_blocks_blend_on_the_shared_separator() {
+        // Arrange: 3 one-line messages, viewport 4. Focusing the messages
+        // selects m2 and auto-follow keeps offset 3; select_prev to m1
+        // reveals m1's block top, scrolling to offset 2 - m1's top cap on
+        // screen row 0, m1 on row 1, the shared separator row 2, m2 on
+        // row 3. Formally select m1 (the message ABOVE), hover m2 (BELOW).
+        let mut app = test_app(22, 4);
+        app.push_message(msg("a", "one"));
+        app.push_message(msg("b", "two"));
+        app.push_message(msg("c", "three"));
+        app.tab();
+        app.tab(); // messages focused -> selects m2 (newest visible)
+        app.select_prev(); // -> m1 (reveal scrolls offset 3 -> 2)
+        assert_eq!(app.selected(), Some(1));
+        app.set_hover_message(Some(2));
+
+        // Act
+        let buffer = render_sized(&app, "", 50, 12);
+
+        // Assert: upper half of the shared separator follows the message
+        // above (selected m1 -> ▀ with fg = select color), lower half
+        // follows the message below (hovered m2 -> bg = hover color).
+        assert_eq!(buffer.cell((MAIN_COL_X, 1)).unwrap().bg, MESSAGE_SELECT_BG);
+        assert_eq!(buffer.cell((MAIN_COL_X, 3)).unwrap().bg, HOVER_BG);
+        let shared = buffer.cell((MAIN_COL_X, 2)).unwrap();
+        assert_eq!(shared.symbol(), "▀");
+        assert_eq!(shared.fg, MESSAGE_SELECT_BG);
+        assert_eq!(shared.bg, HOVER_BG);
+    }
+
+    #[test]
+    fn sidebar_hover_highlights_plain_rows_only() {
+        // Arrange: hover the plain #chinese row (row 2).
+        let mut app = test_app(22, 3);
+        app.set_hover_sidebar(Some(2));
+
+        // Act
+        let buffer = render_sized(&app, "", 50, 10);
+
+        // Assert: plain hovered row gets the hover background; hovering
+        // the active channel row keeps its brighter active background.
+        assert_eq!(buffer.cell((10, 2)).unwrap().bg, HOVER_BG);
+        app.set_hover_sidebar(Some(1));
+        let buffer = render_sized(&app, "", 50, 10);
+        assert_eq!(buffer.cell((10, 1)).unwrap().bg, SIDEBAR_ACTIVE_BG);
     }
 }

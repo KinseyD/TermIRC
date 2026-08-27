@@ -3,16 +3,23 @@
 use std::time::Duration;
 
 use anyhow::Context;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
+};
 
 use termirc::app::{App, Focus};
 use termirc::config::Config;
 use termirc::irc::{IrcEvent, OutgoingMessage, spawn_irc};
 use termirc::message::ChatMessage;
+use termirc::mouse;
 use termirc::ui;
 
 /// How often the event loop wakes up to pump IRC events and redraw.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Lines scrolled per mouse-wheel notch (finer than PgUp/PgDn's third-page).
+const MOUSE_SCROLL_LINES: i32 = 3;
 
 fn main() -> anyhow::Result<()> {
     install_panic_hook();
@@ -56,7 +63,12 @@ fn main() -> anyhow::Result<()> {
             return Err(e.into());
         }
     };
+    if ratatui::crossterm::execute!(std::io::stdout(), EnableMouseCapture).is_err() {
+        ratatui::restore();
+        anyhow::bail!("failed to enable mouse capture");
+    }
     let result = run(&mut terminal, &config);
+    let _ = ratatui::crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     match &result {
         Ok(()) => tracing::info!("termirc exiting"),
         Err(e) => tracing::error!("termirc exiting on error: {e:#}"),
@@ -71,6 +83,7 @@ fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         tracing::error!("panic: {info}");
+        let _ = ratatui::crossterm::execute!(std::io::stdout(), DisableMouseCapture);
         let _ = ratatui::try_restore();
         default_hook(info);
     }));
@@ -206,6 +219,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal, config: &Config) -> anyhow::Resu
                     term_size = (width, height);
                     relayout = true;
                 }
+                Event::Mouse(mouse_event) => handle_mouse(&mut app, mouse_event, term_size),
                 _ => {}
             }
             if relayout {
@@ -254,4 +268,64 @@ fn fit_app(app: &mut App, (w, h): (u16, u16)) {
     if app.size() != (message_width, message_height) {
         app.resize(message_width, message_height);
     }
+}
+
+/// Route one mouse event: wheel scrolling, click actions, and hover
+/// pre-selection (updated on every event - a scroll also moves content
+/// under a stationary pointer).
+fn handle_mouse(app: &mut App, mouse: MouseEvent, term_size: (u16, u16)) {
+    let (_, input_text_width) = ui::input_text_geometry(term_size.0);
+    let input_lines =
+        termirc::layout::input_line_count(app.input(), app.input_cursor(), input_text_width);
+    // The welcome page has no composer; its message pane owns the height.
+    let composer_rows = if app.active_channel().is_some() {
+        ui::composer_height(input_lines)
+    } else {
+        0
+    };
+    let target = mouse::hit(
+        mouse.column,
+        mouse.row,
+        term_size.0,
+        term_size.1,
+        composer_rows,
+    );
+
+    match mouse.kind {
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            if matches!(
+                target,
+                mouse::MouseTarget::MessageRow(_) | mouse::MouseTarget::MessageBlank
+            ) {
+                let delta = if mouse.kind == MouseEventKind::ScrollUp {
+                    -MOUSE_SCROLL_LINES
+                } else {
+                    MOUSE_SCROLL_LINES
+                };
+                app.scroll_lines(delta);
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) => match target {
+            mouse::MouseTarget::SidebarRow(i) => app.click_sidebar_row(i),
+            mouse::MouseTarget::MessageRow(row) => match app.message_at_row(row) {
+                Some(index) => app.click_message(index),
+                None => app.focus_messages(),
+            },
+            mouse::MouseTarget::MessageBlank => app.focus_messages(),
+            mouse::MouseTarget::Composer => app.focus_composer(),
+            mouse::MouseTarget::None => {}
+        },
+        _ => {}
+    }
+
+    // Hover follows the pointer (bounds-checked against the row list).
+    let sidebar_len = app.sidebar_rows().len();
+    app.set_hover_sidebar(match target {
+        mouse::MouseTarget::SidebarRow(i) if i < sidebar_len => Some(i),
+        _ => None,
+    });
+    app.set_hover_message(match target {
+        mouse::MouseTarget::MessageRow(row) => app.message_at_row(row),
+        _ => None,
+    });
 }
