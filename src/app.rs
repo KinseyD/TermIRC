@@ -34,6 +34,9 @@ struct ChannelState {
     scroll_offset: u16,
     /// Selected message index (used while the message pane has focus).
     selected: Option<usize>,
+    /// Hovered (pre-selected) message index while the pointer rests on the
+    /// pane; mirrors `selected`'s eviction adjustment.
+    hovered: Option<usize>,
     /// Whether this channel has been viewed at least once. The first view
     /// snaps to the newest history; later views keep the scroll position.
     viewed: bool,
@@ -48,6 +51,7 @@ impl ChannelState {
             lines: Vec::new(),
             scroll_offset: 0,
             selected: None,
+            hovered: None,
             viewed: false,
         }
     }
@@ -81,6 +85,8 @@ pub struct App {
     focus: Focus,
     /// Sidebar cursor (visible-row index), present only while the sidebar is focused.
     sidebar_cursor: Option<usize>,
+    /// Hovered sidebar row (visible-row index), pointer-driven.
+    sidebar_hovered: Option<usize>,
     /// Lower-cased names of servers whose channel lists are collapsed.
     collapsed: std::collections::BTreeSet<String>,
     width: u16,
@@ -105,6 +111,7 @@ impl App {
             active: None,
             focus: Focus::Sidebar,
             sidebar_cursor: Some(0),
+            sidebar_hovered: None,
             collapsed: std::collections::BTreeSet::new(),
             width,
             viewport_height,
@@ -149,6 +156,8 @@ impl App {
         if index < self.channels.len() {
             let first_view = !self.channels[index].viewed;
             self.channels[index].viewed = true;
+            // The pointer's row mapping is stale for a different channel.
+            self.channels[index].hovered = None;
             self.active = Some(index);
             self.relayout_active(first_view);
         }
@@ -210,6 +219,9 @@ impl App {
             state.messages.drain(..excess);
             if let Some(sel) = state.selected {
                 state.selected = Some(sel.saturating_sub(excess));
+            }
+            if let Some(h) = state.hovered {
+                state.hovered = Some(h.saturating_sub(excess));
             }
         }
     }
@@ -408,6 +420,9 @@ impl App {
             if let Some(sel) = state.selected {
                 state.selected = Some(sel.saturating_sub(1));
             }
+            if let Some(h) = state.hovered {
+                state.hovered = Some(h.saturating_sub(1));
+            }
             state.lines = layout_messages(&state.messages, width);
         }
         let max = state.total_height().saturating_sub(viewport_height);
@@ -530,6 +545,96 @@ impl App {
         state.scroll_offset = state.scroll_offset.min(max);
     }
 
+    // ----- mouse -----
+
+    /// The hovered (pre-selected) message index of the viewed channel.
+    pub fn hovered(&self) -> Option<usize> {
+        self.active_state().and_then(|s| s.hovered)
+    }
+
+    /// The hovered message's row span `(start, height)`, like
+    /// [`selected_span`](Self::selected_span).
+    pub fn hovered_span(&self) -> Option<(u16, u16)> {
+        let state = self.active_state()?;
+        let idx = state.hovered?;
+        message_spans(&state.messages, self.width).get(idx).copied()
+    }
+
+    /// Set/clear the hovered message (out-of-bounds indices clear).
+    pub fn set_hover_message(&mut self, index: Option<usize>) {
+        if let Some(state) = self.active_state_mut() {
+            state.hovered = match index {
+                Some(i) if i < state.messages.len() => Some(i),
+                _ => None,
+            };
+        }
+    }
+
+    /// The hovered sidebar row (visible-row index), if any.
+    pub fn sidebar_hovered(&self) -> Option<usize> {
+        self.sidebar_hovered
+    }
+
+    /// Set/clear the hovered sidebar row.
+    pub fn set_hover_sidebar(&mut self, row: Option<usize>) {
+        self.sidebar_hovered = row;
+    }
+
+    /// The message index under a viewport row (`None` on separators and
+    /// outside the list). The row is an absolute screen row in the message
+    /// pane; the channel's scroll offset is applied here.
+    pub fn message_at_row(&self, viewport_row: u16) -> Option<usize> {
+        let state = self.active_state()?;
+        let content = u32::from(state.scroll_offset) + u32::from(viewport_row);
+        message_spans(&state.messages, self.width)
+            .iter()
+            .position(|&(start, height)| {
+                u32::from(start) <= content && content < u32::from(start) + u32::from(height)
+            })
+    }
+
+    /// Scroll the active channel by `delta` rows (negative = up), clamped.
+    pub fn scroll_lines(&mut self, delta: i32) {
+        let next = i32::from(self.scroll_offset())
+            .saturating_add(delta)
+            .clamp(0, i32::from(self.max_offset()));
+        self.set_scroll_offset(u16::try_from(next).unwrap_or(0));
+    }
+
+    /// Click on a message: formally select it and focus the message pane.
+    /// The clicked row is already visible - no reveal scroll is needed.
+    pub fn click_message(&mut self, index: usize) {
+        if let Some(state) = self.active_state_mut()
+            && index < state.messages.len()
+        {
+            state.selected = Some(index);
+        }
+        self.focus = Focus::Messages;
+    }
+
+    /// Click on a sidebar row: a channel row opens the channel (focus to
+    /// the composer); a server row toggles collapse. Unlike
+    /// `sidebar_enter` this does not require sidebar focus.
+    pub fn click_sidebar_row(&mut self, row: usize) {
+        let Some(srow) = self.sidebar_rows().into_iter().nth(row) else {
+            return;
+        };
+        match srow.channel {
+            Some(channel) => self.open_channel_and_focus(&srow.server, &channel),
+            None => self.toggle_server_collapse(&srow.server),
+        }
+    }
+
+    /// Click on empty message-pane space: focus it without selecting.
+    pub fn focus_messages(&mut self) {
+        self.focus = Focus::Messages;
+    }
+
+    /// Click on the composer: focus it.
+    pub fn focus_composer(&mut self) {
+        self.focus = Focus::Composer;
+    }
+
     // ----- focus & sidebar -----
 
     /// The region that currently holds keyboard focus.
@@ -629,13 +734,17 @@ impl App {
         };
         match &row.channel {
             None => self.toggle_server_collapse(&row.server),
-            Some(channel) => {
-                if let Some(idx) = self.find_channel(&row.server, channel) {
-                    self.select_channel(idx);
-                    self.focus = Focus::Composer;
-                    self.sidebar_cursor = None;
-                }
-            }
+            Some(channel) => self.open_channel_and_focus(&row.server, channel),
+        }
+    }
+
+    /// Switch the view to a channel located by its sidebar row and hand
+    /// focus to the composer (shared by sidebar Enter and mouse clicks).
+    fn open_channel_and_focus(&mut self, server: &str, channel: &str) {
+        if let Some(idx) = self.find_channel(server, channel) {
+            self.select_channel(idx);
+            self.focus = Focus::Composer;
+            self.sidebar_cursor = None;
         }
     }
 
@@ -1563,5 +1672,223 @@ mod tests {
 
         // Assert
         assert_eq!(app.selected(), None);
+    }
+
+    // ----- mouse: scrolling -----
+
+    #[test]
+    fn scroll_linesmoves_by_exact_amount_and_clamps() {
+        // Arrange: 5 one-line messages -> 11 rows; viewport 3 -> max 8.
+        let mut app = App::new(40, 3);
+        for i in 0..5 {
+            app.push_message(msg("u", &format!("m{i}")));
+        }
+        app.set_scroll_offset(5);
+
+        // Act / Assert
+        app.scroll_lines(-3);
+        assert_eq!(app.scroll_offset(), 2);
+        app.scroll_lines(-10);
+        assert_eq!(app.scroll_offset(), 0);
+        app.scroll_lines(100);
+        assert_eq!(app.scroll_offset(), 8);
+    }
+
+    // ----- mouse: row -> message lookup -----
+
+    #[test]
+    fn message_at_row_maps_rows_and_skips_separators() {
+        // Arrange: 2 one-line messages -> rows [frame, m0, sep, m1, frame].
+        let mut app = App::new(40, 10);
+        app.open_channel("srv", "#c");
+        app.select_channel(0);
+        app.push_message(msg("a", "one"));
+        app.push_message(msg("b", "two"));
+
+        // Act / Assert
+        assert_eq!(app.message_at_row(1), Some(0));
+        assert_eq!(app.message_at_row(2), None); // separator row
+        assert_eq!(app.message_at_row(3), Some(1));
+        assert_eq!(app.message_at_row(0), None); // framing row
+        assert_eq!(app.message_at_row(9), None); // past the end
+    }
+
+    #[test]
+    fn message_at_row_hits_continuation_rows_of_multiline_messages() {
+        // Arrange: nick "alice" -> indent 7 at width 20; the body wraps to
+        // 2 rows, so message 0 owns content rows 1 and 2.
+        let mut app = App::new(20, 10);
+        app.open_channel("srv", "#c");
+        app.select_channel(0);
+        app.push_message(msg("alice", "one two three four five"));
+
+        // Act / Assert
+        assert_eq!(app.message_at_row(1), Some(0));
+        assert_eq!(app.message_at_row(2), Some(0));
+        assert_eq!(app.message_at_row(3), None); // trailing frame
+    }
+
+    #[test]
+    fn message_at_row_applies_the_scroll_offset() {
+        // Arrange: as in message_at_row_maps_rows_and_skips_separators,
+        // scrolled so content row 4 is at viewport row 1 (offset 3).
+        let mut app = App::new(40, 2);
+        app.open_channel("srv", "#c");
+        app.select_channel(0);
+        app.push_message(msg("a", "one"));
+        app.push_message(msg("b", "two"));
+        app.set_scroll_offset(3);
+
+        // Act / Assert: viewport row 1 shows content row 4 = trailing frame.
+        assert_eq!(app.message_at_row(1), None);
+        assert_eq!(app.message_at_row(0), Some(1)); // content row 3 = m1
+    }
+
+    // ----- mouse: hover state -----
+
+    #[test]
+    fn set_hover_message_validates_bounds() {
+        // Arrange
+        let mut app = App::new(40, 10);
+        app.open_channel("srv", "#c");
+        app.select_channel(0);
+        app.push_message(msg("u", "m0"));
+
+        // Act / Assert: valid indices stick, invalid ones clear.
+        app.set_hover_message(Some(0));
+        assert_eq!(app.hovered(), Some(0));
+        app.set_hover_message(Some(9));
+        assert_eq!(app.hovered(), None);
+        app.set_hover_message(None);
+        assert_eq!(app.hovered(), None);
+    }
+
+    #[test]
+    fn switching_channel_clears_the_hover() {
+        // Arrange
+        let mut app = App::new(40, 10);
+        app.open_channel("srv", "#c");
+        app.open_channel("srv", "#b");
+        app.select_channel(0);
+        app.push_message(msg("u", "m0"));
+        app.set_hover_message(Some(0));
+
+        // Act
+        app.select_channel(1);
+
+        // Assert: the pointer position is stale for the new channel.
+        assert_eq!(app.hovered(), None);
+    }
+
+    #[test]
+    fn eviction_adjusts_the_hover_like_the_selection() {
+        // Arrange: width 10 -> every "aa bb cc N" message is 2 rows; line
+        // cap 8 keeps 2 messages (3*2+1 = 7 rows fit). Hover the newest.
+        let mut app = App::with_caps(10, 5, 1000, 8);
+        app.push_message(msg("u", "aa bb cc 0"));
+        app.push_message(msg("u", "aa bb cc 1"));
+        app.set_hover_message(Some(1));
+
+        // Act: a third message evicts the oldest ("aa bb cc 0").
+        app.push_message(msg("u", "aa bb cc 2"));
+
+        // Assert: the hover shifted down with the list, like `selected`.
+        assert_eq!(app.hovered(), Some(0));
+        assert_eq!(app.messages().first().unwrap().text, "aa bb cc 1");
+    }
+
+    // ----- mouse: click semantics -----
+
+    #[test]
+    fn click_message_selects_and_focuses_the_pane() {
+        // Arrange: viewing a channel with the composer focused.
+        let mut app = App::new(40, 10);
+        app.open_channel("srv", "#c");
+        app.select_channel(0);
+        app.push_message(msg("a", "one"));
+        app.push_message(msg("b", "two"));
+        app.tab(); // Sidebar -> Messages
+        app.tab(); // Messages -> Composer
+        assert_eq!(app.focus(), Focus::Composer);
+
+        // Act
+        app.click_message(1);
+
+        // Assert
+        assert_eq!(app.selected(), Some(1));
+        assert_eq!(app.focus(), Focus::Messages);
+    }
+
+    #[test]
+    fn click_message_out_of_bounds_only_focuses() {
+        // Arrange
+        let mut app = App::new(40, 10);
+        app.open_channel("srv", "#c");
+        app.select_channel(0);
+        app.push_message(msg("a", "one"));
+
+        // Act
+        app.click_message(9);
+
+        // Assert: focus moves, the (invalid) selection does not change.
+        assert_eq!(app.focus(), Focus::Messages);
+        assert_eq!(app.selected(), None);
+    }
+
+    #[test]
+    fn click_sidebar_channel_row_opens_it_and_focuses_the_composer() {
+        // Arrange: rows = [srv, #a, #b], viewing #a via the keyboard path.
+        let mut app = App::new(40, 10);
+        app.open_channel("srv", "#a");
+        app.open_channel("srv", "#b");
+        app.select_channel(0);
+
+        // Act: click #b's row (2) - sidebar is NOT focused.
+        app.click_sidebar_row(2);
+
+        // Assert
+        assert_eq!(app.active_channel(), Some(("srv", "#b")));
+        assert_eq!(app.focus(), Focus::Composer);
+        assert_eq!(app.sidebar_cursor(), None);
+    }
+
+    #[test]
+    fn click_sidebar_server_row_toggles_collapse() {
+        // Arrange
+        let mut app = App::new(40, 10);
+        app.open_channel("srv", "#a");
+        assert!(!app.server_collapsed("srv"));
+
+        // Act / Assert: works without sidebar focus.
+        app.click_sidebar_row(0);
+        assert!(app.server_collapsed("srv"));
+        app.click_sidebar_row(0);
+        assert!(!app.server_collapsed("srv"));
+    }
+
+    #[test]
+    fn click_sidebar_row_out_of_range_is_ignored() {
+        // Arrange
+        let mut app = App::new(40, 10);
+        app.open_channel("srv", "#a");
+
+        // Act / Assert: no panic, no state change.
+        app.click_sidebar_row(5);
+        assert_eq!(app.active_channel(), None);
+    }
+
+    #[test]
+    fn focus_setters_move_focus_without_selecting() {
+        // Arrange
+        let mut app = App::new(40, 10);
+        app.open_channel("srv", "#a");
+        app.select_channel(0);
+
+        // Act / Assert: focus moves, no selection is created.
+        app.focus_messages();
+        assert_eq!(app.focus(), Focus::Messages);
+        assert_eq!(app.selected(), None);
+        app.focus_composer();
+        assert_eq!(app.focus(), Focus::Composer);
     }
 }
