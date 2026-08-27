@@ -82,6 +82,7 @@ pub fn spawn_irc(
         {
             Ok(runtime) => runtime,
             Err(e) => {
+                tracing::error!("{server_label}: runtime init failed: {e}");
                 let _ = tx.send(IrcEvent::Error(format!(
                     "{server_label}: runtime init failed: {e}"
                 )));
@@ -96,11 +97,13 @@ pub fn spawn_irc(
         // process is about to reap this thread; nothing to report anywhere.
         match result {
             Ok(()) => {
+                tracing::info!("{label}: disconnected from {host} (connection closed)");
                 let _ = tx.send(IrcEvent::Status(format!(
                     "{label}: disconnected from {host} (connection closed)"
                 )));
             }
             Err(e) => {
+                tracing::error!("{label}: {e}");
                 let _ = tx.send(IrcEvent::Error(format!("{label}: {e}")));
             }
         }
@@ -122,6 +125,7 @@ async fn run_client(
         "{server_label}: connected to {}",
         server.server
     )));
+    tracing::info!("{server_label}: connected to {}", server.server);
 
     loop {
         tokio::select! {
