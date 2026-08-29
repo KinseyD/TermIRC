@@ -281,13 +281,16 @@ fn reports_status_when_server_closes_connection() {
         tx,
     );
 
-    // Assert: after the chat message, a disconnect notification must arrive —
-    // the UI must never keep showing "connected" to a dead feed.
+    // Assert: after the chat message, a disconnect notification carrying the
+    // server's config key must arrive — the UI never keeps showing
+    // "connected" to a dead feed.
     let deadline = std::time::Instant::now() + RECV_TIMEOUT;
     let mut disconnected = false;
     while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
         match rx.recv_timeout(remaining) {
-            Ok(IrcEvent::Status(text)) if text.contains("disconnected") => {
+            Ok(IrcEvent::Status(server, text))
+                if server == "osu_irc" && text.contains("disconnected") =>
+            {
                 disconnected = true;
                 break;
             }
@@ -319,9 +322,10 @@ fn reports_error_when_connection_is_refused() {
         tx,
     );
 
-    // Assert: the failed connect surfaces as an Error event, not silence.
+    // Assert: the failed connect surfaces as an Error event tagged with the
+    // server's config key, not silence.
     match rx.recv_timeout(RECV_TIMEOUT) {
-        Ok(IrcEvent::Error(_)) => {}
+        Ok(IrcEvent::Error(server, _)) => assert_eq!(server, "osu_irc"),
         other => panic!("expected IrcEvent::Error, got {other:?}"),
     }
 }
@@ -341,7 +345,7 @@ fn outgoing_message_is_sent_as_privmsg_on_the_wire() {
 
     // Act: submit a message through the outgoing channel.
     sender
-        .blocking_send(OutgoingMessage {
+        .blocking_send(OutgoingMessage::Privmsg {
             server: "osu_irc".to_string(),
             target: "#test".to_string(),
             text: "hello world".to_string(),
@@ -353,5 +357,68 @@ fn outgoing_message_is_sent_as_privmsg_on_the_wire() {
     assert!(
         lines.iter().any(|l| l == "PRIVMSG #test :hello world"),
         "no PRIVMSG #test in {lines:?}"
+    );
+}
+
+#[test]
+fn raw_line_is_sent_verbatim_on_the_wire() {
+    // Arrange: connect to the mock and wait for the JOIN to land.
+    let (port, lines_rx) = spawn_mock_server();
+    let (tx, _rx) = mpsc::channel();
+    let (_handle, sender) = spawn_irc(
+        server_config_for(port),
+        "osu_irc".to_string(),
+        server_config_for(port).channels,
+        tx,
+    );
+    let _ = collect_client_lines_until(&lines_rx, |l| l.starts_with("JOIN"));
+
+    // Act: submit a raw console line through the outgoing channel.
+    sender
+        .blocking_send(OutgoingMessage::Raw {
+            server: "osu_irc".to_string(),
+            line: "WHOIS test".to_string(),
+        })
+        .unwrap();
+    let lines = collect_client_lines_until(&lines_rx, |l| l.starts_with("WHOIS"));
+
+    // Assert: the line goes out verbatim as command + parameters.
+    assert!(
+        lines.iter().any(|l| l == "WHOIS test"),
+        "no WHOIS test in {lines:?}"
+    );
+}
+
+#[test]
+fn raw_line_marks_a_colon_last_param_as_trailing() {
+    // Arrange: connect to the mock and wait for the JOIN to land.
+    let (port, lines_rx) = spawn_mock_server();
+    let (tx, _rx) = mpsc::channel();
+    let (_handle, sender) = spawn_irc(
+        server_config_for(port),
+        "osu_irc".to_string(),
+        server_config_for(port).channels,
+        tx,
+    );
+    let _ = collect_client_lines_until(&lines_rx, |l| l.starts_with("JOIN"));
+
+    // Act: submit a raw line whose last parameter explicitly starts with
+    // ':' (the client's own keepalive PING carries a bare token, so filter
+    // on the colon form).
+    sender
+        .blocking_send(OutgoingMessage::Raw {
+            server: "osu_irc".to_string(),
+            line: "PING :smoke".to_string(),
+        })
+        .unwrap();
+    let lines = collect_client_lines_until(&lines_rx, |l| l.starts_with("PING :"));
+
+    // Assert: the irc crate's `stringify` marks a ':'-prefixed last param
+    // as the trailing param by prefixing another ':' — crate-inherent
+    // behavior that keeps the param a single token. Last params without a
+    // leading ':' go out verbatim.
+    assert!(
+        lines.iter().any(|l| l == "PING ::smoke"),
+        "no PING ::smoke in {lines:?}"
     );
 }

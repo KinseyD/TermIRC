@@ -113,8 +113,10 @@ fn run(terminal: &mut ratatui::DefaultTerminal, config: &Config) -> anyhow::Resu
     let s = terminal.size()?;
     let mut term_size = (s.width, s.height);
     let mut app = App::new(1, 1);
-    // Register every server's channels in config order; the first is viewed.
+    // Register every server's console view and channels in config order;
+    // the first view opens when the first message arrives.
     for (name, server) in config.servers.iter() {
+        app.open_server(name);
         for channel in &server.channels {
             app.open_channel(name, channel);
         }
@@ -163,30 +165,39 @@ fn run(terminal: &mut ratatui::DefaultTerminal, config: &Config) -> anyhow::Resu
                             Focus::Sidebar => app.sidebar_enter(),
                             Focus::Composer => {
                                 if let Some(out) = app.submit_input() {
-                                    let nickname = nickname_of(config, &out.server);
-                                    match outgoing.get(&out.server).map(|s| s.try_send(out.clone()))
-                                    {
+                                    let (server, channel, text) = match &out {
+                                        OutgoingMessage::Privmsg {
+                                            server,
+                                            target,
+                                            text,
+                                        } => (server.clone(), target.clone(), text.clone()),
+                                        // A raw console line echoes into the server's
+                                        // console view (empty-channel sentinel).
+                                        OutgoingMessage::Raw { server, line } => {
+                                            (server.clone(), String::new(), line.clone())
+                                        }
+                                    };
+                                    let nickname = nickname_of(config, &server);
+                                    match outgoing.get(&server).map(|s| s.try_send(out.clone())) {
                                         Some(Ok(())) => {
                                             // Echo our own line locally (IRC
                                             // servers do not send it back).
                                             app.push_message(ChatMessage {
-                                                server: out.server,
-                                                channel: out.target,
+                                                server,
+                                                channel,
                                                 nick: nickname,
-                                                text: out.text,
+                                                text,
                                             });
                                         }
                                         _ => {
                                             // Connection gone or queue full:
                                             // put the text back, explain.
-                                            app.restore_input(out.text);
+                                            app.restore_input(text);
                                             tracing::warn!(
-                                                "send failed on {}: disconnected or busy",
-                                                out.server
+                                                "send failed on {server}: disconnected or busy"
                                             );
                                             status = format!(
-                                                "failed to send ({} disconnected or busy)",
-                                                out.server
+                                                "failed to send ({server} disconnected or busy)"
                                             );
                                         }
                                     }
@@ -230,8 +241,17 @@ fn run(terminal: &mut ratatui::DefaultTerminal, config: &Config) -> anyhow::Resu
         for irc_event in rx.try_iter() {
             match irc_event {
                 IrcEvent::Message(message) => app.push_message(message),
-                IrcEvent::Status(text) => status = text,
-                IrcEvent::Error(text) => status = text,
+                // Status changes the status bar AND lands in that server's
+                // console view as a nick-less line.
+                IrcEvent::Status(server, text) | IrcEvent::Error(server, text) => {
+                    status = format!("{server}: {text}");
+                    app.push_message(ChatMessage {
+                        server,
+                        channel: String::new(),
+                        nick: String::new(),
+                        text,
+                    });
+                }
             }
         }
     }
