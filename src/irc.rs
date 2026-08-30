@@ -161,10 +161,19 @@ async fn run_client(
             item = stream.next() => {
                 match item {
                     Some(Ok(message)) => {
-                        if let Some(chat) =
-                            ChatMessage::from_proto(&message, server_label, channels)
-                        {
-                            let _ = tx.send(IrcEvent::Message(chat));
+                        match ChatMessage::from_proto(&message, server_label, channels) {
+                            Some(chat) => {
+                                let _ = tx.send(IrcEvent::Message(chat));
+                            }
+                            // Server replies (numerics, NOTICEs) land in
+                            // the server's console as raw lines.
+                            None => {
+                                if let Some(raw) =
+                                    ChatMessage::raw_from_proto(&message, server_label)
+                                {
+                                    let _ = tx.send(IrcEvent::Message(raw));
+                                }
+                            }
                         }
                     }
                     Some(Err(e)) => return Err(e.into()),

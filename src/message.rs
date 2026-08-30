@@ -38,6 +38,26 @@ impl ChatMessage {
             text,
         })
     }
+
+    /// Extract a raw protocol line for the server console from a message
+    /// that is not channel chat.
+    ///
+    /// Server replies — numeric responses (welcome, MOTD, WHOIS results,
+    /// errors) and NOTICEs — render verbatim as nick-less lines in the
+    /// server's console view. Other users' presence traffic (JOIN/PART/…)
+    /// and keepalive PINGs stay dropped: they would flood the console
+    /// without ever being a reply to the user.
+    pub fn raw_from_proto(msg: &Message, server: &str) -> Option<ChatMessage> {
+        match &msg.command {
+            Command::Response(..) | Command::NOTICE(..) => Some(ChatMessage {
+                server: server.to_string(),
+                channel: String::new(),
+                nick: String::new(),
+                text: msg.to_string().trim_end_matches(['\r', '\n']).to_string(),
+            }),
+            _ => None,
+        }
+    }
 }
 
 /// Convert a raw PRIVMSG body into display text.
@@ -223,5 +243,66 @@ mod tests {
 
         // Assert
         assert_eq!(chat.unwrap().text, "hello");
+    }
+
+    // ----- raw console lines -----
+
+    #[test]
+    fn numeric_replies_become_raw_console_lines() {
+        // Arrange: the welcome numeric every server sends on connect.
+        let msg: Message = ":mock 001 test :Welcome to the Mock IRC Network"
+            .parse()
+            .unwrap();
+
+        // Act
+        let chat = ChatMessage::raw_from_proto(&msg, SERVER);
+
+        // Assert: routed to the console (empty channel and nick), text is
+        // the verbatim wire line without the CRLF.
+        assert_eq!(
+            chat,
+            Some(ChatMessage {
+                server: "osu_irc".to_string(),
+                channel: String::new(),
+                nick: String::new(),
+                text: ":mock 001 test :Welcome to the Mock IRC Network".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn notices_become_raw_console_lines() {
+        // Arrange: server notices (hostname lookups, auth hints).
+        let msg: Message = ":cho.ppy.sh NOTICE * :*** Looking up your hostname"
+            .parse()
+            .unwrap();
+
+        // Act
+        let chat = ChatMessage::raw_from_proto(&msg, SERVER);
+
+        // Assert
+        assert_eq!(
+            chat.unwrap().text,
+            ":cho.ppy.sh NOTICE * :*** Looking up your hostname"
+        );
+    }
+
+    #[test]
+    fn joins_of_other_users_stay_out_of_the_console() {
+        // Arrange: presence traffic of other users would flood the console
+        // on busy channels.
+        let msg: Message = ":bob!b@c JOIN #osu".parse().unwrap();
+
+        // Act & Assert
+        assert_eq!(ChatMessage::raw_from_proto(&msg, SERVER), None);
+    }
+
+    #[test]
+    fn server_ping_keepalives_stay_out_of_the_console() {
+        // Arrange
+        let msg: Message = "PING :mock".parse().unwrap();
+
+        // Act & Assert
+        assert_eq!(ChatMessage::raw_from_proto(&msg, SERVER), None);
     }
 }

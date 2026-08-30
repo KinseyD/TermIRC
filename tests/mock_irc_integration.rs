@@ -182,16 +182,17 @@ fn forwards_privmsg_as_chat_message() {
         tx,
     );
 
-    // Assert: skipping the status event, the PRIVMSG arrives as a ChatMessage.
+    // Assert: skipping the status event and the console-bound greeting
+    // numerics, the PRIVMSG arrives as a ChatMessage.
     let deadline = std::time::Instant::now() + RECV_TIMEOUT;
     let mut chat = None;
     while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
         match rx.recv_timeout(remaining) {
-            Ok(IrcEvent::Message(message)) => {
+            Ok(IrcEvent::Message(message)) if !message.channel.is_empty() => {
                 chat = Some(message);
                 break;
             }
-            Ok(_) => continue, // Status/Error events before the message
+            Ok(_) => continue, // status events and raw console replies
             Err(_) => break,
         }
     }
@@ -202,6 +203,47 @@ fn forwards_privmsg_as_chat_message() {
             channel: "#test".to_string(),
             nick: "alice".to_string(),
             text: "hello world".to_string(),
+        })
+    );
+}
+
+#[test]
+fn server_replies_land_in_the_console_view() {
+    // Arrange: the mock greets with 001..376 once the client registers.
+    let (port, _lines_rx) = spawn_mock_server();
+    let (tx, rx) = mpsc::channel();
+
+    // Act
+    let _handle = spawn_irc(
+        server_config_for(port),
+        "osu_irc".to_string(),
+        server_config_for(port).channels,
+        tx,
+    );
+
+    // Assert: skipping the status event, the greeting numerics arrive as
+    // console-bound messages (empty channel and nick, verbatim wire text).
+    let deadline = std::time::Instant::now() + RECV_TIMEOUT;
+    let mut welcome = None;
+    while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
+        match rx.recv_timeout(remaining) {
+            Ok(IrcEvent::Message(message)) if message.channel.is_empty() => {
+                if message.text.starts_with(":mock 001") {
+                    welcome = Some(message);
+                    break;
+                }
+            }
+            Ok(_) => continue, // chat for channels, status events
+            Err(_) => break,
+        }
+    }
+    assert_eq!(
+        welcome,
+        Some(ChatMessage {
+            server: "osu_irc".to_string(),
+            channel: String::new(),
+            nick: String::new(),
+            text: ":mock 001 test :Welcome to the Mock IRC Network".to_string(),
         })
     );
 }
