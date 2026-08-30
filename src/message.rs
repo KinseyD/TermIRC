@@ -1,6 +1,6 @@
 //! Chat message model and conversion from IRC protocol messages.
 
-use irc::client::prelude::{Command, Message};
+use irc::client::prelude::{Command, Message, Response};
 
 /// A single chat message to display, extracted from an IRC PRIVMSG.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12,6 +12,28 @@ pub struct ChatMessage {
     pub nick: String,
     pub text: String,
 }
+
+/// Numeric replies with no user-facing meaning, dropped even by the
+/// raw-console path: capability tokens (RPL_ISUPPORT), server population
+/// statistics (LUSERS family), and the member-list flood that follows every
+/// JOIN (RPL_NAMREPLY/ENDOFNAMES — busy channels split it across dozens of
+/// lines). Everything a user asks for — WHOIS, WHO, MOTD, all 4xx errors —
+/// stays visible.
+///
+/// Numerics NOT modeled by irc-proto (e.g. 250) arrive as `Command::Raw`
+/// and are dropped by the catch-all arm below; they need no entry here.
+const IGNORED_NUMERICS: &[Response] = &[
+    Response::RPL_ISUPPORT,
+    Response::RPL_LUSERCLIENT,
+    Response::RPL_LUSEROP,
+    Response::RPL_LUSERUNKNOWN,
+    Response::RPL_LUSERCHANNELS,
+    Response::RPL_LUSERME,
+    Response::RPL_LOCALUSERS,
+    Response::RPL_GLOBALUSERS,
+    Response::RPL_NAMREPLY,
+    Response::RPL_ENDOFNAMES,
+];
 
 impl ChatMessage {
     /// Extract a chat message from a protocol message addressed to any of
@@ -49,6 +71,7 @@ impl ChatMessage {
     /// without ever being a reply to the user.
     pub fn raw_from_proto(msg: &Message, server: &str) -> Option<ChatMessage> {
         match &msg.command {
+            Command::Response(resp, _) if IGNORED_NUMERICS.contains(resp) => None,
             Command::Response(..) | Command::NOTICE(..) => Some(ChatMessage {
                 server: server.to_string(),
                 channel: String::new(),
@@ -304,5 +327,77 @@ mod tests {
 
         // Act & Assert
         assert_eq!(ChatMessage::raw_from_proto(&msg, SERVER), None);
+    }
+
+    #[test]
+    fn names_replies_are_blocked_from_the_console() {
+        // Arrange: 353 floods one line per chunk of members after every
+        // JOIN; 366 closes the list. Neither is a reply to the user.
+        let names: Message = ":mock 353 smoke = #test :smoke alice bob".parse().unwrap();
+        let end: Message = ":mock 366 smoke #test :End of /NAMES list".parse().unwrap();
+
+        // Act & Assert
+        assert_eq!(ChatMessage::raw_from_proto(&names, SERVER), None);
+        assert_eq!(ChatMessage::raw_from_proto(&end, SERVER), None);
+    }
+
+    #[test]
+    fn lusers_statistics_are_blocked_from_the_console() {
+        // Arrange: 251-255 and 265/266 are server population counters. 250
+        // is not modeled by irc-proto, so it arrives as Command::Raw and
+        // must be dropped by that path too.
+        let lines = [
+            ":mock 250 smoke :Highest connection count: 6",
+            ":mock 251 smoke :There are 100 users on 50 servers",
+            ":mock 252 smoke 3 :operator(s) online",
+            ":mock 253 smoke 1 :unknown connection(s)",
+            ":mock 254 smoke 200 :channels formed",
+            ":mock 255 smoke :I have 40 clients and 1 server",
+            ":mock 265 smoke 40 60 :Current local users",
+            ":mock 266 smoke 100 200 :Current global users",
+        ];
+
+        // Act & Assert
+        for line in lines {
+            let msg: Message = line.parse().unwrap();
+            assert_eq!(
+                ChatMessage::raw_from_proto(&msg, SERVER),
+                None,
+                "{line} should be blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn isupport_tokens_are_blocked_from_the_console() {
+        // Arrange: 005 arrives as several lines of capability tokens that
+        // only a client implementation cares about.
+        let msg: Message =
+            ":mock 005 smoke PREFIX=(ov)@+ CHANTYPES=# NICKLEN=30 :are supported by this server"
+                .parse()
+                .unwrap();
+
+        // Act & Assert
+        assert_eq!(ChatMessage::raw_from_proto(&msg, SERVER), None);
+    }
+
+    #[test]
+    fn whois_motd_and_error_replies_stay_visible() {
+        // Arrange: the replies users actually ask for — WHOIS results, the
+        // MOTD, and 4xx errors — must survive the blocklist.
+        let lines = [
+            ":mock 311 smoke alice ~a host * :real name",
+            ":mock 372 smoke :- some motd line",
+            ":mock 401 smoke nobody :No such nick/channel",
+        ];
+
+        // Act & Assert
+        for line in lines {
+            let msg: Message = line.parse().unwrap();
+            assert!(
+                ChatMessage::raw_from_proto(&msg, SERVER).is_some(),
+                "{line} should stay visible"
+            );
+        }
     }
 }

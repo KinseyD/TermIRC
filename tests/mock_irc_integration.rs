@@ -72,9 +72,11 @@ fn spawn_mock_server() -> (u16, mpsc::Receiver<String>) {
                 greeted = true;
             }
             if greeted && !joined && trimmed.starts_with("JOIN") {
+                // A names line right before the chat, mirroring real
+                // servers (and giving the console a flood to resist).
                 write!(
                     writer,
-                    ":alice!a@b PRIVMSG #test :hello world\r\nPING :mock\r\n"
+                    ":mock 353 test = #test :test\r\n:alice!a@b PRIVMSG #test :hello world\r\nPING :mock\r\n"
                 )
                 .unwrap();
                 writer.flush().unwrap();
@@ -245,6 +247,41 @@ fn server_replies_land_in_the_console_view() {
             nick: String::new(),
             text: ":mock 001 test :Welcome to the Mock IRC Network".to_string(),
         })
+    );
+}
+
+#[test]
+fn names_replies_stay_out_of_the_console() {
+    // Arrange: the mock sends a 353 names line immediately before the
+    // channel PRIVMSG after JOIN.
+    let (port, _lines_rx) = spawn_mock_server();
+    let (tx, rx) = mpsc::channel();
+    let _handle = spawn_irc(
+        server_config_for(port),
+        "osu_irc".to_string(),
+        server_config_for(port).channels,
+        tx,
+    );
+
+    // Act: collect every console line until the channel chat arrives.
+    let deadline = std::time::Instant::now() + RECV_TIMEOUT;
+    let mut console = Vec::new();
+    let mut chat = false;
+    while !chat && let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now())
+    {
+        match rx.recv_timeout(remaining) {
+            Ok(IrcEvent::Message(m)) if !m.channel.is_empty() => chat = true,
+            Ok(IrcEvent::Message(m)) => console.push(m.text),
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+
+    // Assert: the chat arrived, and no names line leaked into the console.
+    assert!(chat, "channel chat never arrived");
+    assert!(
+        console.iter().all(|t| !t.contains(" 353 ")),
+        "353 leaked into the console: {console:?}"
     );
 }
 
