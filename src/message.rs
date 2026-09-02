@@ -14,11 +14,13 @@ pub struct ChatMessage {
 }
 
 /// Numeric replies with no user-facing meaning, dropped even by the
-/// raw-console path: capability tokens (RPL_ISUPPORT), server population
+/// console path: capability tokens (RPL_ISUPPORT), server population
 /// statistics (LUSERS family), and the member-list flood that follows every
 /// JOIN (RPL_NAMREPLY/ENDOFNAMES — busy channels split it across dozens of
-/// lines). Everything a user asks for — WHOIS, WHO, MOTD, all 4xx errors —
-/// stays visible.
+/// lines; also caught by `console_from_proto`'s channel rule, kept here as
+/// explicit intent). Everything else a user asks for — WHOIS, WHO, MOTD,
+/// nick/session 4xx errors — stays visible; channel-scoped 4xx (471-475)
+/// are dropped by that channel rule instead.
 ///
 /// Numerics NOT modeled by irc-proto (e.g. 250) arrive as `Command::Raw`
 /// and are dropped by the catch-all arm below; they need no entry here.
@@ -61,25 +63,52 @@ impl ChatMessage {
         })
     }
 
-    /// Extract a raw protocol line for the server console from a message
-    /// that is not channel chat.
+    /// Extract a console payload line for the server console from a
+    /// message that is not channel chat.
     ///
-    /// Server replies — numeric responses (welcome, MOTD, WHOIS results,
-    /// errors) and NOTICEs — render verbatim as nick-less lines in the
-    /// server's console view. Other users' presence traffic (JOIN/PART/…)
-    /// and keepalive PINGs stay dropped: they would flood the console
-    /// without ever being a reply to the user.
-    pub fn raw_from_proto(msg: &Message, server: &str) -> Option<ChatMessage> {
-        match &msg.command {
-            Command::Response(resp, _) if IGNORED_NUMERICS.contains(resp) => None,
-            Command::Response(..) | Command::NOTICE(..) => Some(ChatMessage {
-                server: server.to_string(),
-                channel: String::new(),
-                nick: String::new(),
-                text: msg.to_string().trim_end_matches(['\r', '\n']).to_string(),
-            }),
-            _ => None,
-        }
+    /// The console shows what the server had to say, not the wire
+    /// syntax: prefix, numeric, and our own nick never render. Rules:
+    ///
+    /// - Replies carrying a channel parameter (`#…`/`&…`) — topics,
+    ///   join errors (471-475), channel NOTICEs — are dropped entirely;
+    ///   they are channel business, already visible in the channel
+    ///   view.
+    /// - NOTICEs render their text field; numeric replies render their
+    ///   parameters after the first (our own nick) joined by single
+    ///   spaces — a 311 becomes `alice ~a host * real name`.
+    /// - Replies left with an empty payload are dropped.
+    ///
+    /// Other users' presence traffic (JOIN/PART/…) and keepalive PINGs
+    /// stay dropped: they would flood the console without ever being a
+    /// reply to the user.
+    pub fn console_from_proto(msg: &Message, server: &str) -> Option<ChatMessage> {
+        let text = match &msg.command {
+            Command::Response(resp, _) if IGNORED_NUMERICS.contains(resp) => return None,
+            Command::Response(_, args) => {
+                if args
+                    .iter()
+                    .any(|a| a.starts_with('#') || a.starts_with('&'))
+                    || args.len() <= 1
+                {
+                    return None; // channel-scoped, or nothing past our own nick
+                }
+                args[1..].join(" ")
+            }
+            Command::NOTICE(target, text) => {
+                if target.starts_with('#') || target.starts_with('&') {
+                    return None; // channel NOTICEs are channel business
+                }
+                text.clone()
+            }
+            _ => return None,
+        };
+        let text = text.trim().to_string();
+        (!text.is_empty()).then(|| ChatMessage {
+            server: server.to_string(),
+            channel: String::new(),
+            nick: String::new(),
+            text,
+        })
     }
 }
 
@@ -268,46 +297,105 @@ mod tests {
         assert_eq!(chat.unwrap().text, "hello");
     }
 
-    // ----- raw console lines -----
+    // ----- console replies -----
 
     #[test]
-    fn numeric_replies_become_raw_console_lines() {
+    fn numeric_replies_become_console_payload_lines() {
         // Arrange: the welcome numeric every server sends on connect.
         let msg: Message = ":mock 001 test :Welcome to the Mock IRC Network"
             .parse()
             .unwrap();
 
         // Act
-        let chat = ChatMessage::raw_from_proto(&msg, SERVER);
+        let chat = ChatMessage::console_from_proto(&msg, SERVER);
 
-        // Assert: routed to the console (empty channel and nick), text is
-        // the verbatim wire line without the CRLF.
+        // Assert: routed to the console (empty channel and nick); the
+        // text is the payload only — prefix, numeric, and own nick
+        // stripped.
         assert_eq!(
             chat,
             Some(ChatMessage {
                 server: "osu_irc".to_string(),
                 channel: String::new(),
                 nick: String::new(),
-                text: ":mock 001 test :Welcome to the Mock IRC Network".to_string(),
+                text: "Welcome to the Mock IRC Network".to_string(),
             })
         );
     }
 
     #[test]
-    fn notices_become_raw_console_lines() {
+    fn notices_become_console_payload_lines() {
         // Arrange: server notices (hostname lookups, auth hints).
         let msg: Message = ":cho.ppy.sh NOTICE * :*** Looking up your hostname"
             .parse()
             .unwrap();
 
         // Act
-        let chat = ChatMessage::raw_from_proto(&msg, SERVER);
+        let chat = ChatMessage::console_from_proto(&msg, SERVER);
 
-        // Assert
-        assert_eq!(
-            chat.unwrap().text,
-            ":cho.ppy.sh NOTICE * :*** Looking up your hostname"
-        );
+        // Assert: a NOTICE renders just its text field.
+        assert_eq!(chat.unwrap().text, "*** Looking up your hostname");
+    }
+
+    #[test]
+    fn multi_param_replies_drop_own_nick_and_join_the_rest() {
+        // Arrange: multi-parameter replies keep every parameter after
+        // our own nick, joined by single spaces — WHOIS fields, the
+        // offending nick of a 433.
+        let cases = [
+            (
+                ":mock 311 smoke alice ~a host * :real name",
+                "alice ~a host * real name",
+            ),
+            (
+                ":mock 433 smoke BadNick :Nickname is already in use",
+                "BadNick Nickname is already in use",
+            ),
+        ];
+
+        // Act & Assert
+        for (line, expected) in cases {
+            let msg: Message = line.parse().unwrap();
+            assert_eq!(
+                ChatMessage::console_from_proto(&msg, SERVER).map(|c| c.text),
+                Some(expected.to_string()),
+                "{line} should render as its payload"
+            );
+        }
+    }
+
+    #[test]
+    fn replies_without_a_payload_are_dropped() {
+        // Arrange: a reply whose only parameter is our own nick has
+        // nothing to say — no console line for it.
+        let msg: Message = ":mock 300 smoke".parse().unwrap();
+
+        // Act & Assert
+        assert_eq!(ChatMessage::console_from_proto(&msg, SERVER), None);
+    }
+
+    #[test]
+    fn channel_param_replies_are_blocked_from_the_console() {
+        // Arrange: replies carrying a channel parameter are channel
+        // business — topic (332), join errors (475), channel NOTICEs,
+        // names floods (353, also on the numeric blocklist) — and would
+        // only echo what the channel view already shows.
+        let lines = [
+            ":mock 332 smoke #osu :Welcome to #osu",
+            ":mock 475 smoke #osu :Cannot join channel (+k)",
+            ":mock NOTICE #osu :spam",
+            ":mock 353 smoke = #test :a b",
+        ];
+
+        // Act & Assert
+        for line in lines {
+            let msg: Message = line.parse().unwrap();
+            assert_eq!(
+                ChatMessage::console_from_proto(&msg, SERVER),
+                None,
+                "{line} should be blocked"
+            );
+        }
     }
 
     #[test]
@@ -317,7 +405,7 @@ mod tests {
         let msg: Message = ":bob!b@c JOIN #osu".parse().unwrap();
 
         // Act & Assert
-        assert_eq!(ChatMessage::raw_from_proto(&msg, SERVER), None);
+        assert_eq!(ChatMessage::console_from_proto(&msg, SERVER), None);
     }
 
     #[test]
@@ -326,7 +414,7 @@ mod tests {
         let msg: Message = "PING :mock".parse().unwrap();
 
         // Act & Assert
-        assert_eq!(ChatMessage::raw_from_proto(&msg, SERVER), None);
+        assert_eq!(ChatMessage::console_from_proto(&msg, SERVER), None);
     }
 
     #[test]
@@ -337,8 +425,8 @@ mod tests {
         let end: Message = ":mock 366 smoke #test :End of /NAMES list".parse().unwrap();
 
         // Act & Assert
-        assert_eq!(ChatMessage::raw_from_proto(&names, SERVER), None);
-        assert_eq!(ChatMessage::raw_from_proto(&end, SERVER), None);
+        assert_eq!(ChatMessage::console_from_proto(&names, SERVER), None);
+        assert_eq!(ChatMessage::console_from_proto(&end, SERVER), None);
     }
 
     #[test]
@@ -361,7 +449,7 @@ mod tests {
         for line in lines {
             let msg: Message = line.parse().unwrap();
             assert_eq!(
-                ChatMessage::raw_from_proto(&msg, SERVER),
+                ChatMessage::console_from_proto(&msg, SERVER),
                 None,
                 "{line} should be blocked"
             );
@@ -378,7 +466,7 @@ mod tests {
                 .unwrap();
 
         // Act & Assert
-        assert_eq!(ChatMessage::raw_from_proto(&msg, SERVER), None);
+        assert_eq!(ChatMessage::console_from_proto(&msg, SERVER), None);
     }
 
     #[test]
@@ -395,7 +483,7 @@ mod tests {
         for line in lines {
             let msg: Message = line.parse().unwrap();
             assert!(
-                ChatMessage::raw_from_proto(&msg, SERVER).is_some(),
+                ChatMessage::console_from_proto(&msg, SERVER).is_some(),
                 "{line} should stay visible"
             );
         }

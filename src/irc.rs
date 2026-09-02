@@ -166,12 +166,12 @@ async fn run_client(
                                 let _ = tx.send(IrcEvent::Message(chat));
                             }
                             // Server replies (numerics, NOTICEs) land in
-                            // the server's console as raw lines.
+                            // the server's console as payload-only lines.
                             None => {
-                                if let Some(raw) =
-                                    ChatMessage::raw_from_proto(&message, server_label)
+                                if let Some(line) =
+                                    ChatMessage::console_from_proto(&message, server_label)
                                 {
-                                    let _ = tx.send(IrcEvent::Message(raw));
+                                    let _ = tx.send(IrcEvent::Message(line));
                                 }
                             }
                         }

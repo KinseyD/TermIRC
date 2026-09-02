@@ -72,11 +72,12 @@ fn spawn_mock_server() -> (u16, mpsc::Receiver<String>) {
                 greeted = true;
             }
             if greeted && !joined && trimmed.starts_with("JOIN") {
-                // A names line right before the chat, mirroring real
-                // servers (and giving the console a flood to resist).
+                // A names line and a topic line right before the chat,
+                // mirroring real servers (giving the console both a
+                // flood and a channel-scoped reply to resist).
                 write!(
                     writer,
-                    ":mock 353 test = #test :test\r\n:alice!a@b PRIVMSG #test :hello world\r\nPING :mock\r\n"
+                    ":mock 353 test = #test :test\r\n:mock 332 test #test :Welcome to #test\r\n:alice!a@b PRIVMSG #test :hello world\r\nPING :mock\r\n"
                 )
                 .unwrap();
                 writer.flush().unwrap();
@@ -223,14 +224,15 @@ fn server_replies_land_in_the_console_view() {
         tx,
     );
 
-    // Assert: skipping the status event, the greeting numerics arrive as
-    // console-bound messages (empty channel and nick, verbatim wire text).
+    // Assert: skipping the status event, the greeting numerics arrive
+    // as console-bound messages (empty channel and nick) whose text is
+    // the payload only — prefix, numeric, and own nick stripped.
     let deadline = std::time::Instant::now() + RECV_TIMEOUT;
     let mut welcome = None;
     while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
         match rx.recv_timeout(remaining) {
             Ok(IrcEvent::Message(message)) if message.channel.is_empty() => {
-                if message.text.starts_with(":mock 001") {
+                if message.text.starts_with("Welcome to the Mock") {
                     welcome = Some(message);
                     break;
                 }
@@ -245,15 +247,16 @@ fn server_replies_land_in_the_console_view() {
             server: "osu_irc".to_string(),
             channel: String::new(),
             nick: String::new(),
-            text: ":mock 001 test :Welcome to the Mock IRC Network".to_string(),
+            text: "Welcome to the Mock IRC Network".to_string(),
         })
     );
 }
 
 #[test]
-fn names_replies_stay_out_of_the_console() {
-    // Arrange: the mock sends a 353 names line immediately before the
-    // channel PRIVMSG after JOIN.
+fn channel_param_replies_stay_out_of_the_console() {
+    // Arrange: the mock sends a 353 names line and a 332 topic
+    // line — both carrying a channel parameter — immediately
+    // before the channel PRIVMSG after JOIN.
     let (port, _lines_rx) = spawn_mock_server();
     let (tx, rx) = mpsc::channel();
     let _handle = spawn_irc(
@@ -277,11 +280,21 @@ fn names_replies_stay_out_of_the_console() {
         }
     }
 
-    // Assert: the chat arrived, and no names line leaked into the console.
+    // Assert: the chat arrived, and no channel-scoped reply leaked
+    // into the console — no names line, no topic payload, no
+    // channel name at all.
     assert!(chat, "channel chat never arrived");
     assert!(
         console.iter().all(|t| !t.contains(" 353 ")),
         "353 leaked into the console: {console:?}"
+    );
+    assert!(
+        console.iter().all(|t| !t.contains("Welcome to #test")),
+        "332 payload leaked into the console: {console:?}"
+    );
+    assert!(
+        console.iter().all(|t| !t.contains("#test")),
+        "channel name leaked into the console: {console:?}"
     );
 }
 
