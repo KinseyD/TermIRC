@@ -10,7 +10,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use futures_util::StreamExt;
-use irc::client::prelude::{Client, Config as IrcClientConfig};
+use irc::client::prelude::{Client, Command, Config as IrcClientConfig};
 
 use crate::config::ServerConfig;
 use crate::message::ChatMessage;
@@ -20,21 +20,30 @@ use crate::message::ChatMessage;
 pub enum IrcEvent {
     /// A chat message received from one of the joined channels.
     Message(ChatMessage),
-    /// Informational status (e.g. "osu_irc: connected to irc.ppy.sh").
-    Status(String),
-    /// A connection or protocol error; the thread stops afterwards.
-    Error(String),
+    /// Informational status for `server` (the config key), e.g. "connected
+    /// to irc.ppy.sh".
+    Status(String, String),
+    /// A connection or protocol error for `server` (the config key); the
+    /// thread stops afterwards.
+    Error(String, String),
 }
 
 /// A message the user wants to send through one of our connections.
 ///
-/// `server` is the config key used by the UI to pick the right connection;
-/// the IRC thread sends `text` to `target` over its own server.
+/// `server` is the config key used by the UI to pick the right connection.
+/// `Privmsg` sends `text` to `target` (a channel); `Raw` sends `line` to the
+/// server itself as a raw IRC command (e.g. `JOIN #foo`, `WHOIS nick`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OutgoingMessage {
-    pub server: String,
-    pub target: String,
-    pub text: String,
+pub enum OutgoingMessage {
+    Privmsg {
+        server: String,
+        target: String,
+        text: String,
+    },
+    Raw {
+        server: String,
+        line: String,
+    },
 }
 
 /// How many messages may wait in flight to a connection before `try_send`
@@ -83,9 +92,10 @@ pub fn spawn_irc(
             Ok(runtime) => runtime,
             Err(e) => {
                 tracing::error!("{server_label}: runtime init failed: {e}");
-                let _ = tx.send(IrcEvent::Error(format!(
-                    "{server_label}: runtime init failed: {e}"
-                )));
+                let _ = tx.send(IrcEvent::Error(
+                    server_label.clone(),
+                    format!("runtime init failed: {e}"),
+                ));
                 return;
             }
         };
@@ -98,13 +108,14 @@ pub fn spawn_irc(
         match result {
             Ok(()) => {
                 tracing::info!("{label}: disconnected from {host} (connection closed)");
-                let _ = tx.send(IrcEvent::Status(format!(
-                    "{label}: disconnected from {host} (connection closed)"
-                )));
+                let _ = tx.send(IrcEvent::Status(
+                    label.clone(),
+                    format!("disconnected from {host} (connection closed)"),
+                ));
             }
             Err(e) => {
                 tracing::error!("{label}: {e}");
-                let _ = tx.send(IrcEvent::Error(format!("{label}: {e}")));
+                let _ = tx.send(IrcEvent::Error(label.clone(), format!("{e}")));
             }
         }
     });
@@ -121,10 +132,10 @@ async fn run_client(
     let mut client = Client::from_config(build_client_config(&server, channels)).await?;
     client.identify()?;
     let mut stream = client.stream()?;
-    let _ = tx.send(IrcEvent::Status(format!(
-        "{server_label}: connected to {}",
-        server.server
-    )));
+    let _ = tx.send(IrcEvent::Status(
+        server_label.to_string(),
+        format!("connected to {}", server.server),
+    ));
     tracing::info!("{server_label}: connected to {}", server.server);
 
     loop {
@@ -133,16 +144,36 @@ async fn run_client(
                 match outgoing {
                     // The UI is shutting down (all senders dropped): stop.
                     None => return Ok(()),
-                    Some(message) => client.send_privmsg(&message.target, &message.text)?,
+                    Some(message) => match message {
+                        OutgoingMessage::Privmsg { target, text, .. } => {
+                            client.send_privmsg(&target, &text)?
+                        }
+                        OutgoingMessage::Raw { line, .. } => {
+                            let mut parts = line.split_whitespace();
+                            let cmd = parts.next().unwrap_or_default().to_string();
+                            let args: Vec<String> =
+                                parts.map(str::to_string).collect();
+                            client.send(Command::Raw(cmd, args))?;
+                        }
+                    },
                 }
             }
             item = stream.next() => {
                 match item {
                     Some(Ok(message)) => {
-                        if let Some(chat) =
-                            ChatMessage::from_proto(&message, server_label, channels)
-                        {
-                            let _ = tx.send(IrcEvent::Message(chat));
+                        match ChatMessage::from_proto(&message, server_label, channels) {
+                            Some(chat) => {
+                                let _ = tx.send(IrcEvent::Message(chat));
+                            }
+                            // Server replies (numerics, NOTICEs) land in
+                            // the server's console as payload-only lines.
+                            None => {
+                                if let Some(line) =
+                                    ChatMessage::console_from_proto(&message, server_label)
+                                {
+                                    let _ = tx.send(IrcEvent::Message(line));
+                                }
+                            }
                         }
                     }
                     Some(Err(e)) => return Err(e.into()),

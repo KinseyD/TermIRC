@@ -169,10 +169,11 @@ fn render_separator(frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(Text::from(lines)), col);
 }
 
-/// Render the server/channel sidebar from the app's row model: a fold marker
-/// per server, its channels beneath, the active channel row with a brighter
-/// background, and (while the sidebar has focus) a cursor row with a slightly
-/// brighter background plus a block cursor at its start.
+/// Render the server/channel sidebar from the app's row model: a bold
+/// server header per server with its channels beneath, the active row (the
+/// viewed channel, or the server header while its console is viewed) with
+/// a brighter background, and (while the sidebar has focus) a cursor row
+/// with a slightly brighter background plus a block cursor at its start.
 fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
     let inner = inset(area, 1);
     let focused = app.focus() == Focus::Sidebar;
@@ -187,7 +188,12 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
         }
         let is_cursor = focused && cursor == Some(i);
         let is_active = active.is_some_and(|(srv, ch)| {
-            row.server.eq_ignore_ascii_case(srv) && row.channel.as_deref() == Some(ch)
+            if ch.is_empty() {
+                // A console view highlights its server's header row.
+                row.server.eq_ignore_ascii_case(srv) && row.channel.is_none()
+            } else {
+                row.server.eq_ignore_ascii_case(srv) && row.channel.as_deref() == Some(ch)
+            }
         });
 
         let is_hovered = !is_active && !is_cursor && app.sidebar_hovered() == Some(i);
@@ -213,11 +219,6 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
         let line = match &row.channel {
             None => Line::from(vec![
                 Span::raw(" "),
-                Span::raw(if app.server_collapsed(&row.server) {
-                    "▸ "
-                } else {
-                    "▾ "
-                }),
                 Span::styled(
                     row.server.as_str(),
                     Style::new().add_modifier(Modifier::BOLD),
@@ -893,9 +894,11 @@ mod tests {
         // Act
         let buffer = render_sized(&app, "", 50, 10);
 
-        // Assert: server (with expand marker) and both channels in the sidebar.
+        // Assert: server row (no fold marker) and both channels in the
+        // sidebar.
         assert!(buffer_line(&buffer, 0).contains("osu_irc"));
-        assert!(buffer_line(&buffer, 0).contains("▾"));
+        assert!(!buffer_line(&buffer, 0).contains("▸"));
+        assert!(!buffer_line(&buffer, 0).contains("▾"));
         assert!(buffer_line(&buffer, 1).contains("#osu"));
         assert!(buffer_line(&buffer, 2).contains("#chinese"));
     }
@@ -941,19 +944,55 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_collapsed_server_shows_fold_marker() {
-        // Arrange: collapse the server, then check the marker and hidden rows.
-        let mut app = test_app(22, 3);
-        app.tab(); // Composer -> Sidebar (cursor onto #osu, row 1)
-        app.sidebar_up(); // walk to the server header row
-        app.sidebar_enter(); // collapse osu_irc
+    fn server_console_view_renders_echo_and_status_with_composer() {
+        // Arrange: the osu_irc console viewed, holding one echoed raw
+        // command (with nick) and one status line (empty nick).
+        let mut app = App::new(22, 6);
+        app.open_server("osu_irc");
+        app.open_channel("osu_irc", "#osu");
+        app.select_channel(0); // the console
+        app.push_message(ChatMessage {
+            server: "osu_irc".to_string(),
+            channel: String::new(),
+            nick: "test".to_string(),
+            text: "WHOIS nick".to_string(),
+        });
+        app.push_message(ChatMessage {
+            server: "osu_irc".to_string(),
+            channel: String::new(),
+            nick: String::new(),
+            text: "connected".to_string(),
+        });
+
+        // Act: 50x20 terminal -> composer rows 15..=17 (accent at row 15).
+        let buffer = render_sized(&app, "", 50, 20);
+
+        // Assert: the echo line carries the nick column; the status line
+        // starts at the main column with no nick column.
+        assert!(buffer_line(&buffer, 1).contains("test: WHOIS nick"));
+        assert_eq!(buffer.cell((MAIN_COL_X, 3)).unwrap().symbol(), "c");
+        assert!(buffer_line(&buffer, 3).contains("connected"));
+        // The composer is rendered in the console view, like in a channel.
+        assert_eq!(buffer.cell((INPUT_X, 15)).unwrap().symbol(), "┃");
+    }
+
+    #[test]
+    fn active_server_row_is_highlighted_when_console_viewed() {
+        // Arrange: the osu_irc console viewed; focus off the sidebar.
+        let mut app = App::new(22, 3);
+        app.open_server("osu_irc");
+        app.open_channel("osu_irc", "#osu");
+        app.select_channel(0); // the console
+        app.focus_composer();
 
         // Act
         let buffer = render_sized(&app, "", 50, 10);
 
-        // Assert: ▸ marker on the server row; channel rows hidden.
-        assert!(buffer_line(&buffer, 0).contains("▸"));
-        assert!(!buffer_line(&buffer, 1).contains("#osu"));
+        // Assert: the server row (row 0) gets the active background, the
+        // channel row (row 1) does not. Column 10 is inside the sidebar's
+        // inner area.
+        assert_eq!(buffer.cell((10, 0)).unwrap().bg, SIDEBAR_ACTIVE_BG);
+        assert_ne!(buffer.cell((10, 1)).unwrap().bg, SIDEBAR_ACTIVE_BG);
     }
 
     #[test]

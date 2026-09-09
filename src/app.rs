@@ -24,9 +24,11 @@ pub const MAX_LINES: usize = 50_000;
 /// Maximum input buffer length, in chars.
 pub const MAX_INPUT: usize = 512;
 
-/// One channel's history plus its scroll state.
+/// One view's history plus its scroll state: a channel, or a server console
+/// (identified by an empty `channel`).
 struct ChannelState {
     server: String,
+    /// Channel name; empty for a server console view.
     channel: String,
     messages: Vec<ChatMessage>,
     lines: Vec<LayoutLine>,
@@ -78,8 +80,9 @@ pub struct SidebarRow {
 }
 
 pub struct App {
-    /// Registered channels in sidebar order; `active` indexes the viewed one
-    /// (`None` = no channel open yet: the message pane shows a welcome page).
+    /// Registered views in sidebar order (per server: its console plus its
+    /// channels); `active` indexes the viewed one (`None` = no view open
+    /// yet: the message pane shows a welcome page).
     channels: Vec<ChannelState>,
     active: Option<usize>,
     focus: Focus,
@@ -87,8 +90,6 @@ pub struct App {
     sidebar_cursor: Option<usize>,
     /// Hovered sidebar row (visible-row index), pointer-driven.
     sidebar_hovered: Option<usize>,
-    /// Lower-cased names of servers whose channel lists are collapsed.
-    collapsed: std::collections::BTreeSet<String>,
     width: u16,
     viewport_height: u16,
     running: bool,
@@ -112,7 +113,6 @@ impl App {
             focus: Focus::Sidebar,
             sidebar_cursor: Some(0),
             sidebar_hovered: None,
-            collapsed: std::collections::BTreeSet::new(),
             width,
             viewport_height,
             running: true,
@@ -135,13 +135,24 @@ impl App {
         }
     }
 
+    /// Register a server's console view (idempotent, matched
+    /// case-insensitively): where raw console lines echo and connection
+    /// status lands. Like `open_channel`, registering does not view it.
+    pub fn open_server(&mut self, server: &str) {
+        if self.find_channel(server, "").is_none() {
+            self.channels
+                .push(ChannelState::new(server.to_string(), String::new()));
+        }
+    }
+
     /// Number of registered channels.
     pub fn channel_count(&self) -> usize {
         self.channels.len()
     }
 
     /// The `(server, channel)` currently being viewed, or `None` while the
-    /// welcome page is shown (no channel opened yet).
+    /// welcome page is shown (no channel opened yet). A server console view
+    /// reports an empty channel (`("srv", "")`).
     pub fn active_channel(&self) -> Option<(&str, &str)> {
         self.active
             .and_then(|i| self.channels.get(i))
@@ -370,8 +381,9 @@ impl App {
     }
 
     /// Submit the composer: take the typed text as a message to the viewed
-    /// channel and clear the input. Whitespace-only input sends nothing (but
-    /// is still cleared); with no channel open the input is kept.
+    /// channel and clear the input. In a server console view the line goes
+    /// out as a raw IRC command instead. Whitespace-only input sends
+    /// nothing (but is still cleared); with no view open the input is kept.
     pub fn submit_input(&mut self) -> Option<OutgoingMessage> {
         let (server, target) = self.active_channel()?;
         let text = self.input.trim().to_string();
@@ -384,11 +396,15 @@ impl App {
         }
         self.input.clear();
         self.input_cursor = 0;
-        Some(OutgoingMessage {
-            server,
-            target,
-            text,
-        })
+        if target.is_empty() {
+            Some(OutgoingMessage::Raw { server, line: text })
+        } else {
+            Some(OutgoingMessage::Privmsg {
+                server,
+                target,
+                text,
+            })
+        }
     }
 
     /// Put text back into the composer (with the cursor at its end), e.g.
@@ -613,7 +629,7 @@ impl App {
     }
 
     /// Click on a sidebar row: a channel row opens the channel (focus to
-    /// the composer); a server row toggles collapse. Unlike
+    /// the composer); a server row opens its console view. Unlike
     /// `sidebar_enter` this does not require sidebar focus.
     pub fn click_sidebar_row(&mut self, row: usize) {
         let Some(srow) = self.sidebar_rows().into_iter().nth(row) else {
@@ -621,7 +637,7 @@ impl App {
         };
         match srow.channel {
             Some(channel) => self.open_channel_and_focus(&srow.server, &channel),
-            None => self.toggle_server_collapse(&srow.server),
+            None => self.open_server_and_focus(&srow.server),
         }
     }
 
@@ -666,33 +682,24 @@ impl App {
 
     /// One visible row of the sidebar (a server header, or one of its channels).
     pub fn sidebar_rows(&self) -> Vec<SidebarRow> {
-        // Servers in first-appearance order, each followed by its channels
-        // unless collapsed.
-        let mut servers: Vec<&str> = Vec::new();
-        for state in &self.channels {
-            if !servers
-                .iter()
-                .any(|s| s.eq_ignore_ascii_case(&state.server))
-            {
-                servers.push(&state.server);
-            }
-        }
+        // One pass over the views in registration order: the first
+        // appearance of a server (its console or a channel) emits the
+        // server's header row; every channel view emits a channel row.
+        let mut seen: Vec<&str> = Vec::new();
         let mut rows = Vec::new();
-        for server in servers {
-            rows.push(SidebarRow {
-                server: server.to_string(),
-                channel: None,
-            });
-            if self.server_collapsed(server) {
-                continue;
+        for state in &self.channels {
+            if !seen.iter().any(|s| s.eq_ignore_ascii_case(&state.server)) {
+                seen.push(&state.server);
+                rows.push(SidebarRow {
+                    server: state.server.clone(),
+                    channel: None,
+                });
             }
-            for state in &self.channels {
-                if state.server.eq_ignore_ascii_case(server) {
-                    rows.push(SidebarRow {
-                        server: server.to_string(),
-                        channel: Some(state.channel.clone()),
-                    });
-                }
+            if !state.channel.is_empty() {
+                rows.push(SidebarRow {
+                    server: state.server.clone(),
+                    channel: Some(state.channel.clone()),
+                });
             }
         }
         rows
@@ -713,14 +720,9 @@ impl App {
         self.move_sidebar_cursor(|c, _| c.saturating_sub(1));
     }
 
-    /// Whether a server's channel list is collapsed.
-    pub fn server_collapsed(&self, server: &str) -> bool {
-        self.collapsed.contains(&server.to_lowercase())
-    }
-
     /// Interact with the row under the sidebar cursor: on a server row,
-    /// collapse/expand its channel list; on a channel row, switch the message
-    /// pane to it and return focus to the composer.
+    /// open its console view; on a channel row, switch the message pane to
+    /// it. Both hand focus back to the composer.
     pub fn sidebar_enter(&mut self) {
         if self.focus != Focus::Sidebar {
             return;
@@ -733,7 +735,7 @@ impl App {
             return;
         };
         match &row.channel {
-            None => self.toggle_server_collapse(&row.server),
+            None => self.open_server_and_focus(&row.server),
             Some(channel) => self.open_channel_and_focus(&row.server, channel),
         }
     }
@@ -748,20 +750,20 @@ impl App {
         }
     }
 
-    fn toggle_server_collapse(&mut self, server: &str) {
-        let key = server.to_lowercase();
-        if self.collapsed.remove(&key) {
-            return;
-        }
-        self.collapsed.insert(key);
-        // Collapse shortens the row list; keep the cursor within bounds.
-        let len = self.sidebar_rows().len().max(1);
-        if let Some(cursor) = self.sidebar_cursor {
-            self.sidebar_cursor = Some(cursor.min(len - 1));
+    /// Open a server's console view (registering it if needed) and hand
+    /// focus to the composer (shared by sidebar Enter and mouse clicks).
+    fn open_server_and_focus(&mut self, server: &str) {
+        self.open_server(server);
+        if let Some(idx) = self.find_channel(server, "") {
+            self.select_channel(idx);
+            self.focus = Focus::Composer;
+            self.sidebar_cursor = None;
         }
     }
 
-    /// The sidebar row index of the viewed channel (0 when none is open).
+    /// The sidebar row index of the viewed view (0 when none is open): the
+    /// server's header row while its console is viewed, the channel row
+    /// for a channel.
     fn active_sidebar_row(&self) -> usize {
         let Some(active) = self.active else {
             return 0;
@@ -771,7 +773,11 @@ impl App {
             .iter()
             .position(|row| {
                 row.server.eq_ignore_ascii_case(&target.server)
-                    && row.channel.as_deref() == Some(target.channel.as_str())
+                    && if target.channel.is_empty() {
+                        row.channel.is_none()
+                    } else {
+                        row.channel.as_deref() == Some(target.channel.as_str())
+                    }
             })
             .unwrap_or(0)
     }
@@ -1179,10 +1185,35 @@ mod tests {
         // is reset.
         assert_eq!(
             outgoing,
-            Some(OutgoingMessage {
+            Some(OutgoingMessage::Privmsg {
                 server: "srv".to_string(),
                 target: "#a".to_string(),
                 text: "hi".to_string(),
+            })
+        );
+        assert_eq!(app.input(), "");
+        assert_eq!(app.input_cursor(), 0);
+    }
+    #[test]
+    fn submit_input_in_console_returns_a_raw_send() {
+        // Arrange: the server console is the viewed "channel" with a raw
+        // command typed into the composer.
+        let mut app = App::new(40, 10);
+        app.open_server("srv");
+        app.select_channel(0);
+        for c in "WHOIS nick".chars() {
+            app.type_char(c);
+        }
+
+        // Act
+        let outgoing = app.submit_input();
+
+        // Assert: the line goes out raw (no target), composer reset.
+        assert_eq!(
+            outgoing,
+            Some(OutgoingMessage::Raw {
+                server: "srv".to_string(),
+                line: "WHOIS nick".to_string(),
             })
         );
         assert_eq!(app.input(), "");
@@ -1233,7 +1264,10 @@ mod tests {
         assert_eq!(app.input(), "");
 
         // Act: the UI puts the text back after a failed send.
-        app.restore_input(outgoing.text);
+        let OutgoingMessage::Privmsg { text, .. } = outgoing else {
+            panic!("channel submit must produce a Privmsg");
+        };
+        app.restore_input(text);
 
         // Assert
         assert_eq!(app.input(), "hi");
@@ -1249,6 +1283,58 @@ mod tests {
             nick: "u".to_string(),
             text: text.to_string(),
         }
+    }
+
+    #[test]
+    fn push_routes_status_to_the_server_console_ignoring_case() {
+        // Arrange: a registered console plus one channel, viewing the console
+        // (status lines arrive with an empty channel and nick).
+        let mut app = App::new(40, 10);
+        app.open_server("srv");
+        app.open_channel("srv", "#a");
+        app.select_channel(0);
+
+        // Act
+        app.push_message(ChatMessage {
+            server: "SRV".to_string(),
+            channel: String::new(),
+            nick: String::new(),
+            text: "connected to host".to_string(),
+        });
+
+        // Assert: the status landed in the console view, not in #a.
+        assert_eq!(app.messages().len(), 1);
+        app.select_channel(1);
+        assert_eq!(app.messages().len(), 0);
+    }
+
+    #[test]
+    fn pushed_status_lands_in_that_servers_console_and_is_dropped_without_one() {
+        // Arrange: one server has a console view registered; another does
+        // not (only possible in hand-built apps — real startup always
+        // registers one).
+        let mut app = App::new(40, 10);
+        app.open_server("s1");
+
+        // Act
+        app.push_message(ChatMessage {
+            server: "s1".to_string(),
+            channel: String::new(),
+            nick: String::new(),
+            text: "connected to a".to_string(),
+        });
+        app.push_message(ChatMessage {
+            server: "s2".to_string(),
+            channel: String::new(),
+            nick: String::new(),
+            text: "connected to b".to_string(),
+        });
+
+        // Assert: s1's console holds its status; s2's status is dropped
+        // without opening a view for it.
+        app.select_channel(0);
+        assert_eq!(app.messages().len(), 1);
+        assert_eq!(app.channel_count(), 1);
     }
 
     #[test]
@@ -1468,58 +1554,54 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_enter_on_server_row_toggles_collapse() {
-        // Arrange: rows = [srv, #a, #b]
+    fn sidebar_enter_on_server_row_opens_the_console_and_focuses_the_composer() {
+        // Arrange: rows = [srv, #a, #b]; cursor on the server row (row 0).
         let mut app = App::new(40, 10);
         app.open_channel("srv", "#a");
         app.open_channel("srv", "#b");
 
-        // Act: collapse, then expand (focus starts on the sidebar).
+        // Act
         app.sidebar_enter();
-        assert!(app.server_collapsed("srv"));
-        assert_eq!(app.sidebar_rows().len(), 1); // only the server row remains
-        app.sidebar_enter();
-        assert!(!app.server_collapsed("srv"));
-        assert_eq!(app.sidebar_rows().len(), 3);
+
+        // Assert: the console view (empty channel) opens with focus handed
+        // to the composer, like a channel row does.
+        assert_eq!(app.active_channel(), Some(("srv", "")));
+        assert_eq!(app.focus(), Focus::Composer);
+        assert_eq!(app.sidebar_cursor(), None);
     }
 
     #[test]
-    fn collapsing_keeps_cursor_on_the_server_row() {
-        // Arrange: cursor on the server header row (row 0).
+    fn open_server_is_idempotent_ignoring_case() {
+        // Arrange
         let mut app = App::new(40, 10);
-        app.open_channel("srv", "#a");
-        app.open_channel("srv", "#b");
-        assert_eq!(app.sidebar_cursor(), Some(0));
 
-        // Act: collapse via Enter on the server row.
-        app.sidebar_enter();
+        // Act: register the same server twice with different case.
+        app.open_server("srv");
+        app.open_server("SRV");
 
-        // Assert: the cursor stays on the (now only) server row and is valid.
-        assert_eq!(app.sidebar_rows().len(), 1);
-        assert_eq!(app.sidebar_cursor(), Some(0));
+        // Assert: exactly one console view, and registration alone does not
+        // view it.
+        assert_eq!(app.channel_count(), 1);
+        assert_eq!(app.active_channel(), None);
     }
 
     #[test]
-    fn collapse_moves_a_cursor_stranded_past_the_end() {
-        // Arrange: two servers [s1, #a, s2, #b]; cursor on #b (row 3), then
-        // walk it back to s1's header (row 0) before collapsing s1.
+    fn tab_into_sidebar_snaps_to_the_server_row_when_console_view_is_active() {
+        // Arrange: rows = [s1, #a, s2] with s2's console (row 2) viewed; the
+        // composer holds focus.
         let mut app = App::new(40, 10);
+        app.open_server("s1");
         app.open_channel("s1", "#a");
-        app.open_channel("s2", "#b");
-        app.sidebar_down();
-        app.sidebar_down();
-        app.sidebar_down();
-        assert_eq!(app.sidebar_cursor(), Some(3)); // on #b
+        app.open_server("s2");
+        app.select_channel(2);
+        app.focus_composer();
 
-        // Act: collapse s1 (cursor walked to its header at row 0).
-        app.sidebar_up();
-        app.sidebar_up();
-        app.sidebar_up();
-        app.sidebar_enter();
+        // Act: Composer -> Sidebar.
+        app.tab();
 
-        // Assert: rows shrink to [s1, s2, #b]; the cursor is valid and clamped.
-        assert_eq!(app.sidebar_rows().len(), 3);
-        assert_eq!(app.sidebar_cursor(), Some(0));
+        // Assert: the cursor snaps onto s2's server row (the console's row),
+        // not onto row 0.
+        assert_eq!(app.sidebar_cursor(), Some(2));
     }
 
     #[test]
@@ -1853,17 +1935,19 @@ mod tests {
     }
 
     #[test]
-    fn click_sidebar_server_row_toggles_collapse() {
-        // Arrange
+    fn click_sidebar_server_row_opens_the_console() {
+        // Arrange: rows = [srv, #a]; the sidebar is NOT focused.
         let mut app = App::new(40, 10);
         app.open_channel("srv", "#a");
-        assert!(!app.server_collapsed("srv"));
 
-        // Act / Assert: works without sidebar focus.
+        // Act
         app.click_sidebar_row(0);
-        assert!(app.server_collapsed("srv"));
-        app.click_sidebar_row(0);
-        assert!(!app.server_collapsed("srv"));
+
+        // Assert: works without sidebar focus; the console opens with the
+        // composer focused, like a channel row.
+        assert_eq!(app.active_channel(), Some(("srv", "")));
+        assert_eq!(app.focus(), Focus::Composer);
+        assert_eq!(app.sidebar_cursor(), None);
     }
 
     #[test]

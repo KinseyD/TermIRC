@@ -21,9 +21,10 @@ use crate::message::ChatMessage;
 pub struct LayoutLine {
     /// Number of leading spaces before the body on continuation lines.
     pub indent: u16,
-    /// `Some(nick)` only on the first line of a message.
+    /// `Some(nick)` only on the first line of a message; `None` on
+    /// continuation lines and on nick-less messages (status lines), which
+    /// have no nick column at all.
     pub nick: Option<String>,
-    /// The body text for this row (already width-wrapped).
     pub body: String,
 }
 
@@ -98,7 +99,11 @@ pub fn message_spans(messages: &[ChatMessage], width: u16) -> Vec<(u16, u16)> {
         if i > 0 {
             row += 1; // blank separator row before this message
         }
-        let indent = nick_column_width(&message.nick).min(width.saturating_sub(1));
+        let indent = if message.nick.is_empty() {
+            0
+        } else {
+            nick_column_width(&message.nick).min(width.saturating_sub(1))
+        };
         let body_width = width.saturating_sub(indent).max(1);
         let height = wrap_body(&message.text, body_width).len() as u16;
         spans.push((row, height));
@@ -126,13 +131,17 @@ pub fn layout_messages(messages: &[ChatMessage], width: u16) -> Vec<LayoutLine> 
         if i > 0 {
             lines.push(separator());
         }
-        let indent = nick_column_width(&message.nick).min(width.saturating_sub(1));
+        let indent = if message.nick.is_empty() {
+            0
+        } else {
+            nick_column_width(&message.nick).min(width.saturating_sub(1))
+        };
         let body_width = width.saturating_sub(indent).max(1);
         for (j, chunk) in wrap_body(&message.text, body_width).into_iter().enumerate() {
             if j == 0 {
                 lines.push(LayoutLine {
                     indent: 0,
-                    nick: Some(message.nick.clone()),
+                    nick: (!message.nick.is_empty()).then(|| message.nick.clone()),
                     body: chunk,
                 });
             } else {
@@ -205,6 +214,29 @@ mod tests {
                 }
             );
         }
+    }
+    #[test]
+    fn empty_nick_renders_without_nick_column() {
+        // Arrange: a status-style line (empty nick) whose 19-column body
+        // fits one full-width row but would wrap under a 2-column indent.
+        let messages = vec![msg("", &"a".repeat(19))];
+
+        // Act
+        let lines = layout_messages(&messages, 20);
+        let spans = message_spans(&messages, 20);
+
+        // Assert: one body row with no nick column and no indent, using the
+        // full width (a 2-column nick indent would have hard-split it).
+        assert_eq!(lines.len(), 3); // framing blank + body + framing blank
+        assert_eq!(
+            lines[1],
+            LayoutLine {
+                indent: 0,
+                nick: None,
+                body: "a".repeat(19),
+            }
+        );
+        assert_eq!(spans, vec![(1, 1)]);
     }
 
     #[test]

@@ -72,9 +72,12 @@ fn spawn_mock_server() -> (u16, mpsc::Receiver<String>) {
                 greeted = true;
             }
             if greeted && !joined && trimmed.starts_with("JOIN") {
+                // A names line and a topic line right before the chat,
+                // mirroring real servers (giving the console both a
+                // flood and a channel-scoped reply to resist).
                 write!(
                     writer,
-                    ":alice!a@b PRIVMSG #test :hello world\r\nPING :mock\r\n"
+                    ":mock 353 test = #test :test\r\n:mock 332 test #test :Welcome to #test\r\n:alice!a@b PRIVMSG #test :hello world\r\nPING :mock\r\n"
                 )
                 .unwrap();
                 writer.flush().unwrap();
@@ -182,16 +185,17 @@ fn forwards_privmsg_as_chat_message() {
         tx,
     );
 
-    // Assert: skipping the status event, the PRIVMSG arrives as a ChatMessage.
+    // Assert: skipping the status event and the console-bound greeting
+    // numerics, the PRIVMSG arrives as a ChatMessage.
     let deadline = std::time::Instant::now() + RECV_TIMEOUT;
     let mut chat = None;
     while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
         match rx.recv_timeout(remaining) {
-            Ok(IrcEvent::Message(message)) => {
+            Ok(IrcEvent::Message(message)) if !message.channel.is_empty() => {
                 chat = Some(message);
                 break;
             }
-            Ok(_) => continue, // Status/Error events before the message
+            Ok(_) => continue, // status events and raw console replies
             Err(_) => break,
         }
     }
@@ -203,6 +207,94 @@ fn forwards_privmsg_as_chat_message() {
             nick: "alice".to_string(),
             text: "hello world".to_string(),
         })
+    );
+}
+
+#[test]
+fn server_replies_land_in_the_console_view() {
+    // Arrange: the mock greets with 001..376 once the client registers.
+    let (port, _lines_rx) = spawn_mock_server();
+    let (tx, rx) = mpsc::channel();
+
+    // Act
+    let _handle = spawn_irc(
+        server_config_for(port),
+        "osu_irc".to_string(),
+        server_config_for(port).channels,
+        tx,
+    );
+
+    // Assert: skipping the status event, the greeting numerics arrive
+    // as console-bound messages (empty channel and nick) whose text is
+    // the payload only — prefix, numeric, and own nick stripped.
+    let deadline = std::time::Instant::now() + RECV_TIMEOUT;
+    let mut welcome = None;
+    while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
+        match rx.recv_timeout(remaining) {
+            Ok(IrcEvent::Message(message)) if message.channel.is_empty() => {
+                if message.text.starts_with("Welcome to the Mock") {
+                    welcome = Some(message);
+                    break;
+                }
+            }
+            Ok(_) => continue, // chat for channels, status events
+            Err(_) => break,
+        }
+    }
+    assert_eq!(
+        welcome,
+        Some(ChatMessage {
+            server: "osu_irc".to_string(),
+            channel: String::new(),
+            nick: String::new(),
+            text: "Welcome to the Mock IRC Network".to_string(),
+        })
+    );
+}
+
+#[test]
+fn channel_param_replies_stay_out_of_the_console() {
+    // Arrange: the mock sends a 353 names line and a 332 topic
+    // line — both carrying a channel parameter — immediately
+    // before the channel PRIVMSG after JOIN.
+    let (port, _lines_rx) = spawn_mock_server();
+    let (tx, rx) = mpsc::channel();
+    let _handle = spawn_irc(
+        server_config_for(port),
+        "osu_irc".to_string(),
+        server_config_for(port).channels,
+        tx,
+    );
+
+    // Act: collect every console line until the channel chat arrives.
+    let deadline = std::time::Instant::now() + RECV_TIMEOUT;
+    let mut console = Vec::new();
+    let mut chat = false;
+    while !chat && let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now())
+    {
+        match rx.recv_timeout(remaining) {
+            Ok(IrcEvent::Message(m)) if !m.channel.is_empty() => chat = true,
+            Ok(IrcEvent::Message(m)) => console.push(m.text),
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+
+    // Assert: the chat arrived, and no channel-scoped reply leaked
+    // into the console — no names line, no topic payload, no
+    // channel name at all.
+    assert!(chat, "channel chat never arrived");
+    assert!(
+        console.iter().all(|t| !t.contains(" 353 ")),
+        "353 leaked into the console: {console:?}"
+    );
+    assert!(
+        console.iter().all(|t| !t.contains("Welcome to #test")),
+        "332 payload leaked into the console: {console:?}"
+    );
+    assert!(
+        console.iter().all(|t| !t.contains("#test")),
+        "channel name leaked into the console: {console:?}"
     );
 }
 
@@ -281,13 +373,16 @@ fn reports_status_when_server_closes_connection() {
         tx,
     );
 
-    // Assert: after the chat message, a disconnect notification must arrive —
-    // the UI must never keep showing "connected" to a dead feed.
+    // Assert: after the chat message, a disconnect notification carrying the
+    // server's config key must arrive — the UI never keeps showing
+    // "connected" to a dead feed.
     let deadline = std::time::Instant::now() + RECV_TIMEOUT;
     let mut disconnected = false;
     while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
         match rx.recv_timeout(remaining) {
-            Ok(IrcEvent::Status(text)) if text.contains("disconnected") => {
+            Ok(IrcEvent::Status(server, text))
+                if server == "osu_irc" && text.contains("disconnected") =>
+            {
                 disconnected = true;
                 break;
             }
@@ -319,9 +414,10 @@ fn reports_error_when_connection_is_refused() {
         tx,
     );
 
-    // Assert: the failed connect surfaces as an Error event, not silence.
+    // Assert: the failed connect surfaces as an Error event tagged with the
+    // server's config key, not silence.
     match rx.recv_timeout(RECV_TIMEOUT) {
-        Ok(IrcEvent::Error(_)) => {}
+        Ok(IrcEvent::Error(server, _)) => assert_eq!(server, "osu_irc"),
         other => panic!("expected IrcEvent::Error, got {other:?}"),
     }
 }
@@ -341,7 +437,7 @@ fn outgoing_message_is_sent_as_privmsg_on_the_wire() {
 
     // Act: submit a message through the outgoing channel.
     sender
-        .blocking_send(OutgoingMessage {
+        .blocking_send(OutgoingMessage::Privmsg {
             server: "osu_irc".to_string(),
             target: "#test".to_string(),
             text: "hello world".to_string(),
@@ -353,5 +449,68 @@ fn outgoing_message_is_sent_as_privmsg_on_the_wire() {
     assert!(
         lines.iter().any(|l| l == "PRIVMSG #test :hello world"),
         "no PRIVMSG #test in {lines:?}"
+    );
+}
+
+#[test]
+fn raw_line_is_sent_verbatim_on_the_wire() {
+    // Arrange: connect to the mock and wait for the JOIN to land.
+    let (port, lines_rx) = spawn_mock_server();
+    let (tx, _rx) = mpsc::channel();
+    let (_handle, sender) = spawn_irc(
+        server_config_for(port),
+        "osu_irc".to_string(),
+        server_config_for(port).channels,
+        tx,
+    );
+    let _ = collect_client_lines_until(&lines_rx, |l| l.starts_with("JOIN"));
+
+    // Act: submit a raw console line through the outgoing channel.
+    sender
+        .blocking_send(OutgoingMessage::Raw {
+            server: "osu_irc".to_string(),
+            line: "WHOIS test".to_string(),
+        })
+        .unwrap();
+    let lines = collect_client_lines_until(&lines_rx, |l| l.starts_with("WHOIS"));
+
+    // Assert: the line goes out verbatim as command + parameters.
+    assert!(
+        lines.iter().any(|l| l == "WHOIS test"),
+        "no WHOIS test in {lines:?}"
+    );
+}
+
+#[test]
+fn raw_line_marks_a_colon_last_param_as_trailing() {
+    // Arrange: connect to the mock and wait for the JOIN to land.
+    let (port, lines_rx) = spawn_mock_server();
+    let (tx, _rx) = mpsc::channel();
+    let (_handle, sender) = spawn_irc(
+        server_config_for(port),
+        "osu_irc".to_string(),
+        server_config_for(port).channels,
+        tx,
+    );
+    let _ = collect_client_lines_until(&lines_rx, |l| l.starts_with("JOIN"));
+
+    // Act: submit a raw line whose last parameter explicitly starts with
+    // ':' (the client's own keepalive PING carries a bare token, so filter
+    // on the colon form).
+    sender
+        .blocking_send(OutgoingMessage::Raw {
+            server: "osu_irc".to_string(),
+            line: "PING :smoke".to_string(),
+        })
+        .unwrap();
+    let lines = collect_client_lines_until(&lines_rx, |l| l.starts_with("PING :"));
+
+    // Assert: the irc crate's `stringify` marks a ':'-prefixed last param
+    // as the trailing param by prefixing another ':' — crate-inherent
+    // behavior that keeps the param a single token. Last params without a
+    // leading ':' go out verbatim.
+    assert!(
+        lines.iter().any(|l| l == "PING ::smoke"),
+        "no PING ::smoke in {lines:?}"
     );
 }
