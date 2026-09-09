@@ -78,6 +78,15 @@ on a message pre-highlights it, and a click focuses a pane — clicking a
 channel in the sidebar opens it. While TermIRC runs, hold `Shift` for the
 terminal's own text selection.
 
+Inputs beginning with `/` after trimming surrounding whitespace are parsed
+as slash commands. Commands are not executed or sent to the IRC server,
+and do not appear in chat or server-console history. A parsed command
+clears the composer; a missing command name keeps the input for editing.
+No parsing feedback is shown in the interface. Parsing outcomes are
+recorded only at DEBUG level in the runtime log, without command contents
+or arguments. This applies in both channels and the server console.
+`//` is not an escape for sending a literal slash.
+
 Two expectations worth setting: opening a channel jumps to its newest
 messages and the view follows new ones while you stay at the bottom; and
 TermIRC never auto-reconnects — after a drop, restart it.

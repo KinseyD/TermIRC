@@ -8,7 +8,8 @@ use ratatui::crossterm::event::{
     MouseButton, MouseEvent, MouseEventKind,
 };
 
-use termirc::app::{App, Focus};
+use termirc::app::{App, Focus, InputSubmission};
+use termirc::command::SlashParseError;
 use termirc::config::Config;
 use termirc::irc::{IrcEvent, OutgoingMessage, spawn_irc};
 use termirc::message::ChatMessage;
@@ -164,44 +165,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal, config: &Config) -> anyhow::Resu
                         KeyCode::Enter => match app.focus() {
                             Focus::Sidebar => app.sidebar_enter(),
                             Focus::Composer => {
-                                if let Some(out) = app.submit_input() {
-                                    let (server, channel, text) = match &out {
-                                        OutgoingMessage::Privmsg {
-                                            server,
-                                            target,
-                                            text,
-                                        } => (server.clone(), target.clone(), text.clone()),
-                                        // A raw console line echoes into the server's
-                                        // console view (empty-channel sentinel).
-                                        OutgoingMessage::Raw { server, line } => {
-                                            (server.clone(), String::new(), line.clone())
-                                        }
-                                    };
-                                    let nickname = nickname_of(config, &server);
-                                    match outgoing.get(&server).map(|s| s.try_send(out.clone())) {
-                                        Some(Ok(())) => {
-                                            // Echo our own line locally (IRC
-                                            // servers do not send it back).
-                                            app.push_message(ChatMessage {
-                                                server,
-                                                channel,
-                                                nick: nickname,
-                                                text,
-                                            });
-                                        }
-                                        _ => {
-                                            // Connection gone or queue full:
-                                            // put the text back, explain.
-                                            app.restore_input(text);
-                                            tracing::warn!(
-                                                "send failed on {server}: disconnected or busy"
-                                            );
-                                            status = format!(
-                                                "failed to send ({server} disconnected or busy)"
-                                            );
-                                        }
-                                    }
-                                }
+                                submit_composer(&mut app, config, &outgoing, &mut status);
                                 relayout = true; // the composer may shrink
                             }
                             Focus::Messages => {}
@@ -257,6 +221,55 @@ fn run(terminal: &mut ratatui::DefaultTerminal, config: &Config) -> anyhow::Resu
     }
 
     Ok(())
+}
+
+/// Handle Enter: slash input produces only debug logs; ordinary input sends
+/// and echoes locally. Parsing feedback never changes the UI status.
+fn submit_composer(
+    app: &mut App,
+    config: &Config,
+    outgoing: &std::collections::HashMap<String, tokio::sync::mpsc::Sender<OutgoingMessage>>,
+    status: &mut String,
+) {
+    let out = match app.submit_input() {
+        Some(InputSubmission::Outgoing(out)) => out,
+        Some(InputSubmission::Slash(_)) => {
+            tracing::debug!(target: "termirc::slash", outcome = "parsed",
+                "slash input parsed; execution disabled");
+            return;
+        }
+        Some(InputSubmission::InvalidSlash(SlashParseError::MissingName)) => {
+            tracing::debug!(target: "termirc::slash", outcome = "rejected",
+                reason = "missing_name", "slash input parse failed");
+            return;
+        }
+        None => return,
+    };
+    let (server, channel, text) = match &out {
+        OutgoingMessage::Privmsg {
+            server,
+            target,
+            text,
+        } => (server.clone(), target.clone(), text.clone()),
+        // Raw lines echo into the server's console (empty-channel sentinel).
+        OutgoingMessage::Raw { server, line } => (server.clone(), String::new(), line.clone()),
+    };
+    let nickname = nickname_of(config, &server);
+    match outgoing.get(&server).map(|s| s.try_send(out)) {
+        Some(Ok(())) => {
+            app.push_message(ChatMessage {
+                server,
+                channel,
+                nick: nickname,
+                text,
+            });
+        }
+        _ => {
+            app.restore_input(text);
+            tracing::warn!("send failed on {server}: disconnected or busy");
+            *status = format!("failed to send ({server} disconnected or busy)");
+        }
+    }
 }
 
 /// The configured nickname for a server (matched case-insensitively by its
@@ -348,4 +361,151 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, term_size: (u16, u16)) {
         mouse::MouseTarget::MessageRow(row) => app.message_at_row(row),
         _ => None,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn slash_submissions_never_send_echo_or_execute() {
+        for console in [false, true] {
+            for input in [
+                "/join #new",
+                "/quit",
+                "/raw JOIN #new",
+                "/unknown a b",
+                "/MSG alice hello  世界",
+                "  /nick newname  ",
+                "//hello",
+                "/private-command-name sensitive-payload-260909",
+                "/",
+                "/   ",
+                "/ join",
+            ] {
+                let mut app = App::new(40, 10);
+                if console {
+                    app.open_server("srv");
+                } else {
+                    app.open_channel("srv", "#a");
+                }
+                app.select_channel(0);
+                for c in input.chars() {
+                    app.type_char(c);
+                }
+                let old_cursor = app.input_cursor();
+                let config = Config {
+                    servers: Default::default(),
+                };
+                let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+                let outgoing = std::collections::HashMap::from([("srv".to_string(), tx)]);
+                let mut status = "previous connection status".to_string();
+                let capture = LogCapture::default();
+                let writer = capture.clone();
+                let subscriber = tracing_subscriber::fmt()
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::DEBUG)
+                    .with_writer(move || writer.clone())
+                    .finish();
+
+                tracing::subscriber::with_default(subscriber, || {
+                    submit_composer(&mut app, &config, &outgoing, &mut status);
+                });
+                let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+
+                assert!(
+                    matches!(
+                        rx.try_recv(),
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                    ),
+                    "slash input entered outgoing queue: {input:?}, console={console}"
+                );
+                assert!(app.messages().is_empty());
+                assert!(app.is_running());
+                assert_eq!(app.channel_count(), 1);
+                assert_eq!(status, "previous connection status");
+                assert_eq!(logs.lines().count(), 1);
+                assert!(logs.contains("DEBUG"));
+                assert!(logs.contains("termirc::slash"));
+                assert!(!logs.contains(input.trim()));
+                assert!(!logs.contains("private-command-name"));
+                assert!(!logs.contains("sensitive-payload-260909"));
+                if matches!(input, "/" | "/   " | "/ join") {
+                    assert_eq!(app.input(), input);
+                    assert_eq!(app.input_cursor(), old_cursor);
+                    assert!(logs.contains("rejected"));
+                    assert!(logs.contains("missing_name"));
+                } else {
+                    assert_eq!(app.input(), "");
+                    assert_eq!(app.input_cursor(), 0);
+                    assert!(logs.contains("parsed"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_submissions_send_echo_and_restore_on_failure() {
+        for console in [false, true] {
+            for connected in [false, true] {
+                let input = if console { "WHOIS nick" } else { "hello /join" };
+                let mut app = App::new(40, 10);
+                if console {
+                    app.open_server("srv");
+                } else {
+                    app.open_channel("srv", "#a");
+                }
+                app.select_channel(0);
+                for c in input.chars() {
+                    app.type_char(c);
+                }
+                let config = Config {
+                    servers: Default::default(),
+                };
+                let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+                let mut outgoing = std::collections::HashMap::new();
+                if connected {
+                    outgoing.insert("srv".to_string(), tx);
+                }
+                let mut status = String::new();
+                submit_composer(&mut app, &config, &outgoing, &mut status);
+                if connected {
+                    let expected = if console {
+                        OutgoingMessage::Raw {
+                            server: "srv".into(),
+                            line: input.into(),
+                        }
+                    } else {
+                        OutgoingMessage::Privmsg {
+                            server: "srv".into(),
+                            target: "#a".into(),
+                            text: input.into(),
+                        }
+                    };
+                    assert_eq!(rx.try_recv().unwrap(), expected);
+                    assert_eq!(app.messages().len(), 1);
+                    assert_eq!(app.messages()[0].text, input);
+                    assert_eq!(app.input(), "");
+                } else {
+                    assert!(app.messages().is_empty());
+                    assert_eq!(app.input(), input);
+                    assert!(status.contains("failed to send"));
+                }
+            }
+        }
+    }
 }

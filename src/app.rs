@@ -6,6 +6,7 @@
 //! user has scrolled up so that line leaves the window, the viewport stays put
 //! until they scroll back to the bottom.
 
+use crate::command::{SlashCommand, SlashParseError, parse_slash_command};
 use crate::irc::OutgoingMessage;
 use crate::layout::{LayoutLine, layout_messages, message_spans};
 use crate::message::ChatMessage;
@@ -69,6 +70,14 @@ pub enum Focus {
     Sidebar,
     Messages,
     Composer,
+}
+
+/// A local input result. Only `Outgoing` may enter the IRC send queue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputSubmission {
+    Outgoing(OutgoingMessage),
+    Slash(SlashCommand),
+    InvalidSlash(SlashParseError),
 }
 
 /// One visible row of the server/channel sidebar.
@@ -380,11 +389,22 @@ impl App {
         self.input_cursor = self.input.chars().count();
     }
 
-    /// Submit the composer: take the typed text as a message to the viewed
-    /// channel and clear the input. In a server console view the line goes
-    /// out as a raw IRC command instead. Whitespace-only input sends
-    /// nothing (but is still cleared); with no view open the input is kept.
-    pub fn submit_input(&mut self) -> Option<OutgoingMessage> {
+    /// Parse slash input locally before considering a network destination.
+    /// Successful commands clear the input; malformed commands keep it for
+    /// editing. Neither result is an outgoing message or a history entry.
+    /// Ordinary input targets the viewed channel, or becomes Raw in a server
+    /// console. Without a view, ordinary input is kept; blanks in a view clear.
+    pub fn submit_input(&mut self) -> Option<InputSubmission> {
+        if let Some(parsed) = parse_slash_command(&self.input) {
+            return Some(match parsed {
+                Ok(command) => {
+                    self.input.clear();
+                    self.input_cursor = 0;
+                    InputSubmission::Slash(command)
+                }
+                Err(error) => InputSubmission::InvalidSlash(error),
+            });
+        }
         let (server, target) = self.active_channel()?;
         let text = self.input.trim().to_string();
         let server = server.to_string();
@@ -397,13 +417,16 @@ impl App {
         self.input.clear();
         self.input_cursor = 0;
         if target.is_empty() {
-            Some(OutgoingMessage::Raw { server, line: text })
+            Some(InputSubmission::Outgoing(OutgoingMessage::Raw {
+                server,
+                line: text,
+            }))
         } else {
-            Some(OutgoingMessage::Privmsg {
+            Some(InputSubmission::Outgoing(OutgoingMessage::Privmsg {
                 server,
                 target,
                 text,
-            })
+            }))
         }
     }
 
@@ -1170,6 +1193,26 @@ mod tests {
     // ----- sending -----
 
     #[test]
+    fn slash_submission_without_active_view_is_local() {
+        let mut app = App::new(40, 10);
+        for c in "/join #new".chars() {
+            app.type_char(c);
+        }
+        assert_eq!(
+            app.submit_input(),
+            Some(InputSubmission::Slash(SlashCommand {
+                name: "join".into(),
+                arguments: "#new".into(),
+            }))
+        );
+        assert_eq!(app.channel_count(), 0);
+        assert!(app.messages().is_empty());
+        assert_eq!(app.input(), "");
+        assert_eq!(app.input_cursor(), 0);
+        assert!(app.is_running());
+    }
+
+    #[test]
     fn submit_input_returns_active_channel_and_clears_the_composer() {
         // Arrange: viewing #a with text typed in the composer.
         let mut app = App::new(40, 10);
@@ -1185,11 +1228,11 @@ mod tests {
         // is reset.
         assert_eq!(
             outgoing,
-            Some(OutgoingMessage::Privmsg {
+            Some(InputSubmission::Outgoing(OutgoingMessage::Privmsg {
                 server: "srv".to_string(),
                 target: "#a".to_string(),
                 text: "hi".to_string(),
-            })
+            }))
         );
         assert_eq!(app.input(), "");
         assert_eq!(app.input_cursor(), 0);
@@ -1211,10 +1254,10 @@ mod tests {
         // Assert: the line goes out raw (no target), composer reset.
         assert_eq!(
             outgoing,
-            Some(OutgoingMessage::Raw {
+            Some(InputSubmission::Outgoing(OutgoingMessage::Raw {
                 server: "srv".to_string(),
                 line: "WHOIS nick".to_string(),
-            })
+            }))
         );
         assert_eq!(app.input(), "");
         assert_eq!(app.input_cursor(), 0);
@@ -1264,7 +1307,7 @@ mod tests {
         assert_eq!(app.input(), "");
 
         // Act: the UI puts the text back after a failed send.
-        let OutgoingMessage::Privmsg { text, .. } = outgoing else {
+        let InputSubmission::Outgoing(OutgoingMessage::Privmsg { text, .. }) = outgoing else {
             panic!("channel submit must produce a Privmsg");
         };
         app.restore_input(text);

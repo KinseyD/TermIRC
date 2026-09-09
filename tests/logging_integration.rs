@@ -12,6 +12,9 @@ fn init_writes_events_to_the_daily_log_file() {
     // Act: the blocking appender writes synchronously - no flush needed.
     termirc::logging::init(&dir).unwrap();
     tracing::info!("termirc probe 260824");
+    tracing::debug!(target: "termirc::slash", "slash debug probe 260909");
+    tracing::debug!(target: "termirc::other", "unrelated debug probe 260909");
+    tracing::trace!(target: "termirc::slash", "slash trace probe 260909");
 
     // Assert: exactly one log file named termirc.log.YYYY-MM-DD exists and
     // carries the event text.
@@ -44,5 +47,12 @@ fn init_writes_events_to_the_daily_log_file() {
         content.contains("termirc probe 260824"),
         "log content: {content}"
     );
+    assert!(
+        content
+            .lines()
+            .any(|line| line.contains("DEBUG") && line.contains("slash debug probe 260909"))
+    );
+    assert!(!content.contains("unrelated debug probe 260909"));
+    assert!(!content.contains("slash trace probe 260909"));
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
+use tracing_subscriber::{filter::Targets, prelude::*};
 
 /// How many rotated log files to keep on disk.
 const MAX_LOG_FILES: usize = 7;
@@ -31,10 +32,18 @@ pub fn build_appender(dir: &Path) -> anyhow::Result<RollingFileAppender> {
 /// caller: return `Err` and keep running without logs.
 pub fn init(dir: &Path) -> anyhow::Result<()> {
     let appender = build_appender(dir)?;
-    tracing_subscriber::fmt()
-        .with_writer(appender)
-        .with_ansi(false)
-        .with_max_level(tracing::Level::INFO)
+    // Slash feedback has no UI surface, so retain its DEBUG events while
+    // leaving the verbosity of all other targets unchanged.
+    let filter = Targets::new()
+        .with_default(tracing::Level::INFO)
+        .with_target("termirc::slash", tracing::Level::DEBUG);
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(appender)
+                .with_ansi(false)
+                .with_filter(filter),
+        )
         .try_init()
         .map_err(|e| anyhow::anyhow!("failed to install the global log subscriber: {e}"))?;
     Ok(())
