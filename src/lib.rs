@@ -5,6 +5,7 @@
 //! in `main.rs` is a thin wiring layer.
 
 pub mod app;
+pub mod command;
 pub mod config;
 pub mod irc;
 pub mod layout;
