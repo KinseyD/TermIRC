@@ -1,6 +1,8 @@
 # TermIRC
 
 [![CI](https://github.com/KinseyD/TermIRC/actions/workflows/ci.yml/badge.svg)](https://github.com/KinseyD/TermIRC/actions/workflows/ci.yml)
+[![Rust](https://img.shields.io/badge/Rust-1.85%2B-DEA584?logo=rust)](https://www.rust-lang.org/)
+[![Built With Ratatui](https://img.shields.io/badge/Built_With_Ratatui-000?logo=ratatui&logoColor=fff)](https://ratatui.rs/)
 
 A terminal IRC client written in Rust. TermIRC reads your servers from a
 TOML config file, opens one connection per server — joining every

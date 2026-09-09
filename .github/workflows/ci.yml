@@ -3,8 +3,14 @@ name: CI
 on:
   push:
     branches: [main]
+    # Doc-only pushes skip CI entirely — nothing to lint or test.
+    paths-ignore:
+      - '**.md'
   pull_request:
     types: [opened, synchronize, reopened]
+    # Same for PRs: a doc-only diff never queues a run.
+    paths-ignore:
+      - '**.md'
 
 concurrency:
   group: ci-${{ github.ref }}
