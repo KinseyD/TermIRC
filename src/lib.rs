@@ -7,6 +7,7 @@
 pub mod app;
 pub mod command;
 pub mod config;
+mod connection;
 pub mod irc;
 pub mod layout;
 pub mod logging;

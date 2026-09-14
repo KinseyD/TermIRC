@@ -12,6 +12,50 @@ pub enum SlashParseError {
     MissingName,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandAction {
+    Nick(String),
+    Away(Option<String>),
+    Back,
+    Connect(Option<String>),
+    Reconnect(Option<String>),
+    Disconnect(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandError {
+    Unsupported,
+    InvalidArguments,
+}
+
+impl SlashCommand {
+    pub fn action(&self) -> Result<CommandAction, CommandError> {
+        use CommandAction::*;
+        let args = self.arguments.as_str();
+        if args.contains(['\r', '\n', '\0']) {
+            return Err(CommandError::InvalidArguments);
+        }
+        let single = !args.is_empty() && !args.chars().any(char::is_whitespace);
+        let optional = || (!args.is_empty()).then(|| args.to_string());
+        match self.name.as_str() {
+            "nick"
+                if single
+                    && !args.contains([',', '*', '?', '!', '@', '.'])
+                    && !args.starts_with(['$', ':', '#', '&', '+', '%', '~']) =>
+            {
+                Ok(Nick(args.into()))
+            }
+            "away" => Ok(Away(optional())),
+            "back" if args.is_empty() => Ok(Back),
+            "connect" if args.is_empty() || single => Ok(Connect(optional())),
+            "reconnect" if args.is_empty() || single => Ok(Reconnect(optional())),
+            "disconnect" | "quit" => Ok(Disconnect(args.into())),
+            "nick" | "back" | "connect" | "reconnect" => Err(CommandError::InvalidArguments),
+            _ => Err(CommandError::Unsupported),
+        }
+    }
+}
+
 /// Classify trimmed input and split a slash command without executing it.
 ///
 /// `None` denotes ordinary input. Only the first slash is removed, so `//`
@@ -33,6 +77,66 @@ pub fn parse_slash_command(input: &str) -> Option<Result<SlashCommand, SlashPars
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identity_and_connection_commands_have_typed_arguments() {
+        for (input, expected) in [
+            ("/nick Alice", CommandAction::Nick("Alice".into())),
+            (
+                "/away lunch  break",
+                CommandAction::Away(Some("lunch  break".into())),
+            ),
+            ("/away", CommandAction::Away(None)),
+            ("/back", CommandAction::Back),
+            ("/connect", CommandAction::Connect(None)),
+            (
+                "/connect Libera",
+                CommandAction::Connect(Some("Libera".into())),
+            ),
+            (
+                "/reconnect srv",
+                CommandAction::Reconnect(Some("srv".into())),
+            ),
+            (
+                "/disconnect bye all",
+                CommandAction::Disconnect("bye all".into()),
+            ),
+            ("/quit", CommandAction::Disconnect(String::new())),
+        ] {
+            assert_eq!(
+                parse_slash_command(input).unwrap().unwrap().action(),
+                Ok(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_or_malformed_commands_cannot_be_executed() {
+        for input in [
+            "/nick",
+            "/nick a b",
+            "/nick #chan",
+            "/nick :bob",
+            "/nick a,b",
+            "/back now",
+            "/connect a b",
+            "/reconnect a b",
+            "/away hi\r\nQUIT",
+            "/quit a\0b",
+        ] {
+            assert_eq!(
+                parse_slash_command(input).unwrap().unwrap().action(),
+                Err(CommandError::InvalidArguments),
+                "{input:?}"
+            );
+        }
+        for input in ["/raw QUIT", "/join #new", "//hello", "/unknown"] {
+            assert_eq!(
+                parse_slash_command(input).unwrap().unwrap().action(),
+                Err(CommandError::Unsupported)
+            );
+        }
+    }
 
     #[test]
     fn parses_name_and_preserves_argument_body() {

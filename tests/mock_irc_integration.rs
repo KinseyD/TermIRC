@@ -416,9 +416,15 @@ fn reports_error_when_connection_is_refused() {
 
     // Assert: the failed connect surfaces as an Error event tagged with the
     // server's config key, not silence.
-    match rx.recv_timeout(RECV_TIMEOUT) {
-        Ok(IrcEvent::Error(server, _)) => assert_eq!(server, "osu_irc"),
-        other => panic!("expected IrcEvent::Error, got {other:?}"),
+    loop {
+        match rx.recv_timeout(RECV_TIMEOUT) {
+            Ok(IrcEvent::Error(server, _)) => {
+                assert_eq!(server, "osu_irc");
+                break;
+            }
+            Ok(_) => continue,
+            other => panic!("expected IrcEvent::Error, got {other:?}"),
+        }
     }
 }
 
@@ -437,6 +443,7 @@ fn outgoing_message_is_sent_as_privmsg_on_the_wire() {
 
     // Act: submit a message through the outgoing channel.
     sender
+        .outgoing
         .blocking_send(OutgoingMessage::Privmsg {
             server: "osu_irc".to_string(),
             target: "#test".to_string(),
@@ -467,6 +474,7 @@ fn raw_line_is_sent_verbatim_on_the_wire() {
 
     // Act: submit a raw console line through the outgoing channel.
     sender
+        .outgoing
         .blocking_send(OutgoingMessage::Raw {
             server: "osu_irc".to_string(),
             line: "WHOIS test".to_string(),
@@ -498,6 +506,7 @@ fn raw_line_marks_a_colon_last_param_as_trailing() {
     // ':' (the client's own keepalive PING carries a bare token, so filter
     // on the colon form).
     sender
+        .outgoing
         .blocking_send(OutgoingMessage::Raw {
             server: "osu_irc".to_string(),
             line: "PING :smoke".to_string(),

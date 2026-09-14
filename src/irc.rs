@@ -1,4 +1,4 @@
-//! IRC client adapter: runs the async client on a dedicated thread.
+//! IRC client adapter: one controllable worker thread per configured server.
 //!
 //! The async `irc` crate needs a tokio runtime; we confine it to a single
 //! background thread with a cheap current-thread runtime and forward events
@@ -9,22 +9,67 @@
 use std::sync::mpsc;
 use std::thread;
 
-use futures_util::StreamExt;
-use irc::client::prelude::{Client, Command, Config as IrcClientConfig};
+use irc::client::prelude::Config as IrcClientConfig;
 
 use crate::config::ServerConfig;
 use crate::message::ChatMessage;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConnectionState {
+    Connecting,
+    Connected,
+    #[default]
+    Stopped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectionCommand {
+    Connect,
+    Reconnect,
+    Disconnect(String),
+    Nick(String),
+    Away(Option<String>),
+    Back,
+}
+
+pub struct ConnectionHandle {
+    pub outgoing: tokio::sync::mpsc::Sender<OutgoingMessage>,
+    pub control: tokio::sync::mpsc::Sender<ConnectionCommand>,
+}
+
+#[derive(Clone, Copy)]
+pub struct RetryPolicy {
+    pub max_retries: u32,
+    pub delay: std::time::Duration,
+    pub timeout: std::time::Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            delay: std::time::Duration::from_secs(1),
+            timeout: std::time::Duration::from_secs(30),
+        }
+    }
+}
+
 /// Events produced by the IRC adapter thread.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IrcEvent {
+    /// Ordered barrier: the worker has consumed a manual disconnect/reconnect.
+    ControlApplied(String),
+    Connection(String, ConnectionState),
+    Channel(String, String, ConnectionState),
+    Nickname(String, String),
+    Away(String, bool),
     /// A chat message received from one of the joined channels.
     Message(ChatMessage),
     /// Informational status for `server` (the config key), e.g. "connected
     /// to irc.ppy.sh".
     Status(String, String),
-    /// A connection or protocol error for `server` (the config key); the
-    /// thread stops afterwards.
+    /// A failed attempt for `server`; a subsequent state event indicates
+    /// whether the worker is retrying or stopped.
     Error(String, String),
 }
 
@@ -66,122 +111,42 @@ pub fn build_client_config(server: &ServerConfig, channels: &[String]) -> IrcCli
     }
 }
 
-/// Spawn the IRC client thread for one server; events arrive on `tx`.
-///
-/// `server_label` is the config key identifying the server in events and
-/// statuses. The thread connects, registers, joins all channels, forwards
-/// chat messages, and sends whatever the returned `Sender` receives until
-/// the connection ends. A terminal event is ALWAYS emitted on exit — `Status`
-/// for a clean close, `Error` otherwise — so the UI never keeps claiming
-/// "connected" to a dead feed.
+/// Start one controllable worker for the lifetime of a configured server.
+/// Dropping the handle cancels pending attempts and closes the active socket.
 pub fn spawn_irc(
     server: ServerConfig,
     server_label: String,
     channels: Vec<String>,
     tx: mpsc::Sender<IrcEvent>,
-) -> (
-    thread::JoinHandle<()>,
-    tokio::sync::mpsc::Sender<OutgoingMessage>,
-) {
-    let (out_tx, out_rx) = tokio::sync::mpsc::channel(OUTGOING_CAPACITY);
+) -> (thread::JoinHandle<()>, ConnectionHandle) {
+    spawn_irc_with_policy(server, server_label, channels, tx, RetryPolicy::default())
+}
+
+/// Start a worker with an explicit retry and timeout policy.
+pub fn spawn_irc_with_policy(
+    server: ServerConfig,
+    label: String,
+    channels: Vec<String>,
+    tx: mpsc::Sender<IrcEvent>,
+    policy: RetryPolicy,
+) -> (thread::JoinHandle<()>, ConnectionHandle) {
+    let (outgoing, out_rx) = tokio::sync::mpsc::channel(OUTGOING_CAPACITY);
+    let (control, control_rx) = tokio::sync::mpsc::channel(16);
     let handle = thread::spawn(move || {
-        let runtime = match tokio::runtime::Builder::new_current_thread()
+        match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
         {
-            Ok(runtime) => runtime,
-            Err(e) => {
-                tracing::error!("{server_label}: runtime init failed: {e}");
-                let _ = tx.send(IrcEvent::Error(
-                    server_label.clone(),
-                    format!("runtime init failed: {e}"),
-                ));
-                return;
-            }
-        };
-
-        let host = server.server.clone();
-        let label = server_label.clone();
-        let result = runtime.block_on(run_client(server, &server_label, &channels, &tx, out_rx));
-        // `send` failing means the receiver is gone — the UI has quit and the
-        // process is about to reap this thread; nothing to report anywhere.
-        match result {
-            Ok(()) => {
-                tracing::info!("{label}: disconnected from {host} (connection closed)");
-                let _ = tx.send(IrcEvent::Status(
-                    label.clone(),
-                    format!("disconnected from {host} (connection closed)"),
-                ));
-            }
-            Err(e) => {
-                tracing::error!("{label}: {e}");
-                let _ = tx.send(IrcEvent::Error(label.clone(), format!("{e}")));
+            Ok(runtime) => runtime.block_on(crate::connection::run(
+                server, label, channels, tx, policy, out_rx, control_rx,
+            )),
+            Err(_) => {
+                let _ = tx.send(IrcEvent::Error(label.clone(), "runtime init failed".into()));
+                let _ = tx.send(IrcEvent::Connection(label, ConnectionState::Stopped));
             }
         }
     });
-    (handle, out_tx)
-}
-
-async fn run_client(
-    server: ServerConfig,
-    server_label: &str,
-    channels: &[String],
-    tx: &mpsc::Sender<IrcEvent>,
-    mut out_rx: tokio::sync::mpsc::Receiver<OutgoingMessage>,
-) -> anyhow::Result<()> {
-    let mut client = Client::from_config(build_client_config(&server, channels)).await?;
-    client.identify()?;
-    let mut stream = client.stream()?;
-    let _ = tx.send(IrcEvent::Status(
-        server_label.to_string(),
-        format!("connected to {}", server.server),
-    ));
-    tracing::info!("{server_label}: connected to {}", server.server);
-
-    loop {
-        tokio::select! {
-            outgoing = out_rx.recv() => {
-                match outgoing {
-                    // The UI is shutting down (all senders dropped): stop.
-                    None => return Ok(()),
-                    Some(message) => match message {
-                        OutgoingMessage::Privmsg { target, text, .. } => {
-                            client.send_privmsg(&target, &text)?
-                        }
-                        OutgoingMessage::Raw { line, .. } => {
-                            let mut parts = line.split_whitespace();
-                            let cmd = parts.next().unwrap_or_default().to_string();
-                            let args: Vec<String> =
-                                parts.map(str::to_string).collect();
-                            client.send(Command::Raw(cmd, args))?;
-                        }
-                    },
-                }
-            }
-            item = stream.next() => {
-                match item {
-                    Some(Ok(message)) => {
-                        match ChatMessage::from_proto(&message, server_label, channels) {
-                            Some(chat) => {
-                                let _ = tx.send(IrcEvent::Message(chat));
-                            }
-                            // Server replies (numerics, NOTICEs) land in
-                            // the server's console as payload-only lines.
-                            None => {
-                                if let Some(line) =
-                                    ChatMessage::console_from_proto(&message, server_label)
-                                {
-                                    let _ = tx.send(IrcEvent::Message(line));
-                                }
-                            }
-                        }
-                    }
-                    Some(Err(e)) => return Err(e.into()),
-                    None => return Ok(()),
-                }
-            }
-        }
-    }
+    (handle, ConnectionHandle { outgoing, control })
 }
 
 #[cfg(test)]

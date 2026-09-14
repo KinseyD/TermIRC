@@ -216,9 +216,24 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
         }
 
         // Row text: a leading space reserves room for the block cursor.
+        let state = app.connection_state(&row.server, row.channel.as_deref());
+        let (symbol, color) = match state {
+            crate::irc::ConnectionState::Connected => ("● ", Color::Green),
+            crate::irc::ConnectionState::Stopped => ("● ", Color::Red),
+            crate::irc::ConnectionState::Connecting => (
+                if app.connecting_dot_visible() {
+                    "● "
+                } else {
+                    "  "
+                },
+                Color::Gray,
+            ),
+        };
+        let dot = Span::styled(symbol, Style::new().fg(color));
         let line = match &row.channel {
             None => Line::from(vec![
                 Span::raw(" "),
+                dot,
                 Span::styled(
                     row.server.as_str(),
                     Style::new().add_modifier(Modifier::BOLD),
@@ -227,6 +242,7 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
             Some(channel) => Line::from(vec![
                 Span::raw(" "),
                 Span::raw("  "),
+                dot,
                 Span::styled(channel.as_str(), DIM_STYLE),
             ]),
         };
@@ -901,6 +917,38 @@ mod tests {
         assert!(!buffer_line(&buffer, 0).contains("▾"));
         assert!(buffer_line(&buffer, 1).contains("#osu"));
         assert!(buffer_line(&buffer, 2).contains("#chinese"));
+    }
+
+    #[test]
+    fn connection_dots_follow_confirmed_server_and_channel_states() {
+        use crate::irc::{ConnectionState as S, IrcEvent as E};
+        let mut app = test_app(22, 3);
+        app.apply_connection_event(&E::Connection("osu_irc".into(), S::Connecting));
+        let pending = render_sized(&app, "", 50, 10);
+        assert_eq!(pending[(2, 0)].symbol(), "●");
+        assert_eq!(pending[(2, 0)].fg, Color::Gray);
+        assert_eq!(pending[(4, 1)].fg, Color::Gray);
+        app.tick(std::time::Duration::from_millis(500));
+        let off = render_sized(&app, "", 50, 10);
+        assert_eq!(off[(2, 0)].symbol(), " ");
+        assert_eq!(off[(4, 1)].symbol(), " ");
+        for x in 4..11 {
+            assert_eq!(pending[(x, 0)].symbol(), off[(x, 0)].symbol());
+        }
+        app.apply_connection_event(&E::Connection("OSU_IRC".into(), S::Connected));
+        app.apply_connection_event(&E::Channel("osu_irc".into(), "#osu".into(), S::Connected));
+        app.apply_connection_event(&E::Channel("osu_irc".into(), "#chinese".into(), S::Stopped));
+        let connected = render_sized(&app, "", 50, 10);
+        assert_eq!(connected[(2, 0)].symbol(), "●");
+        assert_eq!(connected[(2, 0)].fg, Color::Green);
+        assert_eq!(connected[(4, 1)].fg, Color::Green);
+        assert_eq!(connected[(4, 2)].fg, Color::Red);
+        app.apply_connection_event(&E::Connection("osu_irc".into(), S::Stopped));
+        let stopped = render_sized(&app, "", 50, 10);
+        for pos in [(2, 0), (4, 1), (4, 2)] {
+            assert_eq!(stopped[pos].symbol(), "●");
+            assert_eq!(stopped[pos].fg, Color::Red);
+        }
     }
 
     #[test]

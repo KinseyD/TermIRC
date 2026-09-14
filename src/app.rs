@@ -7,7 +7,7 @@
 //! until they scroll back to the bottom.
 
 use crate::command::{SlashCommand, SlashParseError, parse_slash_command};
-use crate::irc::OutgoingMessage;
+use crate::irc::{ConnectionState, IrcEvent, OutgoingMessage};
 use crate::layout::{LayoutLine, layout_messages, message_spans};
 use crate::message::ChatMessage;
 
@@ -28,6 +28,7 @@ pub const MAX_INPUT: usize = 512;
 /// One view's history plus its scroll state: a channel, or a server console
 /// (identified by an empty `channel`).
 struct ChannelState {
+    connection: ConnectionState,
     server: String,
     /// Channel name; empty for a server console view.
     channel: String,
@@ -48,6 +49,7 @@ struct ChannelState {
 impl ChannelState {
     fn new(server: String, channel: String) -> ChannelState {
         ChannelState {
+            connection: ConnectionState::Stopped,
             server,
             channel,
             messages: Vec::new(),
@@ -89,6 +91,8 @@ pub struct SidebarRow {
 }
 
 pub struct App {
+    servers: std::collections::HashMap<String, ServerState>,
+    connecting_dot_visible: bool,
     /// Registered views in sidebar order (per server: its console plus its
     /// channels); `active` indexes the viewed one (`None` = no view open
     /// yet: the message pane shows a welcome page).
@@ -110,13 +114,116 @@ pub struct App {
     line_cap: usize,
 }
 
+#[derive(Default)]
+struct ServerState {
+    pending_changes: usize,
+    connection: ConnectionState,
+    nickname: Option<String>,
+    away: bool,
+}
+
 impl App {
+    /// Ignore older connection events until the worker reaches this request.
+    pub fn begin_connection_change(&mut self, server: &str, connection: ConnectionState) {
+        self.update_connection_state(server, connection);
+        self.servers
+            .entry(server.to_ascii_lowercase())
+            .or_default()
+            .pending_changes += 1;
+    }
+
+    fn update_connection_state(&mut self, server: &str, connection: ConnectionState) {
+        self.servers
+            .entry(server.to_ascii_lowercase())
+            .or_default()
+            .connection = connection;
+        if connection != ConnectionState::Connected {
+            for channel in &mut self.channels {
+                if channel.server.eq_ignore_ascii_case(server) {
+                    channel.connection = connection;
+                }
+            }
+        }
+    }
+
+    fn has_pending_connection_change(&self, server: &str) -> bool {
+        self.servers
+            .get(&server.to_ascii_lowercase())
+            .is_some_and(|s| s.pending_changes > 0)
+    }
+
+    /// Apply protocol-confirmed state without adding messages or UI feedback.
+    pub fn apply_connection_event(&mut self, event: &IrcEvent) {
+        match event {
+            IrcEvent::ControlApplied(server) => {
+                let state = self.servers.entry(server.to_ascii_lowercase()).or_default();
+                state.pending_changes = state.pending_changes.saturating_sub(1);
+            }
+            IrcEvent::Connection(server, connection) => {
+                if !self.has_pending_connection_change(server) {
+                    self.update_connection_state(server, *connection);
+                }
+            }
+            IrcEvent::Channel(server, channel, connection) => {
+                if self.has_pending_connection_change(server) {
+                    return;
+                }
+                if let Some(i) = self.find_channel(server, channel) {
+                    self.channels[i].connection = *connection;
+                }
+            }
+            IrcEvent::Nickname(server, nickname) => {
+                self.servers
+                    .entry(server.to_ascii_lowercase())
+                    .or_default()
+                    .nickname = Some(nickname.clone());
+            }
+            IrcEvent::Away(server, away) => {
+                self.servers
+                    .entry(server.to_ascii_lowercase())
+                    .or_default()
+                    .away = *away;
+            }
+            _ => {}
+        }
+    }
+
+    pub fn connection_state(&self, server: &str, channel: Option<&str>) -> ConnectionState {
+        match channel.filter(|c| !c.is_empty()) {
+            Some(channel) => self
+                .find_channel(server, channel)
+                .map(|i| self.channels[i].connection)
+                .unwrap_or_default(),
+            None => self
+                .servers
+                .get(&server.to_ascii_lowercase())
+                .map(|s| s.connection)
+                .unwrap_or_default(),
+        }
+    }
+
+    pub fn nickname(&self, server: &str) -> Option<&str> {
+        self.servers
+            .get(&server.to_ascii_lowercase())
+            .and_then(|s| s.nickname.as_deref())
+    }
+
+    pub fn tick(&mut self, elapsed: std::time::Duration) {
+        self.connecting_dot_visible = (elapsed.as_millis() / 500).is_multiple_of(2);
+    }
+
+    pub fn connecting_dot_visible(&self) -> bool {
+        self.connecting_dot_visible
+    }
+
     pub fn new(width: u16, viewport_height: u16) -> App {
         Self::with_caps(width, viewport_height, MAX_MESSAGES, MAX_LINES)
     }
 
     fn with_caps(width: u16, viewport_height: u16, message_cap: usize, line_cap: usize) -> App {
         App {
+            servers: Default::default(),
+            connecting_dot_visible: true,
             channels: Vec::new(),
             active: None,
             focus: Focus::Sidebar,
@@ -430,8 +537,13 @@ impl App {
         }
     }
 
-    /// Put text back into the composer (with the cursor at its end), e.g.
-    /// after a send failed.
+    /// Restore a rejected command without moving the editing cursor.
+    pub fn restore_input_at(&mut self, text: String, cursor: usize) {
+        self.restore_input(text);
+        self.input_cursor = cursor.min(self.input.chars().count());
+    }
+
+    /// Put text back into the composer with the cursor at its end.
     pub fn restore_input(&mut self, text: String) {
         self.input_cursor = text.chars().count();
         self.input = text;
@@ -821,6 +933,50 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn consecutive_connection_requests_wait_for_every_worker_acknowledgement() {
+        let mut app = App::new(40, 10);
+        app.open_channel("srv", "#a");
+        app.begin_connection_change("srv", ConnectionState::Stopped);
+        app.begin_connection_change("srv", ConnectionState::Connecting);
+        app.apply_connection_event(&IrcEvent::ControlApplied("srv".into()));
+        app.apply_connection_event(&IrcEvent::Connection(
+            "srv".into(),
+            ConnectionState::Stopped,
+        ));
+        app.apply_connection_event(&IrcEvent::Channel(
+            "srv".into(),
+            "#a".into(),
+            ConnectionState::Connected,
+        ));
+        assert_eq!(
+            app.connection_state("srv", None),
+            ConnectionState::Connecting
+        );
+        assert_eq!(
+            app.connection_state("srv", Some("#a")),
+            ConnectionState::Connecting
+        );
+        app.apply_connection_event(&IrcEvent::ControlApplied("srv".into()));
+        app.apply_connection_event(&IrcEvent::Connection(
+            "srv".into(),
+            ConnectionState::Connected,
+        ));
+        app.apply_connection_event(&IrcEvent::Channel(
+            "srv".into(),
+            "#a".into(),
+            ConnectionState::Connected,
+        ));
+        assert_eq!(
+            app.connection_state("srv", None),
+            ConnectionState::Connected
+        );
+        assert_eq!(
+            app.connection_state("srv", Some("#a")),
+            ConnectionState::Connected
+        );
+    }
 
     fn msg(nick: &str, text: &str) -> ChatMessage {
         ChatMessage {

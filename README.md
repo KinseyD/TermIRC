@@ -79,17 +79,47 @@ channel in the sidebar opens it. While TermIRC runs, hold `Shift` for the
 terminal's own text selection.
 
 Inputs beginning with `/` after trimming surrounding whitespace are parsed
-as slash commands. Commands are not executed or sent to the IRC server,
-and do not appear in chat or server-console history. A parsed command
-clears the composer; a missing command name keeps the input for editing.
-No parsing feedback is shown in the interface. Parsing outcomes are
-recorded only at DEBUG level in the runtime log, without command contents
-or arguments. This applies in both channels and the server console.
-`//` is not an escape for sending a literal slash.
+as slash commands in both channels and the server console. Supported
+identity and connection commands are:
 
-Two expectations worth setting: opening a channel jumps to its newest
-messages and the view follows new ones while you stay at the bottom; and
-TermIRC never auto-reconnects — after a drop, restart it.
+| Command | Behavior |
+| --- | --- |
+| `/nick <nickname>` | Request a nickname change on the current server; local echoes use the new nickname after the server confirms it. |
+| `/away [reason]` | Set an away message. With no argument, toggle between away (default reason `Away`) and back, using the confirmed away state. |
+| `/back` | Clear away status on the current server. |
+| `/connect [server]` | Connect a stopped server using its configuration key; defaults to the current server. |
+| `/reconnect [server]` | Restart that server's connection, or connect if stopped; defaults to the current server. |
+| `/disconnect [reason]` | Disconnect the current server and cancel automatic retries. |
+| `/quit [reason]` | Alias for `/disconnect`; the application remains open. Use Esc or Ctrl+C to exit TermIRC. |
+
+Server keys are matched case-insensitively. Connection commands use the
+existing configuration; they do not add servers. Successful command
+submission clears the composer. Invalid, unsupported or unavailable
+commands retain the original input and cursor for editing. Slash input
+never becomes chat or a raw console line; `//` is not an escape for sending
+a literal slash. Local command feedback is only recorded at DEBUG level,
+without command contents or arguments, and never adds a status-bar prompt
+or history line. Normal server messages still appear in the server console.
+
+Each server and channel has a status dot:
+
+- **Green:** server registration confirmed, or our JOIN confirmed for a channel.
+- **Blinking grey:** connecting, waiting to retry, or waiting for a channel JOIN.
+- **Red:** stopped, including manual disconnection, exhausted retries or a failed channel JOIN.
+
+Unexpected disconnections automatically retry up to three times, waiting
+1, 2 and 4 seconds. A connection/registration attempt times out after
+30 seconds; a missing channel JOIN confirmation also times out after
+30 seconds. Registration nickname/password rejection or a server ban stops
+automatic retries immediately. A connection stable for 30 seconds resets
+the retry budget. `/connect` or `/reconnect` starts a fresh retry budget
+after stopping. Reconnection retains the confirmed nickname in memory,
+rejoins configured channels and clears away status. Queued messages from a
+previous connection are discarded, never replayed on the new connection.
+
+Opening a channel jumps to its newest messages, and the view follows new
+ones while you stay at the bottom. Histories remain available across
+disconnections.
 
 ## Roadmap
 
@@ -109,7 +139,8 @@ TermIRC never auto-reconnects — after a drop, restart it.
   `~/.config/termirc/config.toml` (see [Configuration](#configuration)).
 - **CJK characters render as boxes** — use Windows Terminal (or run
   `chcp 65001`) with a CJK font.
-- **Nothing arrives after a disconnect** — there is no auto-reconnect by
-  design; restart TermIRC.
+- **A server has a red dot** — check the configuration and runtime log, then
+  use `/connect` or `/reconnect` in that server's console or a channel.
+  A red channel under a green server indicates a failed JOIN, PART or KICK.
 - **Where do the logs live?** Runtime logs (connections, errors; no chat
   content) rotate daily under `~/.config/termirc/logs/`, 7 days kept.
