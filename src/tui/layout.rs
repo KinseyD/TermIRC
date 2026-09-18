@@ -12,7 +12,8 @@
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::message::ChatMessage;
+use crate::core::{Message, MessageContent, MessageId};
+use std::collections::VecDeque;
 
 /// One rendered row of the message list.
 ///
@@ -42,147 +43,291 @@ pub fn nick_column_width(nick: &str) -> u16 {
 /// that no longer fits moves to the next line (leaving at most a one-column
 /// gap). An empty string yields a single empty line.
 pub fn wrap_body(text: &str, width: u16) -> Vec<String> {
+    measure_body(text, width)
+        .into_iter()
+        .map(|range| render_body(text, range))
+        .collect()
+}
+
+/// Retain source ranges independently of the disposable layout-text cache.
+/// Measuring wraps once; drawing any row needs only that row's source slice.
+fn measure_body(text: &str, width: u16) -> Vec<std::ops::Range<usize>> {
     let width = usize::from(width.max(1));
-    let mut lines: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut current_w = 0usize;
-
+    let mut rows = Vec::new();
+    let mut current: Option<std::ops::Range<usize>> = None;
+    let mut columns = 0;
+    let mut offset = 0;
     for word in text.split_whitespace() {
-        let word_w = word.width();
-        if word_w <= width {
-            // The word fits on a line by itself: pack greedily.
-            if current.is_empty() {
-                current_w = word_w;
-                current.push_str(word);
-            } else if current_w + 1 + word_w <= width {
-                current_w += 1 + word_w;
-                current.push(' ');
-                current.push_str(word);
+        let start = offset + text[offset..].find(word).expect("word belongs to source");
+        offset = start + word.len();
+        let word_width = word.width();
+        if word_width <= width {
+            if current.is_none() {
+                current = Some(start..offset);
+                columns = word_width;
+            } else if columns + 1 + word_width <= width {
+                current.as_mut().unwrap().end = offset;
+                columns += 1 + word_width;
             } else {
-                lines.push(std::mem::take(&mut current));
-                current_w = word_w;
-                current.push_str(word);
+                rows.push(current.replace(start..offset).unwrap());
+                columns = word_width;
             }
         } else {
-            // The word is wider than the whole line: hard-split per character.
-            if !current.is_empty() {
-                lines.push(std::mem::take(&mut current));
-                current_w = 0;
+            if let Some(row) = current.take() {
+                rows.push(row);
             }
-            for c in word.chars() {
-                let c_w = UnicodeWidthChar::width(c).unwrap_or(0);
-                if current_w + c_w > width && !current.is_empty() {
-                    lines.push(std::mem::take(&mut current));
-                    current_w = 0;
+            columns = 0;
+            for (byte, character) in word.char_indices() {
+                let char_width = character.width().unwrap_or(0);
+                if columns + char_width > width && current.is_some() {
+                    rows.push(current.take().unwrap());
+                    columns = 0;
                 }
-                current_w += c_w;
-                current.push(c);
+                let end = start + byte + character.len_utf8();
+                current.get_or_insert(start + byte..end).end = end;
+                columns += char_width;
             }
         }
     }
-
-    if !current.is_empty() || lines.is_empty() {
-        lines.push(current);
+    if let Some(row) = current {
+        rows.push(row);
     }
-    lines
+    if rows.is_empty() {
+        rows.push(0..0);
+    }
+    rows
 }
 
-/// Row span `(start, height)` of each message in the same coordinate system as
-/// `layout_messages` (i.e. including the framing separator row above the first
-/// message and the separator rows between messages). The total row count is
-/// the last span end plus one (the trailing framing row), matching
-/// `layout_messages(...).len()` — an empty list yields no spans.
-pub fn message_spans(messages: &[ChatMessage], width: u16) -> Vec<(u16, u16)> {
-    let mut spans = Vec::with_capacity(messages.len());
-    let mut row = 1u16; // the framing separator row above the first message
-    for (i, message) in messages.iter().enumerate() {
-        if i > 0 {
-            row += 1; // blank separator row before this message
+fn render_body(text: &str, range: std::ops::Range<usize>) -> String {
+    let mut result = String::new();
+    for word in text[range].split_whitespace() {
+        if !result.is_empty() {
+            result.push(' ');
         }
-        let indent = if message.nick.is_empty() {
-            0
-        } else {
-            nick_column_width(&message.nick).min(width.saturating_sub(1))
-        };
-        let body_width = width.saturating_sub(indent).max(1);
-        let height = wrap_body(&message.text, body_width).len() as u16;
-        spans.push((row, height));
-        row += height;
+        result.push_str(word);
     }
-    spans
+    result
 }
 
-/// Lay out all messages for a viewport `width` columns wide.
-///
-/// The list is framed by one blank separator row above the first and below the
-/// last message; an empty message list lays out to no rows at all.
-pub fn layout_messages(messages: &[ChatMessage], width: u16) -> Vec<LayoutLine> {
-    let mut lines = Vec::new();
-    if messages.is_empty() {
-        return lines;
-    }
-    let separator = || LayoutLine {
-        indent: 0,
-        nick: None,
-        body: String::new(),
-    };
-    lines.push(separator()); // framing row above the first message
-    for (i, message) in messages.iter().enumerate() {
-        if i > 0 {
-            lines.push(separator());
-        }
-        let indent = if message.nick.is_empty() {
-            0
-        } else {
-            nick_column_width(&message.nick).min(width.saturating_sub(1))
-        };
-        let body_width = width.saturating_sub(indent).max(1);
-        for (j, chunk) in wrap_body(&message.text, body_width).into_iter().enumerate() {
-            if j == 0 {
-                lines.push(LayoutLine {
-                    indent: 0,
-                    nick: (!message.nick.is_empty()).then(|| message.nick.clone()),
-                    body: chunk,
-                });
-            } else {
-                lines.push(LayoutLine {
-                    indent,
-                    nick: None,
-                    body: chunk,
-                });
-            }
-        }
-    }
-    lines.push(separator()); // framing row below the last message
-    lines
+// Test helpers exercise the same layout engine as the viewport.
+#[cfg(test)]
+fn message_spans(messages: &[Message], width: u16) -> Vec<(usize, usize)> {
+    let mut cache = LayoutCache::default();
+    cache.sync(&messages.iter().cloned().collect(), width);
+    cache
+        .entries
+        .iter()
+        .map(|entry| (entry.start, entry.height))
+        .collect()
+}
+
+#[cfg(test)]
+fn layout_messages(messages: &[Message], width: u16) -> Vec<LayoutLine> {
+    let messages = messages.iter().cloned().collect();
+    let mut cache = LayoutCache::default();
+    cache.sync(&messages, width);
+    cache.visible_lines(&messages, 0, cache.total_height())
 }
 
 /// Number of display lines the composer input occupies when hard-wrapped to
 /// `width` columns (at least one line), including a trailing line when the
 /// cursor sits at the end of a full line and needs room to sit on.
 pub fn input_line_count(text: &str, cursor: usize, width: u16) -> usize {
-    let width = usize::from(width.max(1));
-    let total = text.chars().count();
-    if total == 0 {
-        return 1;
+    super::input::InputLayout::new(text, cursor, width)
+        .lines
+        .len()
+}
+
+/// Geometry survives cache eviction, so rendering never measures a message again.
+struct MeasuredMessage {
+    indent: u16,
+    rows: Vec<std::ops::Range<usize>>,
+}
+impl MeasuredMessage {
+    fn new(message: &MessageContent, width: u16) -> Self {
+        let indent = if message.nick.is_empty() {
+            0
+        } else {
+            nick_column_width(&message.nick).min(width.saturating_sub(1))
+        };
+        Self {
+            indent,
+            rows: measure_body(&message.text, width.saturating_sub(indent).max(1)),
+        }
     }
-    let mut lines = total.div_ceil(width);
-    if cursor >= total && total.is_multiple_of(width) {
-        lines += 1;
+    fn line(&self, message: &MessageContent, row: usize) -> LayoutLine {
+        LayoutLine {
+            indent: if row == 0 { 0 } else { self.indent },
+            nick: (row == 0 && !message.nick.is_empty()).then(|| message.nick.clone()),
+            body: render_body(&message.text, self.rows[row].clone()),
+        }
     }
-    lines
+}
+
+#[derive(Default)]
+pub struct LayoutCache {
+    width: Option<u16>,
+    entries: VecDeque<CachedMessage>,
+    total: usize,
+    /// Diagnostic count of complete message layouts; useful for profiling cache invalidation.
+    pub measurements: usize,
+}
+struct CachedMessage {
+    id: MessageId,
+    start: usize,
+    height: usize,
+    measured: MeasuredMessage,
+    lines: Option<Vec<LayoutLine>>,
+}
+impl LayoutCache {
+    pub fn total_height(&self) -> usize {
+        self.total
+    }
+    pub fn span(&self, id: MessageId) -> Option<(usize, usize)> {
+        self.entries
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| (e.start, e.height))
+    }
+    pub fn anchor(&self, row: usize) -> Option<(MessageId, usize)> {
+        self.entries
+            .iter()
+            .find(|e| row < e.start + e.height)
+            .map(|e| (e.id, row.saturating_sub(e.start.saturating_sub(1))))
+            .or_else(|| self.entries.back().map(|e| (e.id, e.height + 1)))
+    }
+    pub fn resolve_anchor(&self, anchor: Option<(MessageId, usize)>) -> Option<usize> {
+        let (id, offset) = anchor?;
+        self.entries
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.start.saturating_sub(1) + offset.min(e.height))
+    }
+    pub fn message_at(&self, row: usize) -> Option<usize> {
+        self.entries
+            .iter()
+            .position(|e| row >= e.start && row < e.start + e.height)
+    }
+    pub fn last_fully_visible(&self, start: usize, end: usize) -> Option<MessageId> {
+        self.entries
+            .iter()
+            .rev()
+            .find(|e| e.start >= start && e.start + e.height <= end)
+            .map(|e| e.id)
+    }
+    pub fn sync(&mut self, messages: &VecDeque<Message>, width: u16) {
+        if self.width != Some(width) {
+            self.entries.clear();
+            self.width = Some(width);
+        }
+        if let Some(first) = messages.front() {
+            while self.entries.front().is_some_and(|e| e.id != first.id) {
+                self.entries.pop_front();
+            }
+        } else {
+            self.entries.clear();
+        }
+        for message in messages.iter().skip(self.entries.len()) {
+            let measured = MeasuredMessage::new(&message.content, width);
+            let lines: Vec<_> = (0..measured.rows.len())
+                .map(|row| measured.line(&message.content, row))
+                .collect();
+            self.measurements += 1;
+            self.entries.push_back(CachedMessage {
+                id: message.id,
+                start: 0,
+                height: lines.len(),
+                measured,
+                lines: Some(lines),
+            });
+        }
+        let mut row = 1;
+        for entry in &mut self.entries {
+            entry.start = row;
+            row += entry.height + 1;
+        }
+        self.total = if self.entries.is_empty() { 0 } else { row };
+    }
+    /// Keep visible messages preferentially; this never evicts history or row metrics.
+    pub fn prune(&mut self, offset: usize, height: usize, budget: usize) {
+        let mut cached: usize = self
+            .entries
+            .iter()
+            .filter(|e| e.lines.is_some())
+            .map(|e| e.height)
+            .sum();
+        for visible in [false, true] {
+            for entry in &mut self.entries {
+                let intersects =
+                    entry.start < offset + height && entry.start + entry.height > offset;
+                if cached > budget && intersects == visible && entry.lines.is_some() {
+                    cached -= entry.height;
+                    entry.lines = None;
+                }
+            }
+        }
+    }
+    pub fn visible_lines(
+        &self,
+        messages: &VecDeque<Message>,
+        offset: usize,
+        height: usize,
+    ) -> Vec<LayoutLine> {
+        let count = height.min(self.total.saturating_sub(offset));
+        let mut result = vec![
+            LayoutLine {
+                indent: 0,
+                nick: None,
+                body: String::new()
+            };
+            count
+        ];
+        for (entry, message) in self.entries.iter().zip(messages) {
+            if entry.start >= offset + count {
+                break;
+            }
+            if entry.start + entry.height <= offset {
+                continue;
+            }
+            let start = entry.start.max(offset);
+            let end = (entry.start + entry.height).min(offset + count);
+            for row in start..end {
+                result[row - offset] = match &entry.lines {
+                    Some(lines) => lines[row - entry.start].clone(),
+                    None => entry.measured.line(&message.content, row - entry.start),
+                };
+            }
+        }
+        result
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn msg(nick: &str, text: &str) -> ChatMessage {
-        ChatMessage {
-            server: "srv".to_string(),
-            channel: "#c".to_string(),
-            nick: nick.to_string(),
-            text: text.to_string(),
+    #[test]
+    fn discarded_text_cache_renders_the_same_visible_rows_without_remeasurement() {
+        let messages = VecDeque::from([
+            msg("甲", "  hello   世界 abcdefghijklmnopqrstuvwxyz\tend  "),
+            msg("", "second message with other words"),
+        ]);
+        let mut cache = LayoutCache::default();
+        cache.sync(&messages, 9);
+        let expected = cache.visible_lines(&messages, 2, 6);
+        let total = cache.total_height();
+        cache.prune(2, 6, 0);
+        assert!(cache.entries.iter().all(|entry| entry.lines.is_none()));
+        assert_eq!(cache.visible_lines(&messages, 2, 6), expected);
+        assert_eq!(cache.total_height(), total);
+        assert_eq!(cache.measurements, 2);
+    }
+
+    fn msg(nick: &str, text: &str) -> Message {
+        Message {
+            id: MessageId(1),
+            buffer: crate::core::BufferId(1),
+            content: MessageContent::chat(nick, text),
         }
     }
 
@@ -450,7 +595,7 @@ mod tests {
 
         // Act
         let spans = message_spans(&messages, 24);
-        let total: u16 = spans.last().map(|&(s, h)| s + h).unwrap_or(0);
+        let total: usize = spans.last().map(|&(s, h)| s + h).unwrap_or(0);
 
         // Assert: the trailing framing row adds one row past the last span end.
         assert_eq!(total as usize + 1, layout_messages(&messages, 24).len());

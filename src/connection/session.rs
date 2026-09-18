@@ -2,11 +2,9 @@
 
 use crate::{
     config::ServerConfig,
-    irc::{
-        ConnectionCommand, ConnectionState, IrcEvent, OutgoingMessage, RetryPolicy,
-        build_client_config,
-    },
-    message::ChatMessage,
+    connection::{ConnectionState, IrcEvent, RetryPolicy, build_client_config},
+    core::{ConnectionCommand, OutgoingMessage},
+    protocol::{decode_message, encode_outgoing, validate_control},
 };
 use futures_util::StreamExt;
 use irc::client::{Client, ClientStream};
@@ -43,6 +41,10 @@ pub(crate) async fn run(
         tokio::select! {
             biased;
             command = control.recv() => {
+                if command.as_ref().is_some_and(|command| validate_control(command).is_err()) {
+                    tracing::debug!(target: "termirc::slash", reason = "invalid_control", "control rejected");
+                    continue;
+                }
                 acknowledge(&tx, &label, command.as_ref());
                 match command {
                 None => break,
@@ -117,6 +119,10 @@ async fn session(
         tokio::select! {
             biased;
             command = control.recv() => {
+                if command.as_ref().is_some_and(|command| validate_control(command).is_err()) {
+                    tracing::debug!(target: "termirc::slash", reason = "invalid_control", "control rejected");
+                    continue;
+                }
                 acknowledge(tx, label, command.as_ref());
                 match command {
                 None => return End::Shutdown,
@@ -147,6 +153,10 @@ async fn session(
         tokio::select! {
             biased;
             command = control.recv() => {
+                if command.as_ref().is_some_and(|command| validate_control(command).is_err()) {
+                    tracing::debug!(target: "termirc::slash", reason = "invalid_control", "control rejected");
+                    continue;
+                }
                 acknowledge(tx, label, command.as_ref());
                 let wire = match command {
                     None => { close(&client, &mut stream, "").await; return End::Shutdown; }
@@ -173,15 +183,14 @@ async fn session(
             outgoing = outgoing.recv() => {
                 let Some(message) = outgoing else { close(&client, &mut stream, "").await; return End::Shutdown; };
                 if registered_at.is_none() { continue; }
-                let result = match message {
-                    OutgoingMessage::Privmsg { target, text, .. } => client.send_privmsg(target, text),
-                    OutgoingMessage::Raw { line, .. } => {
-                        let mut parts = line.split_whitespace();
-                        let command = parts.next().unwrap_or_default().to_string();
-                        client.send(Command::Raw(command, parts.map(str::to_string).collect()))
+                let wire = match encode_outgoing(&message) {
+                    Ok(wire) => wire,
+                    Err(error) => {
+                        tracing::debug!(target: "termirc::slash", %error, "outgoing message rejected");
+                        continue;
                     }
                 };
-                if result.is_err() { return failed(false, registered_at); }
+                if client.send(wire).is_err() { return failed(false, registered_at); }
             },
             message = stream.next() => {
                 let message = match message {
@@ -205,7 +214,12 @@ async fn session(
                         let _ = tx.send(IrcEvent::Away(label.into(), false));
                         state(tx, label, ConnectionState::Connected);
                     }
-                    Command::Response(Response::ERR_PASSWDMISMATCH | Response::ERR_YOUREBANNEDCREEP, _) => return failed(true, registered_at),
+                    Command::Response(Response::ERR_PASSWDMISMATCH | Response::ERR_YOUREBANNEDCREEP, _) => {
+                        if let Some(message) = decode_message(&message, label, channels) {
+                            let _ = tx.send(IrcEvent::Message(message));
+                        }
+                        return failed(true, registered_at);
+                    },
                     Command::NICK(nick) if own_message(&message, &server.nickname) => {
                         server.nickname.clone_from(nick);
                         let _ = tx.send(IrcEvent::Nickname(label.into(), nick.clone()));
@@ -232,8 +246,7 @@ async fn session(
                     Command::ERROR(_) => return failed(false, registered_at),
                     _ => {}
                 }
-                if let Some(chat) = ChatMessage::from_proto(&message, label, channels)
-                    .or_else(|| ChatMessage::console_from_proto(&message, label)) {
+                if let Some(chat) = decode_message(&message, label, channels) {
                     let _ = tx.send(IrcEvent::Message(chat));
                 }
             }

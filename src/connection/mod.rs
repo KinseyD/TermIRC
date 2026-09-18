@@ -6,13 +6,15 @@
 //! way through a bounded tokio channel (`OutgoingMessage`). One thread is
 //! spawned per configured server, each joining all of that server's channels.
 
+mod session;
+
 use std::sync::mpsc;
 use std::thread;
 
 use irc::client::prelude::Config as IrcClientConfig;
 
 use crate::config::ServerConfig;
-use crate::message::ChatMessage;
+use crate::core::{ConnectionCommand, OutgoingMessage, RoutedMessage};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConnectionState {
@@ -20,16 +22,6 @@ pub enum ConnectionState {
     Connected,
     #[default]
     Stopped,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConnectionCommand {
-    Connect,
-    Reconnect,
-    Disconnect(String),
-    Nick(String),
-    Away(Option<String>),
-    Back,
 }
 
 pub struct ConnectionHandle {
@@ -64,31 +56,13 @@ pub enum IrcEvent {
     Nickname(String, String),
     Away(String, bool),
     /// A chat message received from one of the joined channels.
-    Message(ChatMessage),
+    Message(RoutedMessage),
     /// Informational status for `server` (the config key), e.g. "connected
     /// to irc.ppy.sh".
     Status(String, String),
     /// A failed attempt for `server`; a subsequent state event indicates
     /// whether the worker is retrying or stopped.
     Error(String, String),
-}
-
-/// A message the user wants to send through one of our connections.
-///
-/// `server` is the config key used by the UI to pick the right connection.
-/// `Privmsg` sends `text` to `target` (a channel); `Raw` sends `line` to the
-/// server itself as a raw IRC command (e.g. `JOIN #foo`, `WHOIS nick`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OutgoingMessage {
-    Privmsg {
-        server: String,
-        target: String,
-        text: String,
-    },
-    Raw {
-        server: String,
-        line: String,
-    },
 }
 
 /// How many messages may wait in flight to a connection before `try_send`
@@ -137,7 +111,7 @@ pub fn spawn_irc_with_policy(
             .enable_all()
             .build()
         {
-            Ok(runtime) => runtime.block_on(crate::connection::run(
+            Ok(runtime) => runtime.block_on(session::run(
                 server, label, channels, tx, policy, out_rx, control_rx,
             )),
             Err(_) => {

@@ -3,9 +3,9 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use termirc::config::ServerConfig;
-use termirc::irc::{
-    ConnectionCommand, ConnectionState, IrcEvent, RetryPolicy, spawn_irc_with_policy,
-};
+use termirc::connection::{ConnectionState, IrcEvent, RetryPolicy, spawn_irc_with_policy};
+
+use termirc::core::ConnectionCommand;
 
 const WAIT: Duration = Duration::from_secs(3);
 
@@ -179,7 +179,7 @@ fn nick_away_and_disconnect_use_protocol_without_chat_echo() {
     assert!(
         !feedback
             .iter()
-            .any(|e| matches!(e, IrcEvent::Message(m) if m.text == "Away")),
+            .any(|e| matches!(e, IrcEvent::Message(m) if m.content.text == "Away")),
         "away command feedback leaked into console"
     );
     handle
@@ -357,7 +357,7 @@ fn cancelling_backoff_prevents_future_attempts() {
 
 #[test]
 fn unexpected_disconnect_reconnects_without_replaying_queued_chat() {
-    use termirc::irc::OutgoingMessage;
+    use termirc::core::OutgoingMessage;
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let (tx, rx) = mpsc::channel();
     let (worker, handle) = spawn_irc_with_policy(
@@ -406,6 +406,120 @@ fn unexpected_disconnect_reconnects_without_replaying_queued_chat() {
             break;
         }
     }
+    drop(handle);
+    worker.join().unwrap();
+}
+
+#[test]
+fn channel_errors_are_delivered_once_with_a_console_fallback() {
+    use termirc::core::{BufferKind, MessageKind};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let (tx, rx) = mpsc::channel();
+    let (worker, handle) = spawn_irc_with_policy(
+        config(listener.local_addr().unwrap().port()),
+        "srv".into(),
+        vec!["#ok".into(), "#bad".into()],
+        tx,
+        policy(),
+    );
+    let (mut socket, _) = listener.accept().unwrap();
+    let mut reader = BufReader::new(socket.try_clone().unwrap());
+    registered(&mut reader);
+    socket
+        .write_all(b":mock 001 test :Welcome\r\n:mock 376 test :End\r\n")
+        .unwrap();
+    line(&mut reader, "JOIN #bad");
+    receive_until(&rx, |event| {
+        matches!(event, IrcEvent::Connection(_, ConnectionState::Connected))
+    });
+    socket.write_all(b":mock 475 test #bad :Need a key\r\n:mock 404 test #ok :Cannot send\r\n:mock 475 test #unknown :Unknown channel key\r\n:mock NOTICE * :done\r\n").unwrap();
+    let events = receive_until(
+        &rx,
+        |event| matches!(event, IrcEvent::Message(message) if message.content.text == "done"),
+    );
+    assert_eq!(events.iter().filter(|event| matches!(event, IrcEvent::Channel(_, channel, ConnectionState::Stopped) if channel == "#bad")).count(), 1);
+    let errors: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            IrcEvent::Message(message)
+                if matches!(message.content.kind, MessageKind::Error { .. }) =>
+            {
+                Some(message)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(errors.len(), 3);
+    for (message, target, text) in [
+        (
+            errors[0],
+            BufferKind::Channel("#bad".into()),
+            "475 #bad Need a key",
+        ),
+        (
+            errors[1],
+            BufferKind::Channel("#ok".into()),
+            "404 #ok Cannot send",
+        ),
+        (
+            errors[2],
+            BufferKind::Server,
+            "475 #unknown Unknown channel key",
+        ),
+    ] {
+        assert_eq!(message.target, target);
+        assert_eq!(message.content.text, text);
+        assert!(message.content.nick.is_empty());
+    }
+    drop(handle);
+    worker.join().unwrap();
+}
+
+#[test]
+fn invalid_direct_controls_do_not_reach_the_wire_or_disconnect() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let (tx, rx) = mpsc::channel();
+    let (worker, handle) = spawn_irc_with_policy(
+        config(listener.local_addr().unwrap().port()),
+        "srv".into(),
+        vec![],
+        tx,
+        policy(),
+    );
+    let (mut socket, _) = listener.accept().unwrap();
+    let mut reader = BufReader::new(socket.try_clone().unwrap());
+    registered(&mut reader);
+    socket
+        .write_all(b":mock 001 test :Welcome\r\n:mock 376 test :End\r\n")
+        .unwrap();
+    receive_until(&rx, |event| {
+        matches!(event, IrcEvent::Connection(_, ConnectionState::Connected))
+    });
+    for command in [
+        ConnectionCommand::Nick("bad\r\nQUIT :injected".into()),
+        ConnectionCommand::Away(Some("中".repeat(200))),
+        ConnectionCommand::Disconnect("a".repeat(506)),
+        ConnectionCommand::Nick("sentinel".into()),
+    ] {
+        handle.control.blocking_send(command).unwrap();
+    }
+    loop {
+        let mut value = String::new();
+        assert_ne!(reader.read_line(&mut value).unwrap(), 0);
+        assert!(
+            !value.starts_with("AWAY") && !value.starts_with("QUIT"),
+            "invalid control sent: {value}"
+        );
+        if value.starts_with("NICK") {
+            assert_eq!(value, "NICK sentinel\r\n");
+            break;
+        }
+    }
+    assert!(
+        !rx.try_iter()
+            .any(|event| matches!(event, IrcEvent::ControlApplied(_)))
+    );
     drop(handle);
     worker.join().unwrap();
 }

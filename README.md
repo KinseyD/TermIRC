@@ -92,7 +92,8 @@ identity and connection commands are:
 | `/disconnect [reason]` | Disconnect the current server and cancel automatic retries. |
 | `/quit [reason]` | Alias for `/disconnect`; the application remains open. Use Esc or Ctrl+C to exit TermIRC. |
 
-Server keys are matched case-insensitively. Connection commands use the
+Server keys are matched case-insensitively; keys that differ only in ASCII
+letter case cannot coexist in one configuration. Connection commands use the
 existing configuration; they do not add servers. Successful command
 submission clears the composer. Invalid, unsupported or unavailable
 commands retain the original input and cursor for editing. Slash input
@@ -118,8 +119,55 @@ rejoins configured channels and clears away status. Queued messages from a
 previous connection are discarded, never replayed on the new connection.
 
 Opening a channel jumps to its newest messages, and the view follows new
-ones while you stay at the bottom. Histories remain available across
-disconnections.
+ones while you stay at the bottom. Returning to a previously opened conversation
+restores its reading position. Each server console and channel keeps its own
+draft and editing cursor. Histories remain available across disconnections,
+with up to 5,000 messages per conversation; resizing never deletes messages.
+
+Outgoing IRC lines are limited to 512 UTF-8 bytes including the command,
+target and terminating CRLF. Oversized lines retain the full draft and cursor
+for editing; they are not split or queued. Raw console commands preserve the
+spaces within their trailing parameter. Local echoes mean the message was
+queued, not acknowledged by the server. Server errors for configured channels
+appear there once as system messages; other errors appear in the server console.
+
+## Architecture and development
+
+TermIRC remains a single crate. Its internal boundaries are:
+
+| Module | Responsibility |
+| --- | --- |
+| `core` | Stable server, buffer and message identities; typed conversations, message metadata, drafts and outbound requests. Uses only the standard library. |
+| `history` | Bounded message queues per buffer; returns the IDs removed by eviction. |
+| `protocol` | IRC decoding, tags, structured server errors, wire encoding and byte limits. |
+| `connection` | One worker per server, bounded queues, confirmed connection state, retries and cancellation. |
+| `application` | Session registration, input submission, command execution, event routing and unconfirmed local echoes. |
+| `tui` | Focus, editing gestures, mouse input, layout, view anchors and rendering. |
+
+`config` and `logging` remain independent services; `main` assembles resources
+and restores the terminal. Core and history have no terminal or IRC-library
+dependencies. Layout uses message IDs and `usize` row coordinates. Measured row
+ranges survive layout-text cache eviction; the 50,000-row cache budget does not
+limit history. Rendering constructs text only for visible rows. The composer
+uses the same display-width geometry for wrapping, sizing and mouse regions.
+
+The query buffer type is reserved for future private conversations. Private
+chat, dynamic channels, persistent history, SASL and IRCv3 capability negotiation
+are not implemented in this refactor.
+
+Run local validation with cached dependencies:
+
+```sh
+cargo test --locked --offline --all-targets
+cargo fmt --all --check
+cargo clippy --all-targets --locked --offline -- -D warnings
+git diff --check
+cargo run --release --locked --offline --example layout_benchmark
+```
+
+Network tests use mock servers bound to `127.0.0.1`; the benchmark reads no
+user configuration and opens no connections. See the
+[refactor record](docs/refactor-2026-09-17.md) for regression coverage and measurements.
 
 ## Roadmap
 

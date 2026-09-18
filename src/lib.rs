@@ -1,16 +1,16 @@
-//! termirc: a receive-only terminal IRC client.
+//! termirc: a terminal IRC client.
 //!
-//! The library holds all logic (config, IRC adapter, layout, app state, UI)
-//! so it can be exercised by both unit tests and integration tests; the binary
-//! in `main.rs` is a thin wiring layer.
+//! Core identities and histories are independent of the terminal frontend.
+//! Protocol conversion, connection workers, application coordination, and TUI
+//! presentation form separate boundaries; main only assembles resources.
 
-pub mod app;
 pub mod command;
 pub mod config;
-mod connection;
-pub mod irc;
-pub mod layout;
+pub mod connection;
 pub mod logging;
-pub mod message;
-pub mod mouse;
-pub mod ui;
+
+pub mod application;
+pub mod core;
+pub mod history;
+pub mod protocol;
+pub mod tui;
