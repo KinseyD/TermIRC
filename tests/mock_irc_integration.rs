@@ -11,8 +11,8 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use termirc::config::ServerConfig;
-use termirc::irc::{IrcEvent, OutgoingMessage, spawn_irc};
-use termirc::message::ChatMessage;
+use termirc::connection::{IrcEvent, spawn_irc};
+use termirc::core::{BufferKind, DeliveryState, MessageKind, OutgoingMessage, ServerId};
 
 const RECV_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -53,7 +53,7 @@ fn spawn_mock_server() -> (u16, mpsc::Receiver<String>) {
             if reader.read_line(&mut line).unwrap_or(0) == 0 {
                 break; // client disconnected
             }
-            let trimmed = line.trim_end().to_string();
+            let trimmed = line.trim_end_matches(['\r', '\n']).to_string();
             if lines_tx.send(trimmed.clone()).is_err() {
                 break;
             }
@@ -186,12 +186,12 @@ fn forwards_privmsg_as_chat_message() {
     );
 
     // Assert: skipping the status event and the console-bound greeting
-    // numerics, the PRIVMSG arrives as a ChatMessage.
+    // numerics, the PRIVMSG arrives as a typed channel message.
     let deadline = std::time::Instant::now() + RECV_TIMEOUT;
     let mut chat = None;
     while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
         match rx.recv_timeout(remaining) {
-            Ok(IrcEvent::Message(message)) if !message.channel.is_empty() => {
+            Ok(IrcEvent::Message(message)) if matches!(message.target, BufferKind::Channel(_)) => {
                 chat = Some(message);
                 break;
             }
@@ -199,15 +199,13 @@ fn forwards_privmsg_as_chat_message() {
             Err(_) => break,
         }
     }
-    assert_eq!(
-        chat,
-        Some(ChatMessage {
-            server: "osu_irc".to_string(),
-            channel: "#test".to_string(),
-            nick: "alice".to_string(),
-            text: "hello world".to_string(),
-        })
-    );
+    let chat = chat.expect("channel message was not delivered");
+    assert_eq!(chat.server, ServerId::new("osu_irc"));
+    assert_eq!(chat.target, BufferKind::Channel("#test".into()));
+    assert_eq!(chat.content.nick, "alice");
+    assert_eq!(chat.content.text, "hello world");
+    assert_eq!(chat.content.kind, MessageKind::Chat);
+    assert_eq!(chat.content.delivery, DeliveryState::Received);
 }
 
 #[test]
@@ -225,14 +223,14 @@ fn server_replies_land_in_the_console_view() {
     );
 
     // Assert: skipping the status event, the greeting numerics arrive
-    // as console-bound messages (empty channel and nick) whose text is
+    // as server-buffer messages (empty nickname) whose text is
     // the payload only — prefix, numeric, and own nick stripped.
     let deadline = std::time::Instant::now() + RECV_TIMEOUT;
     let mut welcome = None;
     while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
         match rx.recv_timeout(remaining) {
-            Ok(IrcEvent::Message(message)) if message.channel.is_empty() => {
-                if message.text.starts_with("Welcome to the Mock") {
+            Ok(IrcEvent::Message(message)) if message.target == BufferKind::Server => {
+                if message.content.text.starts_with("Welcome to the Mock") {
                     welcome = Some(message);
                     break;
                 }
@@ -241,15 +239,12 @@ fn server_replies_land_in_the_console_view() {
             Err(_) => break,
         }
     }
-    assert_eq!(
-        welcome,
-        Some(ChatMessage {
-            server: "osu_irc".to_string(),
-            channel: String::new(),
-            nick: String::new(),
-            text: "Welcome to the Mock IRC Network".to_string(),
-        })
-    );
+    let welcome = welcome.expect("server greeting was not delivered");
+    assert_eq!(welcome.server, ServerId::new("osu_irc"));
+    assert_eq!(welcome.target, BufferKind::Server);
+    assert!(welcome.content.nick.is_empty());
+    assert_eq!(welcome.content.text, "Welcome to the Mock IRC Network");
+    assert_eq!(welcome.content.kind, MessageKind::Console);
 }
 
 #[test]
@@ -273,8 +268,8 @@ fn channel_param_replies_stay_out_of_the_console() {
     while !chat && let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now())
     {
         match rx.recv_timeout(remaining) {
-            Ok(IrcEvent::Message(m)) if !m.channel.is_empty() => chat = true,
-            Ok(IrcEvent::Message(m)) => console.push(m.text),
+            Ok(IrcEvent::Message(m)) if matches!(m.target, BufferKind::Channel(_)) => chat = true,
+            Ok(IrcEvent::Message(m)) => console.push(m.content.text),
             Ok(_) => {}
             Err(_) => break,
         }
@@ -416,9 +411,15 @@ fn reports_error_when_connection_is_refused() {
 
     // Assert: the failed connect surfaces as an Error event tagged with the
     // server's config key, not silence.
-    match rx.recv_timeout(RECV_TIMEOUT) {
-        Ok(IrcEvent::Error(server, _)) => assert_eq!(server, "osu_irc"),
-        other => panic!("expected IrcEvent::Error, got {other:?}"),
+    loop {
+        match rx.recv_timeout(RECV_TIMEOUT) {
+            Ok(IrcEvent::Error(server, _)) => {
+                assert_eq!(server, "osu_irc");
+                break;
+            }
+            Ok(_) => continue,
+            other => panic!("expected IrcEvent::Error, got {other:?}"),
+        }
     }
 }
 
@@ -437,6 +438,7 @@ fn outgoing_message_is_sent_as_privmsg_on_the_wire() {
 
     // Act: submit a message through the outgoing channel.
     sender
+        .outgoing
         .blocking_send(OutgoingMessage::Privmsg {
             server: "osu_irc".to_string(),
             target: "#test".to_string(),
@@ -467,6 +469,7 @@ fn raw_line_is_sent_verbatim_on_the_wire() {
 
     // Act: submit a raw console line through the outgoing channel.
     sender
+        .outgoing
         .blocking_send(OutgoingMessage::Raw {
             server: "osu_irc".to_string(),
             line: "WHOIS test".to_string(),
@@ -498,19 +501,84 @@ fn raw_line_marks_a_colon_last_param_as_trailing() {
     // ':' (the client's own keepalive PING carries a bare token, so filter
     // on the colon form).
     sender
+        .outgoing
         .blocking_send(OutgoingMessage::Raw {
             server: "osu_irc".to_string(),
             line: "PING :smoke".to_string(),
         })
         .unwrap();
-    let lines = collect_client_lines_until(&lines_rx, |l| l.starts_with("PING :"));
+    let lines = collect_client_lines_until(&lines_rx, |l| l.contains("smoke"));
 
-    // Assert: the irc crate's `stringify` marks a ':'-prefixed last param
-    // as the trailing param by prefixing another ':' — crate-inherent
-    // behavior that keeps the param a single token. Last params without a
-    // leading ':' go out verbatim.
+    // The colon introduces the trailing parameter; it is not part of it.
     assert!(
-        lines.iter().any(|l| l == "PING ::smoke"),
-        "no PING ::smoke in {lines:?}"
+        lines.iter().any(|l| {
+            let message: irc::proto::Message = l.parse().unwrap();
+            matches!(message.command, irc::proto::Command::PING(token, None) if token == "smoke")
+        }),
+        "PING token was changed: {lines:?}"
     );
+}
+
+#[test]
+fn raw_trailing_parameter_retains_spaces_and_colon_semantics() {
+    let (port, lines_rx) = spawn_mock_server();
+    let (tx, _rx) = mpsc::channel();
+    let (_worker, sender) = spawn_irc(
+        server_config_for(port),
+        "osu_irc".into(),
+        server_config_for(port).channels,
+        tx,
+    );
+    collect_client_lines_until(&lines_rx, |line| line.starts_with("JOIN"));
+    sender
+        .outgoing
+        .blocking_send(OutgoingMessage::Raw {
+            server: "osu_irc".into(),
+            line: "PRIVMSG #test :hello  world  ".into(),
+        })
+        .unwrap();
+    let lines = collect_client_lines_until(&lines_rx, |line| line.starts_with("PRIVMSG"));
+    assert!(
+        lines
+            .iter()
+            .any(|line| line == "PRIVMSG #test :hello  world  "),
+        "changed tail: {lines:?}"
+    );
+}
+
+#[test]
+fn invalid_direct_queue_messages_are_skipped_without_closing_connection() {
+    let (port, lines_rx) = spawn_mock_server();
+    let (tx, _rx) = mpsc::channel();
+    let (_worker, sender) = spawn_irc(
+        server_config_for(port),
+        "osu_irc".into(),
+        server_config_for(port).channels,
+        tx,
+    );
+    collect_client_lines_until(&lines_rx, |line| line.starts_with("JOIN"));
+    for text in ["中".repeat(512), "bad\r\nPRIVMSG #test :injected".into()] {
+        sender
+            .outgoing
+            .blocking_send(OutgoingMessage::Privmsg {
+                server: "osu_irc".into(),
+                target: "#test".into(),
+                text,
+            })
+            .unwrap();
+    }
+    sender
+        .outgoing
+        .blocking_send(OutgoingMessage::Privmsg {
+            server: "osu_irc".into(),
+            target: "#test".into(),
+            text: "sentinel".into(),
+        })
+        .unwrap();
+    let lines = collect_client_lines_until(&lines_rx, |line| line.contains("sentinel"));
+    let chat: Vec<_> = lines
+        .iter()
+        .filter(|line| line.starts_with("PRIVMSG"))
+        .collect();
+    assert_eq!(chat, vec!["PRIVMSG #test sentinel"]);
 }

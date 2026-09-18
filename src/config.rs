@@ -1,10 +1,13 @@
 //! Configuration loading for termirc.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::Context as _;
 use indexmap::IndexMap;
 use serde::Deserialize;
+
+use crate::core::ServerId;
 
 /// Per-server connection settings, as written in the `[servers.<name>]` tables.
 #[derive(Clone, Deserialize)]
@@ -53,7 +56,16 @@ pub struct Config {
 impl Config {
     /// Parse configuration from a TOML string.
     pub fn parse(content: &str) -> anyhow::Result<Config> {
-        Ok(toml::from_str(content)?)
+        let config: Config = toml::from_str(content)?;
+        let mut names = HashMap::new();
+        for name in config.servers.keys() {
+            if let Some(previous) = names.insert(ServerId::new(name), name) {
+                anyhow::bail!(
+                    "server names {previous:?} and {name:?} conflict (ASCII case-insensitive)"
+                );
+            }
+        }
+        Ok(config)
     }
 
     /// Load and parse configuration from a file path.
@@ -258,5 +270,33 @@ channels = ["#osu"]
         assert!(debug.contains("<redacted>"));
         assert!(debug.contains("alice"));
         assert!(debug.contains("irc.example.org"));
+    }
+
+    #[test]
+    fn parse_rejects_case_insensitive_server_name_collisions_without_credentials() {
+        let content = r##"
+[servers.Network]
+username = "alice"
+nickname = "alice"
+password = "do-not-print-this-token"
+server = "irc.example.org"
+port = 6667
+channels = ["#chat"]
+
+[servers.network]
+username = "bob"
+nickname = "bob"
+password = "second-private-token"
+server = "other.example.org"
+port = 6667
+channels = ["#chat"]
+"##;
+
+        let error = Config::parse(content).expect_err("ambiguous server keys must be rejected");
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains("Network"));
+        assert!(diagnostic.contains("network"));
+        assert!(!diagnostic.contains("do-not-print-this-token"));
+        assert!(!diagnostic.contains("second-private-token"));
     }
 }

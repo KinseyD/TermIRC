@@ -1,8 +1,7 @@
 //! Mouse hit-testing: map a screen cell to the region under the pointer.
 
-use crate::ui::{GAP_ROWS, HORIZONTAL_PAD, SEPARATOR_GAP, SIDEBAR_WIDTH};
+use super::render::ScreenGeometry;
 
-/// What the mouse pointer (or wheel) is over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseTarget {
     /// Visible row `i` of the sidebar (0 = first server header).
@@ -22,31 +21,16 @@ pub enum MouseTarget {
 ///
 /// `composer_rows` is the composer's height in rows (`ui::composer_height`
 /// for the current input); 0 on the welcome page, which has no composer.
-pub fn hit(x: u16, y: u16, screen_w: u16, screen_h: u16, composer_rows: u16) -> MouseTarget {
-    if y >= screen_h || x >= screen_w {
-        return MouseTarget::None;
+pub fn hit(x: u16, y: u16, g: &ScreenGeometry) -> MouseTarget {
+    let point = ratatui::layout::Position::new(x, y);
+    if g.sidebar.contains(point) {
+        return MouseTarget::SidebarRow(usize::from(y - g.sidebar.y));
     }
-    if x < SIDEBAR_WIDTH {
-        // Sidebar rows render directly on screen rows 0.. (ui::inset pads
-        // columns only); row bounds are validated by the caller against
-        // sidebar_rows().len().
-        return MouseTarget::SidebarRow(usize::from(y));
-    }
-    let main_x = SIDEBAR_WIDTH + SEPARATOR_GAP;
-    if x < main_x {
-        return MouseTarget::None; // the │ separator and its 1-col gap
-    }
-    let composer_top = screen_h.saturating_sub(GAP_ROWS + composer_rows);
-    // The composer owns [composer_top, composer_top + composer_rows) — the
-    // GAP_ROWS below it (fade + blank) are not part of it.
-    if composer_rows > 0 && y >= composer_top && y < composer_top + composer_rows {
+    if g.composer.contains(point) {
         return MouseTarget::Composer;
     }
-    // Message pane: the main column inset by HORIZONTAL_PAD each side, from
-    // the top of the screen down to the composer (or the gap on welcome).
-    let right_edge = screen_w.saturating_sub(HORIZONTAL_PAD);
-    if x >= main_x + HORIZONTAL_PAD && x < right_edge && y < composer_top {
-        return MouseTarget::MessageRow(y);
+    if g.messages.contains(point) {
+        return MouseTarget::MessageRow(y - g.messages.y);
     }
     MouseTarget::None
 }
@@ -54,6 +38,10 @@ pub fn hit(x: u16, y: u16, screen_w: u16, screen_h: u16, composer_rows: u16) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn hit(x: u16, y: u16, w: u16, h: u16, composer_rows: u16) -> MouseTarget {
+        let g = crate::tui::render::geometry(w, h, "", 0, composer_rows > 0);
+        super::hit(x, y, &g)
+    }
 
     // A 50x10 screen with a 4-row composer: the message pane owns rows
     // 0..=3 of the main column; composer rows 4..=7; gap rows 8..=9.
@@ -111,10 +99,10 @@ mod tests {
     }
 
     #[test]
-    fn welcome_page_without_composer_extends_the_pane_to_the_gap() {
-        // composer_rows = 0: pane rows go down to screen_h - GAP_ROWS.
+    fn welcome_page_uses_the_full_message_area() {
+        // The welcome page has neither composer nor gap.
         assert_eq!(hit(26, 5, W, H, 0), MouseTarget::MessageRow(5));
-        assert_eq!(hit(26, 8, W, H, 0), MouseTarget::None); // gap rows
-        assert_eq!(hit(26, 9, W, H, 0), MouseTarget::None);
+        assert_eq!(hit(26, 8, W, H, 0), MouseTarget::MessageRow(8)); // full welcome pane
+        assert_eq!(hit(26, 9, W, H, 0), MouseTarget::MessageRow(9));
     }
 }

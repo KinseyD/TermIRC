@@ -17,13 +17,13 @@
 
 use ratatui::{
     Frame,
-    layout::{Constraint, Layout, Rect},
+    layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::Paragraph,
 };
 
-use crate::app::{App, Focus};
+use crate::tui::{App, Focus};
 
 const NICK_STYLE: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
 
@@ -80,26 +80,111 @@ pub struct Chrome<'a> {
 
 /// Convert the app's laid-out rows into ratatui `Text`.
 ///
-/// Borrows the row bodies instead of cloning them: the `Paragraph` only needs
-/// the text for the duration of the render call, so per-frame allocations stay
-/// flat no matter how much scrollback is held.
-pub fn build_text(app: &App) -> Text<'_> {
-    let lines: Vec<Line<'_>> = app
-        .lines()
-        .iter()
-        .map(|row| match row.nick.as_ref() {
-            Some(nick) => Line::from(vec![
-                Span::styled(format!("{nick}: "), NICK_STYLE),
-                Span::raw(row.body.as_str()),
-            ]),
-            None if row.body.is_empty() => Line::from(""),
-            None => Line::from(vec![
-                Span::raw(" ".repeat(usize::from(row.indent))),
-                Span::raw(row.body.as_str()),
-            ]),
-        })
-        .collect();
-    Text::from(lines)
+/// Owns only the visible rows, so per-frame text allocations depend on the
+/// viewport size rather than the amount of scrollback.
+pub fn build_text(app: &App) -> Text<'static> {
+    Text::from(
+        app.visible_lines()
+            .into_iter()
+            .map(|row| match row.nick {
+                Some(nick) => Line::from(vec![
+                    Span::styled(format!("{nick}: "), NICK_STYLE),
+                    Span::raw(row.body),
+                ]),
+                None if row.body.is_empty() => Line::from(""),
+                None => Line::from(vec![
+                    Span::raw(" ".repeat(usize::from(row.indent))),
+                    Span::raw(row.body),
+                ]),
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// The same terminal rectangles are used by drawing, viewport sizing, and mouse input.
+pub struct ScreenGeometry {
+    pub sidebar: Rect,
+    pub separator: Rect,
+    pub messages: Rect,
+    pub composer: Rect,
+    pub gap: Rect,
+    pub input: Rect,
+    pub first_input_line: usize,
+    pub input_layout: super::input::InputLayout,
+}
+pub fn geometry(
+    width: u16,
+    height: u16,
+    input: &str,
+    cursor: usize,
+    active: bool,
+) -> ScreenGeometry {
+    let sidebar = Rect::new(0, 0, width.min(SIDEBAR_WIDTH), height);
+    let separator = Rect::new(
+        sidebar.width,
+        0,
+        width.saturating_sub(sidebar.width).min(SEPARATOR_GAP),
+        height,
+    );
+    let main = Rect::new(
+        separator.right(),
+        0,
+        width.saturating_sub(separator.right()),
+        height,
+    );
+    let (text_x, text_width) = input_text_geometry(width);
+    let input_layout = super::input::InputLayout::new(input, cursor, text_width);
+    let gap_height = if active {
+        GAP_ROWS.min(height.saturating_sub(1))
+    } else {
+        0
+    };
+    let composer_height = if active {
+        composer_height(input_layout.lines.len()).min(height.saturating_sub(gap_height))
+    } else {
+        0
+    };
+    let messages = inset(
+        Rect::new(
+            main.x,
+            0,
+            main.width,
+            height.saturating_sub(composer_height + gap_height),
+        ),
+        HORIZONTAL_PAD,
+    );
+    let composer = Rect::new(main.x, messages.height, main.width, composer_height);
+    let gap = Rect::new(main.x, composer.bottom(), main.width, gap_height);
+    // Remove decorative rows before sacrificing the cursor's input row.
+    let input_padding = u16::from(composer_height > INPUT_FIXED_ROWS);
+    let rows = if input_padding > 0 {
+        composer_height - INPUT_FIXED_ROWS
+    } else {
+        composer_height
+    }
+    .min(u16::try_from(input_layout.lines.len()).unwrap_or(u16::MAX));
+    let first_input_line = input_layout
+        .cursor_row
+        .saturating_sub(usize::from(rows.saturating_sub(1)));
+    let input = Rect::new(
+        text_x,
+        composer
+            .y
+            .saturating_add(input_padding)
+            .min(composer.bottom()),
+        text_width,
+        rows,
+    );
+    ScreenGeometry {
+        sidebar,
+        separator,
+        messages,
+        composer,
+        gap,
+        input,
+        first_input_line,
+        input_layout,
+    }
 }
 
 /// Render the whole screen: sidebar on the left, main column (messages /
@@ -112,58 +197,42 @@ pub fn draw(frame: &mut Frame, app: &App, chrome: &Chrome<'_>) {
         frame.area(),
     );
 
-    let columns = Layout::horizontal([
-        Constraint::Length(SIDEBAR_WIDTH), // sidebar
-        Constraint::Length(SEPARATOR_GAP), // │ separator + 1-col blank gap
-        Constraint::Min(0),                // main column
-    ])
-    .split(frame.area());
-    render_sidebar(frame, columns[0], app);
-    render_separator(frame, columns[1]);
-
-    // Welcome page (no channel opened yet): the logo centered in the whole
-    // main column - no composer on this page.
-    if app.active_channel().is_none() {
-        render_welcome(frame, inset(columns[2], HORIZONTAL_PAD));
+    let g = geometry(
+        frame.area().width,
+        frame.area().height,
+        app.input(),
+        app.input_cursor(),
+        app.active_buffer().is_some(),
+    );
+    render_sidebar(frame, g.sidebar, app);
+    render_separator(frame, g.separator);
+    if app.active_buffer().is_none() {
+        render_welcome(frame, g.messages);
         return;
     }
-
-    // The composer's wrapped input lines drive its height.
-    let (_, input_text_width) = input_text_geometry(frame.area().width);
-    let focused = app.focus() == Focus::Composer;
-    let input_lines =
-        build_wrapped_input_lines(app.input(), app.input_cursor(), input_text_width, focused);
-    let input_height = composer_height(input_lines.len());
-
-    let rows = Layout::vertical([
-        Constraint::Min(0), // messages (framing separators live in the stream)
-        Constraint::Length(input_height), // composer
-        Constraint::Length(GAP_ROWS), // fade + blank below the composer
-    ])
-    .split(columns[2]);
-
-    let message_rect = inset(rows[0], HORIZONTAL_PAD);
-    frame.render_widget(
-        Paragraph::new(build_text(app)).scroll((app.scroll_offset(), 0)),
-        message_rect,
+    frame.render_widget(Paragraph::new(build_text(app)), g.messages);
+    render_pre_selection(frame, g.messages, app);
+    render_selection(frame, g.messages, app);
+    let input_lines = build_wrapped_input_lines(
+        &g.input_layout,
+        app.input_cursor(),
+        app.focus() == Focus::Composer,
     );
-    render_pre_selection(frame, message_rect, app);
-    render_selection(frame, message_rect, app);
     render_composer(
         frame,
-        rows[1],
+        &g,
         frame.area().width,
         input_lines,
         chrome.status,
         app,
     );
-    render_gap(frame, rows[2], frame.area().width, app);
+    render_gap(frame, g.gap, frame.area().width, app);
 }
 
 /// Render the thin gray vertical line that separates the sidebar from the main
 /// column, spanning the full height (left edge of the separator-gap segment).
 fn render_separator(frame: &mut Frame, area: Rect) {
-    let col = Rect::new(area.x, area.y, 1, area.height);
+    let col = Rect::new(area.x, area.y, area.width.min(1), area.height);
     let line = Line::from(Span::styled("│", Style::new().fg(SEPARATOR)));
     let lines = vec![line; usize::from(area.height)];
     frame.render_widget(Paragraph::new(Text::from(lines)), col);
@@ -176,9 +245,12 @@ fn render_separator(frame: &mut Frame, area: Rect) {
 /// with a slightly brighter background plus a block cursor at its start.
 fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
     let inner = inset(area, 1);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
     let focused = app.focus() == Focus::Sidebar;
     let cursor = app.sidebar_cursor();
-    let active = app.active_channel();
+    let active = app.active_buffer();
     let rows = app.sidebar_rows();
 
     for (i, row) in rows.iter().enumerate() {
@@ -187,13 +259,9 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
             break;
         }
         let is_cursor = focused && cursor == Some(i);
-        let is_active = active.is_some_and(|(srv, ch)| {
-            if ch.is_empty() {
-                // A console view highlights its server's header row.
-                row.server.eq_ignore_ascii_case(srv) && row.channel.is_none()
-            } else {
-                row.server.eq_ignore_ascii_case(srv) && row.channel.as_deref() == Some(ch)
-            }
+        let is_active = active.is_some_and(|buffer| {
+            buffer.server == crate::core::ServerId::new(&row.server)
+                && buffer.kind.channel() == row.channel.as_deref()
         });
 
         let is_hovered = !is_active && !is_cursor && app.sidebar_hovered() == Some(i);
@@ -216,9 +284,24 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
         }
 
         // Row text: a leading space reserves room for the block cursor.
+        let state = app.connection_state(&row.server, row.channel.as_deref());
+        let (symbol, color) = match state {
+            crate::connection::ConnectionState::Connected => ("● ", Color::Green),
+            crate::connection::ConnectionState::Stopped => ("● ", Color::Red),
+            crate::connection::ConnectionState::Connecting => (
+                if app.connecting_dot_visible() {
+                    "● "
+                } else {
+                    "  "
+                },
+                Color::Gray,
+            ),
+        };
+        let dot = Span::styled(symbol, Style::new().fg(color));
         let line = match &row.channel {
             None => Line::from(vec![
                 Span::raw(" "),
+                dot,
                 Span::styled(
                     row.server.as_str(),
                     Style::new().add_modifier(Modifier::BOLD),
@@ -227,6 +310,7 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
             Some(channel) => Line::from(vec![
                 Span::raw(" "),
                 Span::raw("  "),
+                dot,
                 Span::styled(channel.as_str(), DIM_STYLE),
             ]),
         };
@@ -250,82 +334,50 @@ pub fn input_text_geometry(screen_w: u16) -> (u16, u16) {
     let panel_right = screen_w.saturating_sub(INPUT_RIGHT_GAP); // exclusive
     let text_left = panel_left + INPUT_LEFT_PAD;
     let text_right = panel_right.saturating_sub(INPUT_RIGHT_PAD); // exclusive
-    (text_left, text_right.saturating_sub(text_left))
+    (
+        text_left.min(screen_w),
+        text_right.saturating_sub(text_left),
+    )
 }
 
 /// Height of the composer region for a given number of wrapped input lines.
 pub fn composer_height(input_lines: usize) -> u16 {
-    input_lines as u16 + INPUT_FIXED_ROWS
+    u16::try_from(input_lines)
+        .unwrap_or(u16::MAX)
+        .saturating_add(INPUT_FIXED_ROWS)
 }
 
 /// Build the composer's input lines: hard-wrap `text` to `width` columns; when
 /// `show_cursor` is set, render a reverse-video cursor at the `cursor` char
 /// index (a solid block when the cursor sits at the end of the text).
 fn build_wrapped_input_lines(
-    text: &str,
+    layout: &super::input::InputLayout,
     cursor: usize,
-    width: u16,
     show_cursor: bool,
 ) -> Vec<Line<'static>> {
-    let width = usize::from(width.max(1));
-    let chars: Vec<char> = text.chars().collect();
-    let total = chars.len();
-    let cursor = cursor.min(total);
-
-    let mut segments: Vec<Vec<char>> = Vec::new();
-    let mut i = 0;
-    while i < total {
-        let end = (i + width).min(total);
-        segments.push(chars[i..end].to_vec());
-        i = end;
-    }
-    if segments.is_empty() {
-        segments.push(Vec::new());
-    }
-    // A cursor at the end of a full line needs its own line to sit on.
-    if show_cursor && cursor == total && total > 0 && total.is_multiple_of(width) {
-        segments.push(Vec::new());
-    }
-
-    let cursor_style = Style::new().fg(INPUT_BG).bg(Color::White);
-    let mut lines = Vec::new();
-    let mut base = 0usize;
-    for (si, seg) in segments.iter().enumerate() {
-        let is_last = si == segments.len() - 1;
-        let mut before = String::new();
-        let mut cursor_str: Option<String> = None;
-        let mut after = String::new();
-        if show_cursor {
-            for (j, &c) in seg.iter().enumerate() {
-                let gidx = base + j;
-                if gidx == cursor && cursor_str.is_none() {
-                    cursor_str = Some(c.to_string());
-                } else if cursor_str.is_none() {
-                    before.push(c);
-                } else {
-                    after.push(c);
-                }
+    layout
+        .lines
+        .iter()
+        .enumerate()
+        .map(|(row, line)| {
+            if !show_cursor || row != layout.cursor_row {
+                return Line::from(line.text.clone());
             }
-            if cursor_str.is_none() && cursor == base + seg.len() && is_last {
-                cursor_str = Some(" ".to_string());
-            }
-        } else {
-            before = seg.iter().collect();
-        }
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        if !before.is_empty() {
-            spans.push(Span::raw(before));
-        }
-        if let Some(cs) = cursor_str {
-            spans.push(Span::styled(cs, cursor_style));
-        }
-        if !after.is_empty() {
-            spans.push(Span::raw(after));
-        }
-        lines.push(Line::from(spans));
-        base += seg.len();
-    }
-    lines
+            let local = cursor.saturating_sub(line.start);
+            let chars: Vec<char> = line.text.chars().collect();
+            let before: String = chars.iter().take(local).collect();
+            let at = chars
+                .get(local)
+                .map(char::to_string)
+                .unwrap_or_else(|| " ".into());
+            let after: String = chars.iter().skip(local + 1).collect();
+            Line::from(vec![
+                Span::raw(before),
+                Span::styled(at, Style::new().fg(INPUT_BG).bg(Color::White)),
+                Span::raw(after),
+            ])
+        })
+        .collect()
 }
 
 /// Render the composer: an INPUT_BG panel with a pale-green `┃` accent on its
@@ -334,13 +386,17 @@ fn build_wrapped_input_lines(
 /// When the composer is not focused the accent dims and no cursor is shown.
 fn render_composer(
     frame: &mut Frame,
-    area: Rect,
+    g: &ScreenGeometry,
     screen_w: u16,
     input_lines: Vec<Line<'static>>,
     status: &str,
     app: &App,
 ) {
-    let panel_left = COMPOSER_ACCENT_X + 1;
+    let area = g.composer;
+    if area.is_empty() {
+        return;
+    }
+    let panel_left = (COMPOSER_ACCENT_X + 1).min(screen_w);
     let panel_w = screen_w
         .saturating_sub(INPUT_RIGHT_GAP)
         .saturating_sub(panel_left);
@@ -366,13 +422,13 @@ fn render_composer(
         Rect::new(COMPOSER_ACCENT_X, area.y, 1, area.height),
     );
 
-    // Wrapped input lines on rows 1..=n; tips row after the bottom blank.
-    let (text_left, text_width) = input_text_geometry(screen_w);
-    let n = input_lines.len() as u16;
-    frame.render_widget(
-        Paragraph::new(Text::from(input_lines)),
-        Rect::new(text_left, area.y + 1, text_width, n),
-    );
+    let n = g.input.height;
+    let visible: Vec<_> = input_lines
+        .into_iter()
+        .skip(g.first_input_line)
+        .take(usize::from(n))
+        .collect();
+    frame.render_widget(Paragraph::new(Text::from(visible)), g.input);
     let tips = if status.is_empty() {
         "Esc quit · Enter send · PgUp/PgDn scroll".to_string()
     } else {
@@ -380,7 +436,12 @@ fn render_composer(
     };
     frame.render_widget(
         Paragraph::new(tips),
-        Rect::new(text_left, area.y + n + 2, text_width, 1),
+        Rect::new(
+            g.input.x,
+            (area.y + n + 2).min(area.bottom()),
+            g.input.width,
+            u16::from(area.height > n + 2),
+        ),
     );
 }
 
@@ -405,6 +466,9 @@ fn message_block_color(app: &App, idx: usize) -> Color {
 /// color. Rendered before `render_selection`, so the formal styling wins
 /// wherever both point at the same message.
 fn render_pre_selection(frame: &mut Frame, msg_rect: Rect, app: &App) {
+    if msg_rect.is_empty() {
+        return;
+    }
     let Some((start, height)) = app.hovered_span() else {
         return;
     };
@@ -414,9 +478,9 @@ fn render_pre_selection(frame: &mut Frame, msg_rect: Rect, app: &App) {
     if app.focus() == Focus::Messages && app.hovered() == app.selected() {
         return; // same message: the formal selection styling takes over
     }
-    let off = i64::from(app.scroll_offset());
-    let first = i64::from(start) - off;
-    let last = first + i64::from(height) - 1;
+    let off = app.scroll_offset() as i64;
+    let first = start as i64 - off;
+    let last = first + height as i64 - 1;
     let vh = i64::from(msg_rect.height);
     if last < 0 || first >= vh {
         return; // hovered message entirely off-screen
@@ -484,6 +548,9 @@ fn render_pre_selection(frame: &mut Frame, msg_rect: Rect, app: &App) {
 /// The highlight starts flush against the accent so no global-bg gap shows;
 /// rows scrolled out of the pane are simply clipped.
 fn render_selection(frame: &mut Frame, msg_rect: Rect, app: &App) {
+    if msg_rect.is_empty() {
+        return;
+    }
     if app.focus() != Focus::Messages {
         return;
     }
@@ -493,9 +560,9 @@ fn render_selection(frame: &mut Frame, msg_rect: Rect, app: &App) {
     let Some(idx) = app.selected() else {
         return;
     };
-    let off = i64::from(app.scroll_offset());
-    let first = i64::from(start) - off;
-    let last = first + i64::from(height) - 1;
+    let off = app.scroll_offset() as i64;
+    let first = start as i64 - off;
+    let last = first + height as i64 - 1;
     let vh = i64::from(msg_rect.height);
     if last < 0 || first >= vh {
         return; // selection entirely off-screen
@@ -628,7 +695,10 @@ fn fill_half_block_row(
 /// Render the gap below the composer: the `┃` accent tapers into a `╹` and the
 /// composer panel fades out via `▀` across its width.
 fn render_gap(frame: &mut Frame, area: Rect, screen_w: u16, app: &App) {
-    let panel_left = COMPOSER_ACCENT_X + 1;
+    if area.is_empty() {
+        return;
+    }
+    let panel_left = (COMPOSER_ACCENT_X + 1).min(screen_w);
     let panel_w = screen_w
         .saturating_sub(INPUT_RIGHT_GAP)
         .saturating_sub(panel_left);
@@ -652,7 +722,7 @@ fn render_gap(frame: &mut Frame, area: Rect, screen_w: u16, app: &App) {
 /// content never touches the region's left/right edges.
 fn inset(area: Rect, pad: u16) -> Rect {
     Rect::new(
-        area.x + pad,
+        area.x + pad.min(area.width),
         area.y,
         area.width.saturating_sub(2 * pad),
         area.height,
@@ -662,16 +732,28 @@ fn inset(area: Rect, pad: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::ChatMessage;
+    fn active_target(app: &App) -> Option<(&str, &str)> {
+        app.active_buffer()
+            .map(|b| (b.server_label.as_str(), b.kind.channel().unwrap_or("")))
+    }
+
+    fn msg_to(server: &str, channel: &str, nick: &str, text: &str) -> RoutedMessage {
+        RoutedMessage {
+            server: server.into(),
+            target: if channel.is_empty() {
+                BufferKind::Server
+            } else {
+                BufferKind::Channel(channel.into())
+            },
+            content: MessageContent::chat(nick, text),
+        }
+    }
+
+    use crate::core::{BufferKind, MessageContent, RoutedMessage};
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
 
-    fn msg(nick: &str, text: &str) -> ChatMessage {
-        ChatMessage {
-            server: "osu_irc".to_string(),
-            channel: "#osu".to_string(),
-            nick: nick.to_string(),
-            text: text.to_string(),
-        }
+    fn msg(nick: &str, text: &str) -> RoutedMessage {
+        msg_to("osu_irc", "#osu", nick, text)
     }
 
     /// An app with both channels of the test config registered, viewing #osu,
@@ -680,7 +762,7 @@ mod tests {
         let mut app = App::new(width, height);
         app.open_channel("osu_irc", "#osu");
         app.open_channel("osu_irc", "#chinese");
-        app.select_channel(0);
+        app.select_buffer(0);
         app.tab(); // Sidebar -> Messages
         app.tab(); // Messages -> Composer
         app
@@ -691,7 +773,7 @@ mod tests {
     fn viewing_app(width: u16, height: u16) -> App {
         let mut app = App::new(width, height);
         app.open_channel("osu_irc", "#osu");
-        app.select_channel(0);
+        app.select_buffer(0);
         app
     }
 
@@ -847,7 +929,7 @@ mod tests {
         let mut app = App::new(22, 6);
         app.open_channel("osu_irc", "#osu");
         app.open_channel("osu_irc", "#chinese");
-        assert_eq!(app.active_channel(), None);
+        assert_eq!(active_target(&app), None);
 
         // Act: a 100x30 terminal gives the whole main column to the welcome
         // page; the 6-row logo is vertically centered -> top at row 12.
@@ -904,6 +986,38 @@ mod tests {
     }
 
     #[test]
+    fn connection_dots_follow_confirmed_server_and_channel_states() {
+        use crate::connection::{ConnectionState as S, IrcEvent as E};
+        let mut app = test_app(22, 3);
+        app.apply_connection_event(&E::Connection("osu_irc".into(), S::Connecting));
+        let pending = render_sized(&app, "", 50, 10);
+        assert_eq!(pending[(2, 0)].symbol(), "●");
+        assert_eq!(pending[(2, 0)].fg, Color::Gray);
+        assert_eq!(pending[(4, 1)].fg, Color::Gray);
+        app.tick(std::time::Duration::from_millis(500));
+        let off = render_sized(&app, "", 50, 10);
+        assert_eq!(off[(2, 0)].symbol(), " ");
+        assert_eq!(off[(4, 1)].symbol(), " ");
+        for x in 4..11 {
+            assert_eq!(pending[(x, 0)].symbol(), off[(x, 0)].symbol());
+        }
+        app.apply_connection_event(&E::Connection("OSU_IRC".into(), S::Connected));
+        app.apply_connection_event(&E::Channel("osu_irc".into(), "#osu".into(), S::Connected));
+        app.apply_connection_event(&E::Channel("osu_irc".into(), "#chinese".into(), S::Stopped));
+        let connected = render_sized(&app, "", 50, 10);
+        assert_eq!(connected[(2, 0)].symbol(), "●");
+        assert_eq!(connected[(2, 0)].fg, Color::Green);
+        assert_eq!(connected[(4, 1)].fg, Color::Green);
+        assert_eq!(connected[(4, 2)].fg, Color::Red);
+        app.apply_connection_event(&E::Connection("osu_irc".into(), S::Stopped));
+        let stopped = render_sized(&app, "", 50, 10);
+        for pos in [(2, 0), (4, 1), (4, 2)] {
+            assert_eq!(stopped[pos].symbol(), "●");
+            assert_eq!(stopped[pos].fg, Color::Red);
+        }
+    }
+
+    #[test]
     fn sidebar_highlights_active_channel_row() {
         // Arrange
         let app = test_app(22, 3);
@@ -950,19 +1064,9 @@ mod tests {
         let mut app = App::new(22, 6);
         app.open_server("osu_irc");
         app.open_channel("osu_irc", "#osu");
-        app.select_channel(0); // the console
-        app.push_message(ChatMessage {
-            server: "osu_irc".to_string(),
-            channel: String::new(),
-            nick: "test".to_string(),
-            text: "WHOIS nick".to_string(),
-        });
-        app.push_message(ChatMessage {
-            server: "osu_irc".to_string(),
-            channel: String::new(),
-            nick: String::new(),
-            text: "connected".to_string(),
-        });
+        app.select_buffer(0); // the console
+        app.push_message(msg_to("osu_irc", "", "test", "WHOIS nick"));
+        app.push_message(msg_to("osu_irc", "", "", "connected"));
 
         // Act: 50x20 terminal -> composer rows 15..=17 (accent at row 15).
         let buffer = render_sized(&app, "", 50, 20);
@@ -982,7 +1086,7 @@ mod tests {
         let mut app = App::new(22, 3);
         app.open_server("osu_irc");
         app.open_channel("osu_irc", "#osu");
-        app.select_channel(0); // the console
+        app.select_buffer(0); // the console
         app.focus_composer();
 
         // Act
@@ -1299,7 +1403,7 @@ mod tests {
         // rows, so the pane is blank.
         let mut app = App::new(22, 3);
         app.open_channel("osu_irc", "#osu");
-        app.select_channel(0);
+        app.select_buffer(0);
 
         // Act
         let buffer = render_sized(&app, "", 50, 11);

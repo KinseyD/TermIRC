@@ -78,9 +78,96 @@ on a message pre-highlights it, and a click focuses a pane — clicking a
 channel in the sidebar opens it. While TermIRC runs, hold `Shift` for the
 terminal's own text selection.
 
-Two expectations worth setting: opening a channel jumps to its newest
-messages and the view follows new ones while you stay at the bottom; and
-TermIRC never auto-reconnects — after a drop, restart it.
+Inputs beginning with `/` after trimming surrounding whitespace are parsed
+as slash commands in both channels and the server console. Supported
+identity and connection commands are:
+
+| Command | Behavior |
+| --- | --- |
+| `/nick <nickname>` | Request a nickname change on the current server; local echoes use the new nickname after the server confirms it. |
+| `/away [reason]` | Set an away message. With no argument, toggle between away (default reason `Away`) and back, using the confirmed away state. |
+| `/back` | Clear away status on the current server. |
+| `/connect [server]` | Connect a stopped server using its configuration key; defaults to the current server. |
+| `/reconnect [server]` | Restart that server's connection, or connect if stopped; defaults to the current server. |
+| `/disconnect [reason]` | Disconnect the current server and cancel automatic retries. |
+| `/quit [reason]` | Alias for `/disconnect`; the application remains open. Use Esc or Ctrl+C to exit TermIRC. |
+
+Server keys are matched case-insensitively; keys that differ only in ASCII
+letter case cannot coexist in one configuration. Connection commands use the
+existing configuration; they do not add servers. Successful command
+submission clears the composer. Invalid, unsupported or unavailable
+commands retain the original input and cursor for editing. Slash input
+never becomes chat or a raw console line; `//` is not an escape for sending
+a literal slash. Local command feedback is only recorded at DEBUG level,
+without command contents or arguments, and never adds a status-bar prompt
+or history line. Normal server messages still appear in the server console.
+
+Each server and channel has a status dot:
+
+- **Green:** server registration confirmed, or our JOIN confirmed for a channel.
+- **Blinking grey:** connecting, waiting to retry, or waiting for a channel JOIN.
+- **Red:** stopped, including manual disconnection, exhausted retries or a failed channel JOIN.
+
+Unexpected disconnections automatically retry up to three times, waiting
+1, 2 and 4 seconds. A connection/registration attempt times out after
+30 seconds; a missing channel JOIN confirmation also times out after
+30 seconds. Registration nickname/password rejection or a server ban stops
+automatic retries immediately. A connection stable for 30 seconds resets
+the retry budget. `/connect` or `/reconnect` starts a fresh retry budget
+after stopping. Reconnection retains the confirmed nickname in memory,
+rejoins configured channels and clears away status. Queued messages from a
+previous connection are discarded, never replayed on the new connection.
+
+Opening a channel jumps to its newest messages, and the view follows new
+ones while you stay at the bottom. Returning to a previously opened conversation
+restores its reading position. Each server console and channel keeps its own
+draft and editing cursor. Histories remain available across disconnections,
+with up to 5,000 messages per conversation; resizing never deletes messages.
+
+Outgoing IRC lines are limited to 512 UTF-8 bytes including the command,
+target and terminating CRLF. Oversized lines retain the full draft and cursor
+for editing; they are not split or queued. Raw console commands preserve the
+spaces within their trailing parameter. Local echoes mean the message was
+queued, not acknowledged by the server. Server errors for configured channels
+appear there once as system messages; other errors appear in the server console.
+
+## Architecture and development
+
+TermIRC remains a single crate. Its internal boundaries are:
+
+| Module | Responsibility |
+| --- | --- |
+| `core` | Stable server, buffer and message identities; typed conversations, message metadata, drafts and outbound requests. Uses only the standard library. |
+| `history` | Bounded message queues per buffer; returns the IDs removed by eviction. |
+| `protocol` | IRC decoding, tags, structured server errors, wire encoding and byte limits. |
+| `connection` | One worker per server, bounded queues, confirmed connection state, retries and cancellation. |
+| `application` | Session registration, input submission, command execution, event routing and unconfirmed local echoes. |
+| `tui` | Focus, editing gestures, mouse input, layout, view anchors and rendering. |
+
+`config` and `logging` remain independent services; `main` assembles resources
+and restores the terminal. Core and history have no terminal or IRC-library
+dependencies. Layout uses message IDs and `usize` row coordinates. Measured row
+ranges survive layout-text cache eviction; the 50,000-row cache budget does not
+limit history. Rendering constructs text only for visible rows. The composer
+uses the same display-width geometry for wrapping, sizing and mouse regions.
+
+The query buffer type is reserved for future private conversations. Private
+chat, dynamic channels, persistent history, SASL and IRCv3 capability negotiation
+are not implemented in this refactor.
+
+Run local validation with cached dependencies:
+
+```sh
+cargo test --locked --offline --all-targets
+cargo fmt --all --check
+cargo clippy --all-targets --locked --offline -- -D warnings
+git diff --check
+cargo run --release --locked --offline --example layout_benchmark
+```
+
+Network tests use mock servers bound to `127.0.0.1`; the benchmark reads no
+user configuration and opens no connections. See the
+[refactor record](docs/refactor-2026-09-17.md) for regression coverage and measurements.
 
 ## Roadmap
 
@@ -100,7 +187,8 @@ TermIRC never auto-reconnects — after a drop, restart it.
   `~/.config/termirc/config.toml` (see [Configuration](#configuration)).
 - **CJK characters render as boxes** — use Windows Terminal (or run
   `chcp 65001`) with a CJK font.
-- **Nothing arrives after a disconnect** — there is no auto-reconnect by
-  design; restart TermIRC.
+- **A server has a red dot** — check the configuration and runtime log, then
+  use `/connect` or `/reconnect` in that server's console or a channel.
+  A red channel under a green server indicates a failed JOIN, PART or KICK.
 - **Where do the logs live?** Runtime logs (connections, errors; no chat
   content) rotate daily under `~/.config/termirc/logs/`, 7 days kept.
