@@ -1,0 +1,9 @@
+[servers.example]
+username = "YourName"
+nickname = "YourName"
+password = ""
+server = "irc.example.org"
+use_tls = true
+port = 6697
+channels = ["#example"]
+queries = ["alice", "bob"]

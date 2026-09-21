@@ -215,7 +215,7 @@ async fn session(
                         state(tx, label, ConnectionState::Connected);
                     }
                     Command::Response(Response::ERR_PASSWDMISMATCH | Response::ERR_YOUREBANNEDCREEP, _) => {
-                        if let Some(message) = decode_message(&message, label, channels) {
+                        if let Some(message) = decode_message(&message, label, channels, &server.nickname) {
                             let _ = tx.send(IrcEvent::Message(message));
                         }
                         return failed(true, registered_at);
@@ -224,6 +224,11 @@ async fn session(
                         server.nickname.clone_from(nick);
                         let _ = tx.send(IrcEvent::Nickname(label.into(), nick.clone()));
                         tracing::debug!(target: "termirc::slash", outcome = "confirmed", "nickname updated");
+                    }
+                    Command::NICK(nick) => {
+                        if let Some(previous) = message.source_nickname() {
+                            let _ = tx.send(IrcEvent::PeerNickname(label.into(), previous.into(), nick.clone()));
+                        }
                     }
                     Command::Response(Response::RPL_NOWAWAY, _) => {
                         away = true;
@@ -246,7 +251,7 @@ async fn session(
                     Command::ERROR(_) => return failed(false, registered_at),
                     _ => {}
                 }
-                if let Some(chat) = decode_message(&message, label, channels) {
+                if let Some(chat) = decode_message(&message, label, channels, &server.nickname) {
                     let _ = tx.send(IrcEvent::Message(chat));
                 }
             }

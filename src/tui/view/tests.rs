@@ -4,6 +4,206 @@ use crate::command::SlashCommand;
 use crate::connection::{ConnectionState, IrcEvent};
 use crate::core::OutgoingMessage;
 use crate::core::{BufferKind, MessageContent, RoutedMessage};
+
+#[test]
+fn sidebar_groups_interleaved_registrations_by_first_server() {
+    let mut app = App::new(40, 10);
+    app.open_channel("first", "#one");
+    app.open_channel("second", "#two");
+    app.open_channel("FIRST", "#three");
+    let rows = app.sidebar_rows();
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row.server.as_str(), row.kind.channel()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("first", None),
+            ("first", Some("#one")),
+            ("first", Some("#three")),
+            ("second", None),
+            ("second", Some("#two")),
+        ]
+    );
+}
+
+#[test]
+fn sidebar_cursor_tracks_identity_when_earlier_group_grows() {
+    let mut app = App::new(40, 10);
+    app.open_channel("first", "#one");
+    app.open_channel("second", "#two");
+    for _ in 0..3 {
+        app.sidebar_down();
+    }
+    app.session.open_channel("first", "#new");
+    app.sync_view();
+    assert_eq!(app.sidebar_cursor(), Some(4));
+    app.sidebar_enter();
+    assert_eq!(active_target(&app), Some(("second", "#two")));
+}
+
+fn query_message(server: &str, nick: &str, text: &str) -> RoutedMessage {
+    RoutedMessage {
+        server: server.into(),
+        target: BufferKind::Query(nick.into()),
+        content: MessageContent::chat(nick, text),
+    }
+}
+
+#[test]
+fn queries_follow_channels_and_reopen_in_original_order() {
+    let mut app = App::new(40, 10);
+    let first = app.open_server("first");
+    let alice = app.open_query("first", "Alice");
+    let second = app.open_server("second");
+    let other_alice = app.open_query("second", "Alice");
+    let channel = app.open_channel("first", "#one");
+    let bob = app.open_query("first", "Bob");
+    assert_eq!(
+        app.sidebar_rows()
+            .iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>(),
+        [first, channel, alice, bob, second, other_alice].map(Some)
+    );
+    app.close_query(alice);
+    assert!(!app.sidebar_rows().iter().any(|row| row.id == Some(alice)));
+    app.open_query("FIRST", "ALICE");
+    assert_eq!(app.sidebar_rows()[2].id, Some(alice));
+    app.click_sidebar_row(5);
+    assert_eq!(app.active_buffer().unwrap().id, other_alice);
+}
+
+#[test]
+fn activation_effect_follows_first_visit_then_restores_query_view() {
+    use crate::application::SubmissionEffect;
+    let mut app = App::new(40, 3);
+    let console = app.open_server("srv");
+    let query = app.open_query("srv", "alice");
+    app.activate_buffer(console);
+    for _ in 0..8 {
+        app.session
+            .push_message(query_message("srv", "alice", "hello"));
+    }
+    app.apply_submission_effect(SubmissionEffect::Activate(query));
+    assert_eq!(app.focus(), Focus::Composer);
+    assert_eq!(app.active_buffer().unwrap().id, query);
+    assert_eq!(app.scroll_offset(), 14);
+    app.scroll_lines(-5);
+    app.click_message(5);
+    app.apply_submission_effect(SubmissionEffect::Activate(console));
+    app.session
+        .push_message(query_message("srv", "alice", "later"));
+    app.apply_submission_effect(SubmissionEffect::Activate(query));
+    assert_eq!(app.scroll_offset(), 9);
+    assert_eq!(app.selected(), Some(5));
+    assert!(app.buffer(query).unwrap().unread);
+    app.apply_submission_effect(SubmissionEffect::None);
+    assert_eq!(app.scroll_offset(), 9);
+}
+
+#[test]
+fn unread_clears_only_when_active_query_is_visible_at_bottom() {
+    let mut app = App::new(40, 3);
+    let console = app.open_server("srv");
+    let query = app.open_query("srv", "alice");
+    app.activate_buffer(console);
+    for _ in 0..8 {
+        app.session
+            .push_message(query_message("srv", "alice", "hello"));
+    }
+    app.sync_view();
+    assert!(app.buffer(query).unwrap().unread);
+    app.resize(0, 3);
+    app.activate_buffer(query);
+    app.sync_view();
+    assert!(app.buffer(query).unwrap().unread);
+    app.resize(40, 0);
+    app.sync_view();
+    assert!(app.buffer(query).unwrap().unread);
+    app.resize(40, 3);
+    app.sync_view();
+    assert!(!app.buffer(query).unwrap().unread);
+    app.scroll_lines(-4);
+    let offset = app.scroll_offset();
+    app.session
+        .push_message(query_message("srv", "alice", "new"));
+    app.tick(std::time::Duration::ZERO);
+    assert_eq!(app.scroll_offset(), offset);
+    assert!(app.buffer(query).unwrap().unread);
+    app.set_scroll_offset(usize::MAX);
+    app.sync_view();
+    assert!(!app.buffer(query).unwrap().unread);
+    app.session
+        .push_message(query_message("srv", "alice", "newest"));
+    app.sync_view();
+    assert!(app.is_at_bottom());
+    assert!(!app.buffer(query).unwrap().unread);
+}
+
+#[test]
+fn sidebar_viewport_reveals_navigation_and_explicit_activation() {
+    let mut app = App::new(40, 3);
+    app.set_sidebar_height(3);
+    app.open_server("srv");
+    let mut queries = Vec::new();
+    for index in 0..8 {
+        queries.push(app.open_query("srv", &format!("nick{index}")));
+    }
+    for _ in 0..8 {
+        app.sidebar_down();
+    }
+    assert_eq!(app.sidebar_cursor(), Some(8));
+    assert_eq!(app.sidebar_scroll_offset(), 6);
+    app.apply_submission_effect(crate::application::SubmissionEffect::Activate(queries[0]));
+    assert_eq!(app.sidebar_scroll_offset(), 1);
+    app.activate_buffer(queries[7]);
+    assert_eq!(app.sidebar_scroll_offset(), 6);
+    app.set_sidebar_height(1);
+    assert_eq!(app.sidebar_scroll_offset(), 8);
+    app.set_sidebar_height(0);
+    app.sync_view();
+    app.set_sidebar_height(3);
+    assert_eq!(app.sidebar_scroll_offset(), 6);
+}
+
+#[test]
+fn query_command_effect_preserves_destination_draft_and_close_view() {
+    let mut app = App::new(40, 3);
+    let console = app.open_server("srv");
+    let query = app.open_query("srv", "alice");
+    app.activate_buffer(query);
+    app.restore_input_at("saved draft".into(), 3);
+    app.activate_buffer(console);
+    app.restore_input("/query alice".into());
+    let config = crate::config::Config {
+        servers: Default::default(),
+    };
+    let effect = crate::application::submit_composer(
+        &mut app.session,
+        &config,
+        &Default::default(),
+        &mut String::new(),
+    );
+    assert_eq!(app.active_buffer().unwrap().id, console);
+    assert_eq!(app.input(), "");
+    app.apply_submission_effect(effect);
+    assert_eq!(app.active_buffer().unwrap().id, query);
+    assert_eq!(app.input(), "saved draft");
+    assert_eq!(app.input_cursor(), 3);
+    assert_eq!(app.focus(), Focus::Composer);
+    app.restore_input("/close".into());
+    let effect = crate::application::submit_composer(
+        &mut app.session,
+        &config,
+        &Default::default(),
+        &mut String::new(),
+    );
+    assert_eq!(app.active_buffer().unwrap().id, query);
+    app.apply_submission_effect(effect);
+    assert_eq!(app.active_buffer().unwrap().id, console);
+    assert!(app.buffer(query).unwrap().hidden);
+    assert!(!app.sidebar_rows().iter().any(|row| row.id == Some(query)));
+}
 fn active_target(app: &App) -> Option<(&str, &str)> {
     app.active_buffer()
         .map(|b| (b.server_label.as_str(), b.kind.channel().unwrap_or("")))

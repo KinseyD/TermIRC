@@ -54,8 +54,9 @@ pub enum IrcEvent {
     Connection(String, ConnectionState),
     Channel(String, String, ConnectionState),
     Nickname(String, String),
+    PeerNickname(String, String, String),
     Away(String, bool),
-    /// A chat message received from one of the joined channels.
+    /// A routed message received from the server, a channel, or a peer.
     Message(RoutedMessage),
     /// Informational status for `server` (the config key), e.g. "connected
     /// to irc.ppy.sh".
@@ -136,6 +137,7 @@ mod tests {
             use_tls: false,
             port: 6667,
             channels: vec!["#osu".to_string(), "#chinese".to_string()],
+            queries: vec![],
         }
     }
 

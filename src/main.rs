@@ -2,7 +2,7 @@
 use anyhow::Context;
 use ratatui::crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use termirc::config::Config;
-use termirc::connection::{ConnectionHandle, ConnectionState, IrcEvent, spawn_irc};
+use termirc::connection::{ConnectionHandle, spawn_irc};
 use termirc::tui::App;
 fn main() -> anyhow::Result<()> {
     install_panic_hook();
@@ -18,7 +18,7 @@ fn main() -> anyhow::Result<()> {
         Ok(config) => config,
         Err(e) => {
             let e = e.context(format!(
-                "failed to load config from {} - copy your config file there (e.g. test.toml)",
+                    "failed to load config from {} - copy your config file there (e.g. config.example.toml)",
                 config_path.display()
             ));
             // Log the top-level context only: the toml error chain embeds
@@ -92,17 +92,6 @@ fn run(terminal: &mut ratatui::DefaultTerminal, config: &Config) -> anyhow::Resu
     drop(tx);
 
     let mut app = App::new(1, 1);
-    // Register every server's console view and channels in config order;
-    // the sidebar opens a view when the user selects it.
-    for (name, server) in config.servers.iter() {
-        app.open_server(name);
-        for channel in &server.channels {
-            app.open_channel(name, channel);
-        }
-        app.apply_connection_event(&IrcEvent::Connection(
-            name.clone(),
-            ConnectionState::Connecting,
-        ));
-    }
+    app.session.register_config(config);
     termirc::tui::events::run(terminal, config, app, outgoing, rx)
 }

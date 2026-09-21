@@ -18,6 +18,7 @@ fn config(port: u16) -> ServerConfig {
         port,
         use_tls: false,
         channels: vec!["#ok".into(), "#bad".into()],
+        queries: vec![],
     }
 }
 

@@ -1,6 +1,6 @@
 //! Terminal-only view state. Session data and histories live in application/history.
-use crate::application::Session;
-use crate::core::{BufferId, BufferKind, MessageId, RoutedMessage};
+use crate::application::{Session, SubmissionEffect};
+use crate::core::{BufferId, BufferKind, MessageId, RoutedMessage, ServerId};
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 const MAX_MESSAGES: usize = 5000;
@@ -16,7 +16,20 @@ pub enum Focus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarRow {
     pub server: String,
-    pub channel: Option<String>,
+    pub id: Option<BufferId>,
+    pub kind: BufferKind,
+}
+impl SidebarRow {
+    fn identity(&self) -> (ServerId, Option<BufferId>) {
+        (
+            ServerId::new(&self.server),
+            if self.kind == BufferKind::Server {
+                None
+            } else {
+                self.id
+            },
+        )
+    }
 }
 #[derive(Default)]
 struct ViewState {
@@ -33,6 +46,10 @@ pub struct App {
     focus: Focus,
     sidebar_cursor: Option<usize>,
     sidebar_hovered: Option<usize>,
+    sidebar_cursor_id: Option<(ServerId, Option<BufferId>)>,
+    sidebar_hovered_id: Option<(ServerId, Option<BufferId>)>,
+    sidebar_offset: usize,
+    sidebar_height: usize,
     width: u16,
     viewport_height: u16,
     running: bool,
@@ -66,6 +83,10 @@ impl App {
             focus: Focus::Sidebar,
             sidebar_cursor: Some(0),
             sidebar_hovered: None,
+            sidebar_cursor_id: None,
+            sidebar_hovered_id: None,
+            sidebar_offset: 0,
+            sidebar_height: usize::from(viewport_height),
             width,
             viewport_height,
             running: true,
@@ -80,16 +101,29 @@ impl App {
         self.session.active.and_then(|id| self.views.get_mut(&id))
     }
     pub fn select_buffer(&mut self, index: usize) {
-        if index >= self.session.buffers.len() {
+        if let Some(buffer) = self.session.buffers.get(index) {
+            self.activate_buffer(buffer.id);
+        }
+    }
+    pub fn activate_buffer(&mut self, id: BufferId) {
+        if !self.session.buffer(id).is_some_and(|buffer| !buffer.hidden) {
             return;
         }
-        self.session.select_buffer(index);
-        let id = self.session.active.unwrap();
+        self.session.select_buffer_id(id);
         let state = self.views.entry(id).or_default();
         let first = !state.viewed;
         state.viewed = true;
         state.hovered = None;
         self.sync_layout(first);
+        self.reveal_sidebar_row(self.active_sidebar_row());
+    }
+    pub fn apply_submission_effect(&mut self, effect: SubmissionEffect) {
+        if let SubmissionEffect::Activate(id) = effect {
+            self.activate_buffer(id);
+            self.focus = Focus::Composer;
+            self.sidebar_cursor = None;
+            self.sidebar_cursor_id = None;
+        }
     }
     pub fn push_message(&mut self, message: RoutedMessage) {
         let was_empty = self.session.buffers.is_empty();
@@ -100,6 +134,7 @@ impl App {
     }
     /// Reconcile histories after application/network events without recomputing unchanged messages.
     pub fn sync_view(&mut self) {
+        self.reconcile_sidebar();
         let follow =
             self.is_at_bottom() && !(self.focus == Focus::Messages && self.selected().is_some());
         self.sync_layout(follow);
@@ -110,6 +145,8 @@ impl App {
         };
         let messages = self.session.history.messages(id);
         let view = self.views.entry(id).or_default();
+        let follow = follow || !view.viewed;
+        view.viewed = true;
         let anchor = view.layout.anchor(view.scroll_offset);
         view.layout.sync(messages, self.width);
         if view
@@ -138,6 +175,16 @@ impl App {
             usize::from(self.viewport_height),
             self.cache_budget,
         );
+        if self.width > 0
+            && self.viewport_height > 0
+            && view.scroll_offset == max
+            && self
+                .session
+                .buffer(id)
+                .is_some_and(|buffer| !buffer.hidden && matches!(buffer.kind, BufferKind::Query(_)))
+        {
+            self.session.mark_read(id);
+        }
     }
     pub fn tick(&mut self, elapsed: std::time::Duration) {
         self.connecting_dot_visible = (elapsed.as_millis() / 500).is_multiple_of(2);
@@ -303,7 +350,7 @@ impl App {
                 if self.session.buffers.is_empty() {
                     Focus::Composer
                 } else {
-                    self.sidebar_cursor = Some(self.active_sidebar_row());
+                    self.set_sidebar_cursor(self.active_sidebar_row());
                     Focus::Sidebar
                 }
             }
@@ -320,16 +367,37 @@ impl App {
         for buffer in &self.session.buffers {
             if !seen.contains(&buffer.server) {
                 seen.push(buffer.server.clone());
+                let siblings: Vec<_> = self
+                    .session
+                    .buffers
+                    .iter()
+                    .filter(|candidate| candidate.server == buffer.server)
+                    .collect();
                 rows.push(SidebarRow {
                     server: buffer.server_label.clone(),
-                    channel: None,
+                    id: siblings
+                        .iter()
+                        .find(|candidate| candidate.kind == BufferKind::Server)
+                        .map(|candidate| candidate.id),
+                    kind: BufferKind::Server,
                 });
-            }
-            if let BufferKind::Channel(channel) = &buffer.kind {
-                rows.push(SidebarRow {
-                    server: buffer.server_label.clone(),
-                    channel: Some(channel.clone()),
-                });
+                for query in [false, true] {
+                    for sibling in &siblings {
+                        if !sibling.hidden
+                            && match sibling.kind {
+                                BufferKind::Channel(_) => !query,
+                                BufferKind::Query(_) => query,
+                                BufferKind::Server => false,
+                            }
+                        {
+                            rows.push(SidebarRow {
+                                server: buffer.server_label.clone(),
+                                id: Some(sibling.id),
+                                kind: sibling.kind.clone(),
+                            });
+                        }
+                    }
+                }
             }
         }
         rows
@@ -340,10 +408,7 @@ impl App {
         };
         self.sidebar_rows()
             .iter()
-            .position(|r| {
-                crate::core::ServerId::new(&r.server) == b.server
-                    && r.channel.as_deref() == b.kind.channel()
-            })
+            .position(|row| row.id == Some(b.id))
             .unwrap_or(0)
     }
     pub fn sidebar_cursor(&self) -> Option<usize> {
@@ -354,6 +419,9 @@ impl App {
     }
     pub fn set_hover_sidebar(&mut self, row: Option<usize>) {
         self.sidebar_hovered = row.filter(|i| *i < self.sidebar_rows().len());
+        self.sidebar_hovered_id = self
+            .sidebar_hovered
+            .and_then(|index| self.sidebar_rows().get(index).map(SidebarRow::identity));
     }
     pub fn sidebar_down(&mut self) {
         self.move_sidebar_cursor(true);
@@ -362,18 +430,21 @@ impl App {
         self.move_sidebar_cursor(false);
     }
     fn move_sidebar_cursor(&mut self, down: bool) {
+        self.reconcile_sidebar();
         let len = self.sidebar_rows().len();
         if self.focus != Focus::Sidebar || len == 0 {
             return;
         }
         let c = self.sidebar_cursor.unwrap_or(0);
-        self.sidebar_cursor = Some(if down {
+        let next = if down {
             (c + 1).min(len - 1)
         } else {
             c.saturating_sub(1)
-        });
+        };
+        self.set_sidebar_cursor(next);
     }
     pub fn sidebar_enter(&mut self) {
+        self.reconcile_sidebar();
         if self.focus == Focus::Sidebar
             && let Some(i) = self.sidebar_cursor
         {
@@ -384,17 +455,83 @@ impl App {
         let Some(row) = self.sidebar_rows().get(index).cloned() else {
             return;
         };
-        let kind = row.channel.map_or(BufferKind::Server, BufferKind::Channel);
-        let id = self.session.open_buffer(&row.server, kind);
-        let index = self
-            .session
-            .buffers
-            .iter()
-            .position(|b| b.id == id)
-            .unwrap();
-        self.select_buffer(index);
-        self.focus = Focus::Composer;
-        self.sidebar_cursor = None;
+        let id = row
+            .id
+            .unwrap_or_else(|| self.session.open_server(&row.server));
+        self.apply_submission_effect(SubmissionEffect::Activate(id));
+    }
+    fn set_sidebar_cursor(&mut self, index: usize) {
+        if let Some(row) = self.sidebar_rows().get(index) {
+            self.sidebar_cursor = Some(index);
+            self.sidebar_cursor_id = Some(row.identity());
+            self.reveal_sidebar_row(index);
+        }
+    }
+    fn reconcile_sidebar(&mut self) {
+        let rows = self.sidebar_rows();
+        let previous = self.sidebar_cursor;
+        if let Some(index) = previous {
+            self.sidebar_cursor = (!rows.is_empty()).then(|| {
+                self.sidebar_cursor_id
+                    .as_ref()
+                    .and_then(|identity| rows.iter().position(|row| &row.identity() == identity))
+                    .unwrap_or(index.min(rows.len().saturating_sub(1)))
+            });
+            self.sidebar_cursor_id = self.sidebar_cursor.map(|index| rows[index].identity());
+        }
+        self.sidebar_hovered = self
+            .sidebar_hovered_id
+            .as_ref()
+            .and_then(|identity| rows.iter().position(|row| &row.identity() == identity));
+        self.sidebar_offset = self
+            .sidebar_offset
+            .min(rows.len().saturating_sub(self.sidebar_height));
+        if self.sidebar_cursor != previous
+            && let Some(index) = self.sidebar_cursor
+        {
+            self.reveal_sidebar_row(index);
+        }
+    }
+    fn reveal_sidebar_row(&mut self, index: usize) {
+        if self.sidebar_height == 0 {
+            return;
+        }
+        if index < self.sidebar_offset {
+            self.sidebar_offset = index;
+        } else if index >= self.sidebar_offset + self.sidebar_height {
+            self.sidebar_offset = index + 1 - self.sidebar_height;
+        }
+        self.sidebar_offset = self.sidebar_offset.min(
+            self.sidebar_rows()
+                .len()
+                .saturating_sub(self.sidebar_height),
+        );
+    }
+    pub fn set_sidebar_height(&mut self, height: u16) {
+        let height = usize::from(height);
+        if height != self.sidebar_height {
+            self.sidebar_height = height;
+            self.reconcile_sidebar();
+            let index = if self.focus == Focus::Sidebar {
+                self.sidebar_cursor.unwrap_or(0)
+            } else {
+                self.active_sidebar_row()
+            };
+            self.reveal_sidebar_row(index);
+        }
+    }
+    pub fn sidebar_scroll_offset(&self) -> usize {
+        self.sidebar_offset
+    }
+    pub fn scroll_sidebar(&mut self, delta: i32) {
+        self.sidebar_offset = self
+            .sidebar_offset
+            .saturating_add_signed(delta as isize)
+            .min(
+                self.sidebar_rows()
+                    .len()
+                    .saturating_sub(self.sidebar_height),
+            );
     }
 }
 
