@@ -1,10 +1,11 @@
 //! Serial connection lifecycle: cancellation, bounded retries and confirmed state.
 
+use super::channels::Channels;
 use crate::{
     config::ServerConfig,
     connection::{ConnectionState, IrcEvent, RetryPolicy, build_client_config},
     core::{ConnectionCommand, OutgoingMessage},
-    protocol::{decode_message, encode_outgoing, validate_control},
+    protocol::{channel_control_from_raw, decode_message, encode_outgoing, validate_control},
 };
 use futures_util::StreamExt;
 use irc::client::{Client, ClientStream};
@@ -37,6 +38,7 @@ pub(crate) async fn run(
 ) {
     let mut next = Some(Instant::now());
     let mut failures = 0u32;
+    let mut channels = Channels::new(&channels, &label, tx.clone(), policy.timeout);
     loop {
         tokio::select! {
             biased;
@@ -46,6 +48,7 @@ pub(crate) async fn run(
                     continue;
                 }
                 acknowledge(&tx, &label, command.as_ref());
+                if let Some(command) = command.as_ref() { channels.request(command, false); }
                 match command {
                 None => break,
                 Some(ConnectionCommand::Connect) if next.is_none() => { failures = 0; next = Some(Instant::now()); }
@@ -57,12 +60,17 @@ pub(crate) async fn run(
                 _ => {}
                 }
             },
-            message = outgoing.recv() => { if message.is_none() { break; } },
+            message = outgoing.recv() => {
+                let Some(message) = message else { break; };
+                retain_channel_intent(&message, &mut channels);
+            },
             _ = sleep_until(next.unwrap_or_else(Instant::now)), if next.is_some() => {
                 // Never replay messages queued for a previous socket.
-                while outgoing.try_recv().is_ok() {}
+                discard_chat(&mut outgoing, &mut channels);
                 state(&tx, &label, ConnectionState::Connecting);
-                match session(&mut server, &label, &channels, &tx, policy.timeout, &mut outgoing, &mut control).await {
+                let end = session(&mut server, &label, &mut channels, &tx, policy.timeout, &mut outgoing, &mut control).await;
+                channels.disconnected();
+                match end {
                     End::Shutdown => break,
                     End::Stop => { next = None; state(&tx, &label, ConnectionState::Stopped); }
                     End::Restart => { failures = 0; next = Some(Instant::now()); }
@@ -106,14 +114,14 @@ async fn close(client: &Client, stream: &mut ClientStream, reason: &str) {
 async fn session(
     server: &mut ServerConfig,
     label: &str,
-    channels: &[String],
+    channels: &mut Channels,
     tx: &mpsc::Sender<IrcEvent>,
     limit: Duration,
     outgoing: &mut Receiver<OutgoingMessage>,
     control: &mut Receiver<ConnectionCommand>,
 ) -> End {
     let deadline = Instant::now() + limit;
-    let connecting = Client::from_config(build_client_config(server, channels));
+    let connecting = Client::from_config(build_client_config(server));
     tokio::pin!(connecting);
     let mut client = loop {
         tokio::select! {
@@ -124,6 +132,7 @@ async fn session(
                     continue;
                 }
                 acknowledge(tx, label, command.as_ref());
+                if let Some(command) = command.as_ref() { channels.request(command, false); }
                 match command {
                 None => return End::Shutdown,
                 Some(ConnectionCommand::Disconnect(_)) => return End::Stop,
@@ -131,7 +140,10 @@ async fn session(
                 _ => {}
                 }
             },
-            message = outgoing.recv() => { if message.is_none() { return End::Shutdown; } },
+            message = outgoing.recv() => {
+                let Some(message) = message else { return End::Shutdown; };
+                retain_channel_intent(&message, channels);
+            },
             _ = sleep_until(deadline) => return failed(false, None),
             result = &mut connecting => match result {
                 Ok(client) => break client,
@@ -147,8 +159,6 @@ async fn session(
     };
     let mut registered_at = None;
     let mut away = false;
-    let mut pending: Vec<String> = channels.to_vec();
-    let mut join_deadline = deadline;
     loop {
         tokio::select! {
             biased;
@@ -158,6 +168,12 @@ async fn session(
                     continue;
                 }
                 acknowledge(tx, label, command.as_ref());
+                if let Some(command @ (ConnectionCommand::Join(_) | ConnectionCommand::Part { .. })) = command.as_ref() {
+                    if channels.request(command, registered_at.is_some()).is_some_and(|wire| client.send(wire).is_err()) {
+                        return failed(false, registered_at);
+                    }
+                    continue;
+                }
                 let wire = match command {
                     None => { close(&client, &mut stream, "").await; return End::Shutdown; }
                     Some(ConnectionCommand::Disconnect(reason)) => { close(&client, &mut stream, &reason).await; return End::Stop; }
@@ -171,18 +187,20 @@ async fn session(
                         None => Some("Away".into()),
                     }),
                     Some(ConnectionCommand::Back) => Command::AWAY(None),
+                    Some(ConnectionCommand::Join(_) | ConnectionCommand::Part { .. }) => unreachable!(),
                 };
                 if client.send(wire).is_err() { return failed(false, registered_at); }
             },
             _ = sleep_until(deadline), if registered_at.is_none() => return failed(false, None),
-            _ = sleep_until(join_deadline), if registered_at.is_some() && !pending.is_empty() => {
-                for channel in pending.drain(..) {
-                    let _ = tx.send(IrcEvent::Channel(label.into(), channel, ConnectionState::Stopped));
-                }
+            _ = sleep_until(channels.deadline().unwrap_or_else(Instant::now)), if registered_at.is_some() && channels.deadline().is_some() => {
+                channels.expire(Instant::now());
             },
             outgoing = outgoing.recv() => {
                 let Some(message) = outgoing else { close(&client, &mut stream, "").await; return End::Shutdown; };
-                if registered_at.is_none() { continue; }
+                if registered_at.is_none() {
+                    retain_channel_intent(&message, channels);
+                    continue;
+                }
                 let wire = match encode_outgoing(&message) {
                     Ok(wire) => wire,
                     Err(error) => {
@@ -190,6 +208,15 @@ async fn session(
                         continue;
                     }
                 };
+                if let Some(command) = raw_channel_control(&message) {
+                    if channels.request(&command, true).is_some_and(|wire| client.send(wire).is_err()) {
+                        return failed(false, registered_at);
+                    }
+                    continue;
+                }
+                if matches!(&message, OutgoingMessage::Privmsg { target, .. } if !channels.can_send(target)) {
+                    continue;
+                }
                 if client.send(wire).is_err() { return failed(false, registered_at); }
             },
             message = stream.next() => {
@@ -207,15 +234,17 @@ async fn session(
                 match &message.command {
                     Command::Response(Response::RPL_WELCOME, args) if registered_at.is_none() => {
                         if let Some(nick) = args.first() { server.nickname.clone_from(nick); }
-                        while outgoing.try_recv().is_ok() {}
+                        discard_chat(outgoing, channels);
                         registered_at = Some(Instant::now());
-                        join_deadline = Instant::now() + limit;
                         let _ = tx.send(IrcEvent::Nickname(label.into(), server.nickname.clone()));
                         let _ = tx.send(IrcEvent::Away(label.into(), false));
                         state(tx, label, ConnectionState::Connected);
+                        for wire in channels.start() {
+                            if client.send(wire).is_err() { return failed(false, registered_at); }
+                        }
                     }
                     Command::Response(Response::ERR_PASSWDMISMATCH | Response::ERR_YOUREBANNEDCREEP, _) => {
-                        if let Some(message) = decode_message(&message, label, channels, &server.nickname) {
+                        if let Some(message) = decode_message(&message, label, &channels.names(), &server.nickname) {
                             let _ = tx.send(IrcEvent::Message(message));
                         }
                         return failed(true, registered_at);
@@ -242,16 +271,26 @@ async fn session(
                         tracing::debug!(target: "termirc::slash", outcome = "confirmed", away, "away state updated");
                         continue;
                     }
-                    Command::JOIN(channel, _, _) if own_message(&message, &server.nickname) => channel_state(tx, label, channel, ConnectionState::Connected, &mut pending),
-                    Command::PART(channel, _) if own_message(&message, &server.nickname) => channel_state(tx, label, channel, ConnectionState::Stopped, &mut pending),
-                    Command::KICK(channel, nick, _) if nick.eq_ignore_ascii_case(&server.nickname) => channel_state(tx, label, channel, ConnectionState::Stopped, &mut pending),
-                    Command::Response(response, args) if matches!(*response as u16, 403 | 405 | 407 | 437 | 442 | 471 | 473 | 474 | 475 | 476 | 477 | 489) => {
-                        if let Some(channel) = args.get(1) { channel_state(tx, label, channel, ConnectionState::Stopped, &mut pending); }
+                    Command::JOIN(channel, _, _) if own_message(&message, &server.nickname) => {
+                        if channels.joined(channel).is_some_and(|wire| client.send(wire).is_err()) {
+                            return failed(false, registered_at);
+                        }
+                    },
+                    Command::PART(channel, _) if own_message(&message, &server.nickname) => channels.left(channel, false),
+                    Command::KICK(channel, nick, reason) if nick.eq_ignore_ascii_case(&server.nickname) => {
+                        channels.left(channel, true);
+                        channels.notice(channel, format!("Kicked from {channel}: {}", reason.as_deref().unwrap_or("no reason given")));
+                    },
+                    Command::Response(response, args) => {
+                        if let Some(channel) = args.get(1) { channels.error(*response as u16, channel); }
+                    },
+                    Command::Raw(code, args) => {
+                        if let (Ok(code), Some(channel)) = (code.parse::<u16>(), args.get(1)) { channels.error(code, channel); }
                     }
                     Command::ERROR(_) => return failed(false, registered_at),
                     _ => {}
                 }
-                if let Some(chat) = decode_message(&message, label, channels, &server.nickname) {
+                if let Some(chat) = decode_message(&message, label, &channels.names(), &server.nickname) {
                     let _ = tx.send(IrcEvent::Message(chat));
                 }
             }
@@ -273,18 +312,34 @@ fn own_message(message: &Message, nickname: &str) -> bool {
         .is_some_and(|nick| nick.eq_ignore_ascii_case(nickname))
 }
 
-fn channel_state(
-    tx: &mpsc::Sender<IrcEvent>,
-    label: &str,
-    channel: &str,
-    state: ConnectionState,
-    pending: &mut Vec<String>,
-) {
-    pending.retain(|name| !name.eq_ignore_ascii_case(channel));
-    let _ = tx.send(IrcEvent::Channel(label.into(), channel.into(), state));
+fn retain_channel_intent(message: &OutgoingMessage, channels: &mut Channels) {
+    if let Some(command) = raw_channel_control(message) {
+        channels.request(&command, false);
+    }
+}
+
+fn raw_channel_control(message: &OutgoingMessage) -> Option<ConnectionCommand> {
+    match message {
+        OutgoingMessage::Raw { line, .. } => channel_control_from_raw(line).ok().flatten(),
+        _ => None,
+    }
+}
+
+fn discard_chat(outgoing: &mut Receiver<OutgoingMessage>, channels: &mut Channels) {
+    while let Ok(message) = outgoing.try_recv() {
+        retain_channel_intent(&message, channels);
+    }
 }
 
 fn acknowledge(tx: &mpsc::Sender<IrcEvent>, label: &str, command: Option<&ConnectionCommand>) {
+    if let Some(ConnectionCommand::Join(channel) | ConnectionCommand::Part { channel, .. }) =
+        command
+    {
+        let _ = tx.send(IrcEvent::ChannelControlApplied(
+            label.into(),
+            channel.clone(),
+        ));
+    }
     if matches!(
         command,
         Some(ConnectionCommand::Disconnect(_) | ConnectionCommand::Reconnect)

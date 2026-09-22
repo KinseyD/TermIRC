@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use termirc::config::ServerConfig;
 use termirc::connection::{ConnectionState, IrcEvent, RetryPolicy, spawn_irc_with_policy};
 
-use termirc::core::ConnectionCommand;
+use termirc::core::{ChannelState, ChannelStatus, ConnectionCommand};
 
 const WAIT: Duration = Duration::from_secs(3);
 
@@ -106,13 +106,13 @@ fn registration_and_channel_states_wait_for_server_confirmation() {
     socket.write_all(b":someone!u@h JOIN #ok\r\n:assigned!u@h JOIN #ok\r\n:mock 473 assigned #bad :Invite only\r\n").unwrap();
     let events = receive_until(
         &rx,
-        |e| matches!(e, IrcEvent::Channel(_, c, ConnectionState::Stopped) if c == "#bad"),
+        |e| matches!(e, IrcEvent::Channel(_, c, ChannelStatus { state: ChannelState::NotJoined, desired: true }) if c == "#bad"),
     );
     assert_eq!(
         events
             .iter()
             .filter(
-                |e| matches!(e, IrcEvent::Channel(_, c, ConnectionState::Connected) if c == "#ok")
+                |e| matches!(e, IrcEvent::Channel(_, c, ChannelStatus { state: ChannelState::Joined, desired: true }) if c == "#ok")
             )
             .count(),
         1
@@ -439,7 +439,7 @@ fn channel_errors_are_delivered_once_with_a_console_fallback() {
         &rx,
         |event| matches!(event, IrcEvent::Message(message) if message.content.text == "done"),
     );
-    assert_eq!(events.iter().filter(|event| matches!(event, IrcEvent::Channel(_, channel, ConnectionState::Stopped) if channel == "#bad")).count(), 1);
+    assert_eq!(events.iter().filter(|event| matches!(event, IrcEvent::Channel(_, channel, ChannelStatus { state: ChannelState::NotJoined, desired: true }) if channel == "#bad")).count(), 1);
     let errors: Vec<_> = events
         .iter()
         .filter_map(|event| match event {

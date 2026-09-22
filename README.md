@@ -57,7 +57,7 @@ once at startup — restart to pick up changes.
 | `server`   | yes      | —       | hostname                             |
 | `port`     | yes      | —       | usually 6667 (plain) or 6697 (TLS)   |
 | `use_tls`  | no       | `false` | connect over TLS                     |
-| `channels` | yes      | —       | channels to join, in order           |
+| `channels` | yes      | —       | startup channel intent, in order; runtime changes are not persisted |
 | `queries`  | no       | `[]`    | private conversations to show at startup, in order |
 
 `queries` contains individual nicknames, not channels or comma-separated targets.
@@ -65,6 +65,13 @@ Repeated names are deduplicated within each server using ASCII case-insensitive
 matching; the same nickname on different servers is a separate conversation.
 These entries only create sidebar conversations: they do not send JOIN or any
 private message, and do not indicate whether the other user is online.
+
+`channels` seeds the channels to join at startup. Each entry must be one `#` or
+`&` channel name with at least one character after the prefix; whitespace,
+control characters, commas and colons are not allowed. Invalid configured names
+are rejected when loading the config. Channel keys/passwords and multi-target
+entries are unsupported. Runtime JOIN/PART changes stay in memory, never rewrite
+the config, and disappear when the application exits.
 
 Security notes:
 
@@ -88,10 +95,12 @@ terminal's own text selection.
 
 Inputs beginning with `/` after trimming surrounding whitespace are parsed
 as slash commands in both channels and the server console. Supported
-identity and connection commands are:
+channel, identity and connection commands are:
 
 | Command | Behavior |
 | --- | --- |
+| `/join #channel` | Join or focus a channel on the current registered server; a new JOIN waits for server confirmation. |
+| `/part [#channel] [reason]` | Leave the named channel, or the current channel when omitted; retain its buffer and history. |
 | `/query <nickname>` | Create or reopen a private conversation on the current server and focus its composer; works while disconnected. |
 | `/close` | Hide the current private conversation and return to its server console; not available on channels or server consoles. |
 | `/nick <nickname>` | Request a nickname change on the current server; local echoes use the new nickname after the server confirms it. |
@@ -115,17 +124,17 @@ or history line. Normal server messages still appear in the server console.
 Each server and channel has a status dot (private conversations do not):
 
 - **Green:** server registration confirmed, or our JOIN confirmed for a channel.
-- **Blinking grey:** connecting, waiting to retry, or waiting for a channel JOIN.
-- **Red:** stopped, including manual disconnection, exhausted retries or a failed channel JOIN.
+- **Blinking grey:** connecting, waiting to retry, or waiting for a channel JOIN/PART confirmation.
+- **Red:** stopped, not joined, or uncertain channel membership after a timeout.
 
 Unexpected disconnections automatically retry up to three times, waiting
 1, 2 and 4 seconds. A connection/registration attempt times out after
-30 seconds; a missing channel JOIN confirmation also times out after
-30 seconds. Registration nickname/password rejection or a server ban stops
+30 seconds; each channel JOIN or PART has its own 30-second confirmation
+timeout. Registration nickname/password rejection or a server ban stops
 automatic retries immediately. A connection stable for 30 seconds resets
 the retry budget. `/connect` or `/reconnect` starts a fresh retry budget
 after stopping. Reconnection retains the confirmed nickname in memory,
-rejoins configured channels and clears away status. Queued messages from a
+rejoins channels with current join intent and clears away status. Queued messages from a
 previous connection are discarded, never replayed on the new connection.
 
 Opening a channel jumps to its newest messages, and the view follows new
@@ -138,8 +147,44 @@ Outgoing IRC lines are limited to 512 UTF-8 bytes including the command,
 target and terminating CRLF. Oversized lines retain the full draft and cursor
 for editing; they are not split or queued. Raw console commands preserve the
 spaces within their trailing parameter. Local echoes mean the message was
-queued, not acknowledged by the server. Server errors for configured channels
+queued, not acknowledged by the server. Server errors for known channels
 appear there once as system messages; other errors appear in the server console.
+
+### Dynamic channels
+
+Use `/join #channel` from a channel, private conversation or server console.
+Use `/part`, `/part leaving for lunch`, or `/part #channel leaving for lunch`
+to leave. Without an explicit target, PART requires a current channel.
+These commands are online-only: the server must have completed registration.
+Only one `#` or `&` channel is accepted, following the configuration name rule;
+keys/passwords, comma-separated targets and `JOIN 0` are not supported.
+Console raw `JOIN #channel` and `PART #channel :reason` use the same managed
+validation, intent and confirmation path, not an unmanaged escape hatch.
+
+Channel state is separate from join intent:
+
+| State | Meaning |
+| --- | --- |
+| `NotJoined` | No confirmed membership; join failure, PART, KICK or disconnection may lead here. |
+| `Joining` | JOIN requested; channel chat remains disabled until our own server-confirmed JOIN. |
+| `Joined` | Our JOIN is confirmed; channel chat is enabled while the server remains registered. |
+| `Parting` | PART requested; channel chat is immediately disabled while confirmation is pending. |
+| `Uncertain` | JOIN/PART timed out; membership is unknown, not proof that the operation failed. Chat remains disabled. |
+
+Each operation has an independent deadline. Late confirmations resolve uncertain
+state; a late JOIN after leaving does not restore join intent and is followed by
+PART when needed. A failed JOIN or KICK retains join intent but does not trigger
+an automatic retry on the same connection. Explicitly use `/join` to retry.
+Our own PART clears intent; PART after a timed-out JOIN also requests exit.
+Reconnection includes runtime-added channels and excludes configured channels
+you have parted. Operations already accepted just before disconnection still
+update intent, but queued chat is never replayed.
+
+PART does not hide or delete the channel: history, draft and reading position
+remain available. Joining an existing channel reuses its buffer. Incoming
+messages for unknown channels are ignored; our own server-confirmed JOIN first
+registers a newly discovered channel, so its first message is not lost.
+There are no topic, names, modes or other new channel-management commands.
 
 ### Private conversations
 
@@ -193,7 +238,7 @@ ranges survive layout-text cache eviction; the 50,000-row cache budget does not
 limit history. Rendering constructs text only for visible rows. The composer
 uses the same display-width geometry for wrapping, sizing and mouse regions.
 
-Dynamic channels, persistent history, SASL and IRCv3 capability negotiation
+Persistent history, SASL and IRCv3 capability negotiation
 are not implemented in this refactor.
 
 Run local validation with cached dependencies:

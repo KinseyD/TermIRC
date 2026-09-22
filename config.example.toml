@@ -5,5 +5,7 @@ password = ""
 server = "irc.example.org"
 use_tls = true
 port = 6697
+# Startup join intent: individual # or & names, without keys or multiple targets.
+# Runtime /join and /part changes are kept in memory, not written to this file.
 channels = ["#example"]
 queries = ["alice", "bob"]

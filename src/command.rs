@@ -14,6 +14,11 @@ pub enum SlashParseError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandAction {
+    Join(String),
+    Part {
+        channel: Option<String>,
+        reason: Option<String>,
+    },
     Query(String),
     Close,
     Nick(String),
@@ -40,6 +45,27 @@ impl SlashCommand {
         let single = !args.is_empty() && !args.chars().any(char::is_whitespace);
         let optional = || (!args.is_empty()).then(|| args.to_string());
         match self.name.as_str() {
+            "join" if crate::core::valid_channel_name(args) => Ok(Join(args.into())),
+            "join" => Err(CommandError::InvalidArguments),
+            "part" => {
+                let end = args.find(char::is_whitespace).unwrap_or(args.len());
+                let first = &args[..end];
+                if first.starts_with(['#', '&']) {
+                    if !crate::core::valid_channel_name(first) {
+                        return Err(CommandError::InvalidArguments);
+                    }
+                    let reason = args[end..].trim_start();
+                    Ok(Part {
+                        channel: Some(first.into()),
+                        reason: (!reason.is_empty()).then(|| reason.into()),
+                    })
+                } else {
+                    Ok(Part {
+                        channel: None,
+                        reason: optional(),
+                    })
+                }
+            }
             "query" if crate::core::valid_query_nickname(args) => Ok(Query(args.into())),
             "close" if args.is_empty() => Ok(Close),
             "query" | "close" => Err(CommandError::InvalidArguments),
@@ -82,6 +108,89 @@ pub fn parse_slash_command(input: &str) -> Option<Result<SlashCommand, SlashPars
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn join_and_part_are_channel_commands() {
+        for input in [
+            "/join #new",
+            "/JOIN &local",
+            "/part",
+            "/part #new bye  all",
+            "/part bye all",
+        ] {
+            assert!(
+                parse_slash_command(input)
+                    .unwrap()
+                    .unwrap()
+                    .action()
+                    .is_ok(),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn channel_commands_preserve_reason_and_reject_invalid_names() {
+        for (input, expected) in [
+            ("/join #Room", CommandAction::Join("#Room".into())),
+            (
+                "/part",
+                CommandAction::Part {
+                    channel: None,
+                    reason: None,
+                },
+            ),
+            (
+                "/part bye  all",
+                CommandAction::Part {
+                    channel: None,
+                    reason: Some("bye  all".into()),
+                },
+            ),
+            (
+                "/part &local bye  all",
+                CommandAction::Part {
+                    channel: Some("&local".into()),
+                    reason: Some("bye  all".into()),
+                },
+            ),
+            (
+                "/part #Room",
+                CommandAction::Part {
+                    channel: Some("#Room".into()),
+                    reason: None,
+                },
+            ),
+        ] {
+            assert_eq!(
+                parse_slash_command(input).unwrap().unwrap().action(),
+                Ok(expected),
+                "{input}"
+            );
+        }
+        for input in [
+            "/join",
+            "/join #",
+            "/join &",
+            "/join room",
+            "/join 0",
+            "/join #a,#b",
+            "/join #a key",
+            "/join #a #b",
+            "/join #a:b",
+            "/join #a\u{7}",
+            "/part #",
+            "/part #a,#b bye",
+            "/part #a:b",
+            "/part hi\nQUIT",
+        ] {
+            assert_eq!(
+                parse_slash_command(input).unwrap().unwrap().action(),
+                Err(CommandError::InvalidArguments),
+                "{input:?}"
+            );
+        }
+    }
 
     #[test]
     fn query_and_close_are_local_commands() {
@@ -170,7 +279,7 @@ mod tests {
                 "{input:?}"
             );
         }
-        for input in ["/raw QUIT", "/join #new", "//hello", "/unknown"] {
+        for input in ["/raw QUIT", "//hello", "/unknown"] {
             assert_eq!(
                 parse_slash_command(input).unwrap().unwrap().action(),
                 Err(CommandError::Unsupported)

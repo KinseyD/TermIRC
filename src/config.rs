@@ -7,7 +7,7 @@ use anyhow::Context as _;
 use indexmap::IndexMap;
 use serde::Deserialize;
 
-use crate::core::{ServerId, valid_query_nickname};
+use crate::core::{ServerId, valid_channel_name, valid_query_nickname};
 
 /// Per-server connection settings, as written in the `[servers.<name>]` tables.
 #[derive(Clone, Deserialize)]
@@ -71,6 +71,13 @@ impl Config {
         for server in config.servers.values() {
             anyhow::ensure!(
                 server
+                    .channels
+                    .iter()
+                    .all(|channel| valid_channel_name(channel)),
+                "channels must contain individual # or & channel names without passwords"
+            );
+            anyhow::ensure!(
+                server
                     .queries
                     .iter()
                     .all(|nickname| valid_query_nickname(nickname)),
@@ -99,6 +106,24 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_unmanaged_configured_channels() {
+        for channel in [
+            "",
+            "#",
+            "room",
+            "#one,#two",
+            "#one key",
+            "#a:b",
+            "#bad\u{7}",
+        ] {
+            let content = format!(
+                "[servers.test]\nusername='me'\nnickname='me'\npassword=''\nserver='localhost'\nport=6667\nchannels=[{channel:?}]\n"
+            );
+            assert!(Config::parse(&content).is_err(), "accepted {channel:?}");
+        }
+    }
 
     #[test]
     fn rejects_invalid_query_targets() {

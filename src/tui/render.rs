@@ -1040,7 +1040,18 @@ mod tests {
     #[test]
     fn connection_dots_follow_confirmed_server_and_channel_states() {
         use crate::connection::{ConnectionState as S, IrcEvent as E};
+        use crate::core::{ChannelState, ChannelStatus};
         let mut app = test_app(22, 3);
+        for channel in ["#osu", "#chinese"] {
+            app.apply_connection_event(&E::Channel(
+                "osu_irc".into(),
+                channel.into(),
+                ChannelStatus {
+                    state: ChannelState::NotJoined,
+                    desired: true,
+                },
+            ));
+        }
         app.apply_connection_event(&E::Connection("osu_irc".into(), S::Connecting));
         let pending = render_sized(&app, "", 50, 10);
         assert_eq!(pending[(2, 0)].symbol(), "●");
@@ -1054,8 +1065,22 @@ mod tests {
             assert_eq!(pending[(x, 0)].symbol(), off[(x, 0)].symbol());
         }
         app.apply_connection_event(&E::Connection("OSU_IRC".into(), S::Connected));
-        app.apply_connection_event(&E::Channel("osu_irc".into(), "#osu".into(), S::Connected));
-        app.apply_connection_event(&E::Channel("osu_irc".into(), "#chinese".into(), S::Stopped));
+        app.apply_connection_event(&E::Channel(
+            "osu_irc".into(),
+            "#osu".into(),
+            ChannelStatus {
+                state: ChannelState::Joined,
+                desired: true,
+            },
+        ));
+        app.apply_connection_event(&E::Channel(
+            "osu_irc".into(),
+            "#chinese".into(),
+            ChannelStatus {
+                state: ChannelState::NotJoined,
+                desired: true,
+            },
+        ));
         let connected = render_sized(&app, "", 50, 10);
         assert_eq!(connected[(2, 0)].symbol(), "●");
         assert_eq!(connected[(2, 0)].fg, Color::Green);
@@ -1066,6 +1091,78 @@ mod tests {
         for pos in [(2, 0), (4, 1), (4, 2)] {
             assert_eq!(stopped[pos].symbol(), "●");
             assert_eq!(stopped[pos].fg, Color::Red);
+        }
+    }
+
+    #[test]
+    fn channel_dots_blink_only_for_pending_membership_and_require_connected_server_for_green() {
+        use crate::connection::{ConnectionState, IrcEvent};
+        use crate::core::{ChannelState, ChannelStatus};
+        for (state, color, blinking) in [
+            (ChannelState::Joined, Color::Green, false),
+            (ChannelState::Joining, Color::Gray, true),
+            (ChannelState::Parting, Color::Gray, true),
+            (ChannelState::NotJoined, Color::Red, false),
+            (ChannelState::Uncertain, Color::Red, false),
+        ] {
+            let mut app = App::new(22, 3);
+            app.open_server("srv");
+            app.open_channel("srv", "#room");
+            app.apply_connection_event(&IrcEvent::Connection(
+                "srv".into(),
+                ConnectionState::Connected,
+            ));
+            app.apply_connection_event(&IrcEvent::Channel(
+                "srv".into(),
+                "#room".into(),
+                ChannelStatus {
+                    state,
+                    desired: true,
+                },
+            ));
+            let on = render_sized(&app, "", 50, 10);
+            assert_eq!(on[(4, 1)].fg, color, "{state:?}");
+            assert_eq!(on[(4, 1)].symbol(), "●");
+            app.tick(std::time::Duration::from_millis(500));
+            let off = render_sized(&app, "", 50, 10);
+            assert_eq!(
+                off[(4, 1)].symbol(),
+                if blinking { " " } else { "●" },
+                "{state:?}"
+            );
+        }
+        let mut app = App::new(22, 3);
+        app.open_server("srv");
+        app.apply_connection_event(&IrcEvent::Channel(
+            "srv".into(),
+            "#room".into(),
+            ChannelStatus {
+                state: ChannelState::Joined,
+                desired: true,
+            },
+        ));
+        let offline = render_sized(&app, "", 50, 10);
+        assert_eq!(offline[(4, 1)].fg, Color::Red);
+    }
+
+    #[test]
+    fn intentionally_left_channel_stays_red_while_server_reconnects() {
+        use crate::connection::{ConnectionState, IrcEvent};
+        use crate::core::ChannelStatus;
+        let mut app = App::new(22, 3);
+        app.open_server("srv");
+        app.open_channel("srv", "#left");
+        app.apply_connection_event(&IrcEvent::Channel(
+            "srv".into(),
+            "#left".into(),
+            ChannelStatus::default(),
+        ));
+        app.begin_connection_change("srv", ConnectionState::Connecting);
+        for elapsed in [0, 500] {
+            app.tick(std::time::Duration::from_millis(elapsed));
+            let rendered = render_sized(&app, "", 50, 10);
+            assert_eq!(rendered[(4, 1)].symbol(), "●");
+            assert_eq!(rendered[(4, 1)].fg, Color::Red);
         }
     }
 

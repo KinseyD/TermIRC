@@ -8,16 +8,21 @@ use crate::command::{
 use crate::config::Config;
 use crate::connection::{ConnectionHandle, ConnectionState, IrcEvent};
 use crate::core::{
-    BufferId, BufferKind, ConnectionCommand, DeliveryState, Direction, Draft, Message,
-    MessageContent, MessageId, MessageKind, OutgoingMessage, RoutedMessage, ServerId,
+    BufferId, BufferKind, ChannelState, ChannelStatus, ConnectionCommand, DeliveryState, Direction,
+    Draft, Message, MessageContent, MessageId, MessageKind, OutgoingMessage, RoutedMessage,
+    ServerId,
 };
 use crate::history::{HistoryChange, HistoryStore};
-use crate::protocol::{SendError, encode_outgoing, validate_control};
+use crate::protocol::{SendError, channel_control_from_raw, encode_outgoing, validate_control};
 
+mod channels;
 mod queries;
 
 #[cfg(test)]
 mod query_tests;
+
+#[cfg(test)]
+mod channel_tests;
 
 /// Registered conversations retain their display names separately from identity.
 pub struct Buffer {
@@ -29,7 +34,8 @@ pub struct Buffer {
     pub hidden: bool,
     pub unread: bool,
     pub send_blocked: bool,
-    connection: ConnectionState,
+    pub channel_status: ChannelStatus,
+    pending_channel_changes: usize,
 }
 
 #[derive(Default)]
@@ -79,6 +85,9 @@ impl Session {
             self.open_server(name);
             for channel in &server.channels {
                 self.open_channel(name, channel);
+                if let Some(index) = self.channel_index(name, channel) {
+                    self.buffers[index].channel_status.desired = true;
+                }
             }
             for nickname in &server.queries {
                 self.open_query(name, nickname);
@@ -128,12 +137,13 @@ impl Session {
             id,
             server: server_id,
             server_label: state.label.clone(),
+            channel_status: ChannelStatus::default(),
             kind,
             draft: Draft::default(),
             hidden: false,
             unread: false,
             send_blocked: false,
-            connection: ConnectionState::Stopped,
+            pending_channel_changes: 0,
         });
         id
     }
@@ -302,8 +312,14 @@ impl Session {
             let server = ServerId::new(server);
             self.clear_self_echoes(&server);
             for buffer in &mut self.buffers {
-                if buffer.server == server {
-                    buffer.connection = connection;
+                if buffer.server == server && matches!(buffer.kind, BufferKind::Channel(_)) {
+                    buffer.channel_status.state = if connection == ConnectionState::Connecting
+                        && buffer.channel_status.desired
+                    {
+                        ChannelState::Joining
+                    } else {
+                        ChannelState::NotJoined
+                    };
                 }
             }
         }
@@ -332,14 +348,28 @@ impl Session {
             {
                 self.update_connection_state(server, *connection)
             }
-            IrcEvent::Channel(server, channel, connection)
+            IrcEvent::ChannelControlApplied(server, channel) => {
+                if let Some(index) = self.channel_index(server, channel) {
+                    let buffer = &mut self.buffers[index];
+                    buffer.pending_channel_changes =
+                        buffer.pending_channel_changes.saturating_sub(1);
+                }
+            }
+            IrcEvent::Channel(server, channel, status)
                 if !self.has_pending_connection_change(server) =>
             {
-                let id = ServerId::new(server);
-                if let Some(buffer) = self.buffers.iter_mut().find(|b| {
-                    b.server == id && b.kind.matches(&BufferKind::Channel(channel.clone()))
-                }) {
-                    buffer.connection = *connection;
+                if let Some(index) = self.channel_index(server, channel) {
+                    let buffer = &mut self.buffers[index];
+                    if buffer.pending_channel_changes == 0 {
+                        buffer.channel_status = *status;
+                    }
+                } else if crate::core::valid_channel_name(channel) {
+                    let id = self.open_channel(server, channel);
+                    self.buffers
+                        .iter_mut()
+                        .find(|buffer| buffer.id == id)
+                        .unwrap()
+                        .channel_status = *status;
                 }
             }
             IrcEvent::Nickname(server, nickname) => {
@@ -373,18 +403,21 @@ impl Session {
     }
 
     pub fn connection_state(&self, server: &str, channel: Option<&str>) -> ConnectionState {
-        let server = ServerId::new(server);
         match channel {
-            Some(channel) => self
-                .buffers
-                .iter()
-                .find(|b| {
-                    b.server == server && b.kind.matches(&BufferKind::Channel(channel.to_owned()))
-                })
-                .map_or(ConnectionState::Stopped, |b| b.connection),
+            Some(channel) => match self.channel_status(server, channel).state {
+                ChannelState::Joined
+                    if self.connection_state(server, None) == ConnectionState::Connected =>
+                {
+                    ConnectionState::Connected
+                }
+                ChannelState::Joining | ChannelState::Parting => ConnectionState::Connecting,
+                ChannelState::Joined | ChannelState::NotJoined | ChannelState::Uncertain => {
+                    ConnectionState::Stopped
+                }
+            },
             None => self
                 .servers
-                .get(&server)
+                .get(&ServerId::new(server))
                 .map_or(ConnectionState::Stopped, |s| s.connection),
         }
     }
@@ -459,6 +492,35 @@ pub fn submit_composer(
     if let Err(error) = validation {
         *status = format!("failed to send ({error})");
         return SubmissionEffect::None;
+    }
+    if let OutgoingMessage::Raw { line, .. } = &outgoing {
+        match channel_control_from_raw(line) {
+            Ok(Some(command)) => {
+                let action = match command {
+                    ConnectionCommand::Join(channel) => CommandAction::Join(channel),
+                    ConnectionCommand::Part { channel, reason } => CommandAction::Part {
+                        channel: Some(channel),
+                        reason,
+                    },
+                    _ => return SubmissionEffect::None,
+                };
+                return match execute_command(session, connections, action) {
+                    Ok(effect) => {
+                        session.clear_source_draft(source);
+                        effect
+                    }
+                    Err(reason) => {
+                        tracing::debug!(target: "termirc::slash", outcome = "rejected", reason, "channel command rejected");
+                        SubmissionEffect::None
+                    }
+                };
+            }
+            Err(error) => {
+                *status = format!("failed to send ({error})");
+                return SubmissionEffect::None;
+            }
+            Ok(None) => {}
+        }
     }
     let (server, target, text) = match &outgoing {
         OutgoingMessage::Privmsg {
@@ -579,6 +641,18 @@ fn execute_command(
         CommandAction::Nick(nick) => (ConnectionCommand::Nick(nick), None),
         CommandAction::Away(reason) => (ConnectionCommand::Away(reason), None),
         CommandAction::Back => (ConnectionCommand::Back, None),
+        CommandAction::Join(channel) => return session.join_channel(server, &channel, handle),
+        CommandAction::Part { channel, reason } => {
+            let channel = channel
+                .or_else(|| {
+                    session
+                        .active_buffer()
+                        .and_then(|buffer| buffer.kind.channel())
+                        .map(str::to_owned)
+                })
+                .ok_or("no_channel")?;
+            return session.part_channel(server, &channel, reason, handle);
+        }
         CommandAction::Query(_) | CommandAction::Close => return Err("invalid_command"),
     };
     validate_control(&command).map_err(|_| "invalid_control")?;
@@ -782,7 +856,10 @@ mod tests {
             app.apply_connection_event(&IrcEvent::Channel(
                 "srv".into(),
                 "#a".into(),
-                ConnectionState::Connected,
+                ChannelStatus {
+                    state: ChannelState::Joined,
+                    desired: true,
+                },
             ));
             let (outgoing, mut messages) = tokio::sync::mpsc::channel(8);
             let (control, _commands) = tokio::sync::mpsc::channel(8);
@@ -803,7 +880,10 @@ mod tests {
             app.apply_connection_event(&IrcEvent::Channel(
                 "srv".into(),
                 "#a".into(),
-                ConnectionState::Connected,
+                ChannelStatus {
+                    state: ChannelState::Joined,
+                    desired: true,
+                },
             ));
             assert_eq!(app.connection_state("srv", None), expected);
             assert_eq!(app.connection_state("srv", Some("#a")), expected);
@@ -820,7 +900,10 @@ mod tests {
             app.apply_connection_event(&IrcEvent::Channel(
                 "srv".into(),
                 "#a".into(),
-                ConnectionState::Connected,
+                ChannelStatus {
+                    state: ChannelState::Joined,
+                    desired: true,
+                },
             ));
             assert_eq!(
                 app.connection_state("srv", None),
@@ -947,7 +1030,10 @@ mod tests {
                     app.apply_connection_event(&IrcEvent::Channel(
                         "srv".into(),
                         "#a".into(),
-                        ConnectionState::Connected,
+                        ChannelStatus {
+                            state: ChannelState::Joined,
+                            desired: true,
+                        },
                     ));
                     app.apply_connection_event(&IrcEvent::Nickname(
                         "srv".into(),
@@ -1023,7 +1109,10 @@ mod tests {
         session.apply_connection_event(&IrcEvent::Channel(
             "srv".into(),
             "#a".into(),
-            ConnectionState::Connected,
+            ChannelStatus {
+                state: ChannelState::Joined,
+                desired: true,
+            },
         ));
         let (outgoing, messages) = tokio::sync::mpsc::channel(capacity);
         let (control, commands) = tokio::sync::mpsc::channel(capacity);
@@ -1253,6 +1342,14 @@ mod tests {
     fn multiple_pending_connection_changes_require_all_worker_barriers() {
         let mut session = Session::default();
         session.open_channel("SRV", "#a");
+        session.apply_connection_event(&IrcEvent::Channel(
+            "srv".into(),
+            "#a".into(),
+            ChannelStatus {
+                state: ChannelState::Joined,
+                desired: true,
+            },
+        ));
         session.begin_connection_change("srv", ConnectionState::Stopped);
         session.begin_connection_change("SRV", ConnectionState::Connecting);
         session.apply_connection_event(&IrcEvent::ControlApplied("srv".into()));
@@ -1263,7 +1360,10 @@ mod tests {
         session.apply_connection_event(&IrcEvent::Channel(
             "srv".into(),
             "#A".into(),
-            ConnectionState::Connected,
+            ChannelStatus {
+                state: ChannelState::Joined,
+                desired: true,
+            },
         ));
         assert_eq!(
             session.connection_state("srv", None),
@@ -1281,7 +1381,10 @@ mod tests {
         session.apply_connection_event(&IrcEvent::Channel(
             "SRV".into(),
             "#a".into(),
-            ConnectionState::Connected,
+            ChannelStatus {
+                state: ChannelState::Joined,
+                desired: true,
+            },
         ));
         assert_eq!(
             session.connection_state("SRV", None),

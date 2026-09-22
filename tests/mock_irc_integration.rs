@@ -12,7 +12,9 @@ use std::time::Duration;
 
 use termirc::config::ServerConfig;
 use termirc::connection::{IrcEvent, spawn_irc};
-use termirc::core::{BufferKind, DeliveryState, MessageKind, OutgoingMessage, ServerId};
+use termirc::core::{
+    BufferKind, ChannelState, ChannelStatus, DeliveryState, MessageKind, OutgoingMessage, ServerId,
+};
 
 const RECV_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -72,7 +74,11 @@ fn spawn_mock_server() -> (u16, mpsc::Receiver<String>) {
                 writer.flush().unwrap();
                 greeted = true;
             }
-            if greeted && !joined && trimmed.starts_with("JOIN") {
+            if greeted && let Some(channel) = trimmed.strip_prefix("JOIN ") {
+                write!(writer, ":test!u@h JOIN {channel}\r\n").unwrap();
+                writer.flush().unwrap();
+            }
+            if greeted && !joined && trimmed == "JOIN #test" {
                 // A names line and a topic line right before the chat,
                 // mirroring real servers (giving the console both a
                 // flood and a channel-scoped reply to resist).
@@ -105,6 +111,19 @@ fn collect_client_lines_until(
         }
     }
     collected
+}
+
+fn wait_for_confirmed_join(events: &mpsc::Receiver<IrcEvent>) {
+    let deadline = std::time::Instant::now() + RECV_TIMEOUT;
+    loop {
+        let event = events
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .expect("no confirmed JOIN");
+        if matches!(event, IrcEvent::Channel(_, channel, ChannelStatus { state: ChannelState::Joined, desired: true }) if channel == "#test")
+        {
+            return;
+        }
+    }
 }
 
 #[test]
@@ -345,7 +364,11 @@ fn spawn_mock_server_that_closes() -> u16 {
                 writer.flush().unwrap();
             }
             if line.starts_with("JOIN") {
-                write!(writer, ":alice!a@b PRIVMSG #test :hi\r\n").unwrap();
+                write!(
+                    writer,
+                    ":test!u@h JOIN #test\r\n:alice!a@b PRIVMSG #test :hi\r\n"
+                )
+                .unwrap();
                 writer.flush().unwrap();
                 break; // drop everything -> clean TCP close
             }
@@ -428,7 +451,7 @@ fn reports_error_when_connection_is_refused() {
 fn outgoing_message_is_sent_as_privmsg_on_the_wire() {
     // Arrange: connect to the mock and wait for the JOIN to land.
     let (port, lines_rx) = spawn_mock_server();
-    let (tx, _rx) = mpsc::channel();
+    let (tx, rx) = mpsc::channel();
     let (_handle, sender) = spawn_irc(
         server_config_for(port),
         "osu_irc".to_string(),
@@ -436,6 +459,7 @@ fn outgoing_message_is_sent_as_privmsg_on_the_wire() {
         tx,
     );
     let _ = collect_client_lines_until(&lines_rx, |l| l.starts_with("JOIN"));
+    wait_for_confirmed_join(&rx);
 
     // Act: submit a message through the outgoing channel.
     sender
@@ -523,7 +547,7 @@ fn raw_line_marks_a_colon_last_param_as_trailing() {
 #[test]
 fn raw_trailing_parameter_retains_spaces_and_colon_semantics() {
     let (port, lines_rx) = spawn_mock_server();
-    let (tx, _rx) = mpsc::channel();
+    let (tx, rx) = mpsc::channel();
     let (_worker, sender) = spawn_irc(
         server_config_for(port),
         "osu_irc".into(),
@@ -531,6 +555,7 @@ fn raw_trailing_parameter_retains_spaces_and_colon_semantics() {
         tx,
     );
     collect_client_lines_until(&lines_rx, |line| line.starts_with("JOIN"));
+    wait_for_confirmed_join(&rx);
     sender
         .outgoing
         .blocking_send(OutgoingMessage::Raw {
@@ -550,7 +575,7 @@ fn raw_trailing_parameter_retains_spaces_and_colon_semantics() {
 #[test]
 fn invalid_direct_queue_messages_are_skipped_without_closing_connection() {
     let (port, lines_rx) = spawn_mock_server();
-    let (tx, _rx) = mpsc::channel();
+    let (tx, rx) = mpsc::channel();
     let (_worker, sender) = spawn_irc(
         server_config_for(port),
         "osu_irc".into(),
@@ -558,6 +583,7 @@ fn invalid_direct_queue_messages_are_skipped_without_closing_connection() {
         tx,
     );
     collect_client_lines_until(&lines_rx, |line| line.starts_with("JOIN"));
+    wait_for_confirmed_join(&rx);
     for text in ["中".repeat(512), "bad\r\nPRIVMSG #test :injected".into()] {
         sender
             .outgoing

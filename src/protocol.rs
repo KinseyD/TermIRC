@@ -6,7 +6,7 @@ use irc::proto::{Command, Message as WireMessage, Response};
 
 use crate::core::{
     BufferKind, ConnectionCommand, DeliveryState, Direction, MessageContent, MessageKind,
-    OutgoingMessage, RoutedMessage, ServerId,
+    OutgoingMessage, RoutedMessage, ServerId, valid_channel_name,
 };
 
 /// Baseline IRC line limit, including the terminating CRLF.
@@ -62,6 +62,7 @@ pub fn encode_outgoing(message: &OutgoingMessage) -> Result<WireMessage, SendErr
         }
         OutgoingMessage::Raw { line, .. } => {
             validate_text(line)?;
+            channel_control_from_raw(line)?;
             let wire: WireMessage = line.parse().map_err(|_| SendError::InvalidCommand)?;
             if matches!(&wire.command, Command::Raw(command, _) if command.is_empty() || !command.bytes().all(|c| c.is_ascii_alphanumeric()))
             {
@@ -95,8 +96,48 @@ pub fn validate_control(command: &ConnectionCommand) -> Result<(), SendError> {
             Command::AWAY(reason.clone())
         }
         ConnectionCommand::Back => Command::AWAY(None),
+        ConnectionCommand::Join(channel) => {
+            if !valid_channel_name(channel) {
+                return Err(SendError::InvalidCommand);
+            }
+            Command::JOIN(channel.clone(), None, None)
+        }
+        ConnectionCommand::Part { channel, reason } => {
+            if !valid_channel_name(channel) {
+                return Err(SendError::InvalidCommand);
+            }
+            if let Some(reason) = reason {
+                validate_text(reason)?;
+            }
+            Command::PART(channel.clone(), reason.clone())
+        }
     };
     validate_wire(wire.into()).map(|_| ())
+}
+
+pub fn channel_control_from_raw(line: &str) -> Result<Option<ConnectionCommand>, SendError> {
+    validate_text(line)?;
+    let wire: WireMessage = line.parse().map_err(|_| SendError::InvalidCommand)?;
+    let control = match &wire.command {
+        Command::JOIN(channel, None, None) => ConnectionCommand::Join(channel.clone()),
+        Command::PART(channel, reason) => ConnectionCommand::Part {
+            channel: channel.clone(),
+            reason: reason.clone(),
+        },
+        Command::JOIN(..) => return Err(SendError::InvalidCommand),
+        Command::Raw(command, _)
+            if command.eq_ignore_ascii_case("JOIN") || command.eq_ignore_ascii_case("PART") =>
+        {
+            return Err(SendError::InvalidCommand);
+        }
+        _ => return Ok(None),
+    };
+    if wire.prefix.is_some() || wire.tags.is_some() {
+        return Err(SendError::InvalidCommand);
+    }
+    validate_wire(wire)?;
+    validate_control(&control)?;
+    Ok(Some(control))
 }
 
 // Presence and automatic registration floods stay hidden. User-requested
@@ -118,13 +159,13 @@ const IGNORED_NUMERICS: &[Response] = &[
 pub fn decode_message(
     message: &WireMessage,
     server: &str,
-    channels: &[String],
+    known_channels: &[String],
     own_nickname: &str,
 ) -> Option<RoutedMessage> {
     let (target, nick, text, kind) = match &message.command {
         Command::PRIVMSG(target, body) => {
             let nick = message.source_nickname()?.to_owned();
-            let destination = if channels
+            let destination = if known_channels
                 .iter()
                 .any(|channel| channel.eq_ignore_ascii_case(target))
             {
@@ -155,7 +196,7 @@ pub fn decode_message(
             )
         }
         Command::Response(response, args) if (400..600).contains(&(*response as u16)) => {
-            error_payload(*response as u16, args, channels)
+            error_payload(*response as u16, args, known_channels)
         }
         // The IRC dependency treats unrecognized numerics as raw commands.
         Command::Raw(command, args)
@@ -163,7 +204,7 @@ pub fn decode_message(
                 .parse::<u16>()
                 .is_ok_and(|code| (400..600).contains(&code)) =>
         {
-            error_payload(command.parse().ok()?, args, channels)
+            error_payload(command.parse().ok()?, args, known_channels)
         }
         Command::Response(response, _) if IGNORED_NUMERICS.contains(response) => return None,
         Command::Response(_, args) => {
@@ -268,6 +309,54 @@ fn error_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_channel_operations_reject_unmanaged_targets() {
+        for line in [
+            "JOIN #one,#two",
+            "JOIN #one secret",
+            "JOIN 0",
+            "PART #one,#two :bye",
+            "JOIN #",
+            "PART &",
+            "JOIN :#one secret",
+            "@tag=value JOIN #one",
+            ":someone JOIN #one",
+        ] {
+            assert!(encode_outgoing(&raw(line)).is_err(), "accepted {line}");
+        }
+    }
+
+    #[test]
+    fn channel_controls_share_validation_and_preserve_part_reason() {
+        assert_eq!(
+            channel_control_from_raw("join #Room").unwrap(),
+            Some(ConnectionCommand::Join("#Room".into()))
+        );
+        assert_eq!(
+            channel_control_from_raw("PART &local :gone  for lunch").unwrap(),
+            Some(ConnectionCommand::Part {
+                channel: "&local".into(),
+                reason: Some("gone  for lunch".into())
+            })
+        );
+        assert!(channel_control_from_raw("WHOIS alice").unwrap().is_none());
+        assert!(validate_control(&ConnectionCommand::Join("#".into())).is_err());
+        assert!(
+            validate_control(&ConnectionCommand::Part {
+                channel: "#room".into(),
+                reason: Some("x".repeat(512))
+            })
+            .is_err()
+        );
+        assert!(
+            validate_control(&ConnectionCommand::Part {
+                channel: "#room".into(),
+                reason: Some("bye\r\nQUIT".into())
+            })
+            .is_err()
+        );
+    }
 
     fn decode(line: &str) -> Option<RoutedMessage> {
         decode_message(

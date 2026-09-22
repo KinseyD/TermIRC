@@ -65,13 +65,10 @@ channels=[]
             ("legacy", BufferKind::Server),
         ]
     );
-    assert_eq!(
-        crate::connection::build_client_config(
-            &config.servers["first"],
-            &config.servers["first"].channels
-        )
-        .channels,
-        vec!["#one"]
+    assert!(
+        crate::connection::build_client_config(&config.servers["first"])
+            .channels
+            .is_empty()
     );
 }
 
