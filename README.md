@@ -29,9 +29,10 @@ server/channel sidebar, and a composer to talk with. `Enter` sends.
    use_tls = false
    port = 6667
    channels = ["#osu"]
+   queries = ["alice", "bob"]
    ```
 
-   A filled-in sample (`test.toml`) ships in the repo root.
+   A sample (`config.example.toml`) ships in the repo root; replace its connection settings before use.
 
 2. Run:
 
@@ -57,6 +58,13 @@ once at startup — restart to pick up changes.
 | `port`     | yes      | —       | usually 6667 (plain) or 6697 (TLS)   |
 | `use_tls`  | no       | `false` | connect over TLS                     |
 | `channels` | yes      | —       | channels to join, in order           |
+| `queries`  | no       | `[]`    | private conversations to show at startup, in order |
+
+`queries` contains individual nicknames, not channels or comma-separated targets.
+Repeated names are deduplicated within each server using ASCII case-insensitive
+matching; the same nickname on different servers is a separate conversation.
+These entries only create sidebar conversations: they do not send JOIN or any
+private message, and do not indicate whether the other user is online.
 
 Security notes:
 
@@ -84,6 +92,8 @@ identity and connection commands are:
 
 | Command | Behavior |
 | --- | --- |
+| `/query <nickname>` | Create or reopen a private conversation on the current server and focus its composer; works while disconnected. |
+| `/close` | Hide the current private conversation and return to its server console; not available on channels or server consoles. |
 | `/nick <nickname>` | Request a nickname change on the current server; local echoes use the new nickname after the server confirms it. |
 | `/away [reason]` | Set an away message. With no argument, toggle between away (default reason `Away`) and back, using the confirmed away state. |
 | `/back` | Clear away status on the current server. |
@@ -102,7 +112,7 @@ a literal slash. Local command feedback is only recorded at DEBUG level,
 without command contents or arguments, and never adds a status-bar prompt
 or history line. Normal server messages still appear in the server console.
 
-Each server and channel has a status dot:
+Each server and channel has a status dot (private conversations do not):
 
 - **Green:** server registration confirmed, or our JOIN confirmed for a channel.
 - **Blinking grey:** connecting, waiting to retry, or waiting for a channel JOIN.
@@ -120,7 +130,7 @@ previous connection are discarded, never replayed on the new connection.
 
 Opening a channel jumps to its newest messages, and the view follows new
 ones while you stay at the bottom. Returning to a previously opened conversation
-restores its reading position. Each server console and channel keeps its own
+restores its reading position. Each server console, channel and private conversation keeps its own
 draft and editing cursor. Histories remain available across disconnections,
 with up to 5,000 messages per conversation; resizing never deletes messages.
 
@@ -130,6 +140,38 @@ for editing; they are not split or queued. Raw console commands preserve the
 spaces within their trailing parameter. Local echoes mean the message was
 queued, not acknowledged by the server. Server errors for configured channels
 appear there once as system messages; other errors appear in the server console.
+
+### Private conversations
+
+The sidebar groups each server's channels followed by private conversations,
+shown as `@nickname`. Incoming private messages automatically create or reopen a
+conversation without changing your current page or draft. A trailing `*` marks
+unread messages; it clears only when that conversation is visible at the bottom
+of a nonempty message pane. Scrolling through older messages keeps it unread.
+The sidebar scrolls with keyboard navigation or its mouse wheel.
+
+Use `/query alice` to open a conversation, then type normally and press Enter.
+Sending only requires a registered server connection, not a channel JOIN.
+The first visit opens at the newest message; later visits restore the reading
+position. Private ACTION messages are displayed; ordinary NOTICE messages still
+go to the server console. Replies 401 (no such nickname) and 301 (away) go to an
+existing visible private conversation, otherwise to the server console.
+
+`/close` hides rather than deletes: history, drafts and reading positions remain
+in memory until exit. Opening it again or receiving another private message
+restores it. Closing sends no PART or QUIT and does not block the sender.
+`/query`, incoming messages and `/close` never write the configuration file.
+Configured `queries` appear again on restart; runtime-only conversations do not.
+There is no new close shortcut, persistent history, `/msg` or `/me` command.
+
+Confirmed peer nickname changes update the conversation's name and send target
+without changing its identity or configuration. If the new nickname already has
+a conversation, both histories and drafts are preserved separately: the old
+conversation explains the change and blocks sending to the old nickname. Use
+`/query <new-nickname>` to continue, or explicitly `/query <old-nickname>` to
+select that old nickname again and unblock it. Identity changes while offline
+are not inferred; server-specific CASEMAPPING and IRCv3 echo negotiation remain
+unsupported. Sending to yourself displays the matching local echo only once.
 
 ## Architecture and development
 
@@ -151,8 +193,7 @@ ranges survive layout-text cache eviction; the 50,000-row cache budget does not
 limit history. Rendering constructs text only for visible rows. The composer
 uses the same display-width geometry for wrapping, sizing and mouse regions.
 
-The query buffer type is reserved for future private conversations. Private
-chat, dynamic channels, persistent history, SASL and IRCv3 capability negotiation
+Dynamic channels, persistent history, SASL and IRCv3 capability negotiation
 are not implemented in this refactor.
 
 Run local validation with cached dependencies:

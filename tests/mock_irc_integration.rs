@@ -25,6 +25,7 @@ fn server_config_for(port: u16) -> ServerConfig {
         use_tls: false,
         port,
         channels: vec!["#test".to_string(), "#test2".to_string()],
+        queries: vec![],
     }
 }
 

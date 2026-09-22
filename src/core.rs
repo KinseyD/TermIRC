@@ -55,6 +55,15 @@ pub enum BufferKind {
     Query(String),
 }
 
+pub fn valid_query_nickname(nickname: &str) -> bool {
+    !nickname.is_empty()
+        && !nickname
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+        && !nickname.contains([',', '*', '?', '!', '@', '.'])
+        && !nickname.starts_with(['$', ':', '#', '&', '+', '%', '~'])
+}
+
 impl BufferKind {
     pub fn channel(&self) -> Option<&str> {
         match self {

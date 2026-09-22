@@ -66,7 +66,13 @@ pub fn run(
                         KeyCode::Enter => match app.focus() {
                             Focus::Sidebar => app.sidebar_enter(),
                             Focus::Composer => {
-                                submit_composer(&mut app.session, config, &outgoing, &mut status);
+                                let effect = submit_composer(
+                                    &mut app.session,
+                                    config,
+                                    &outgoing,
+                                    &mut status,
+                                );
+                                app.apply_submission_effect(effect);
                                 relayout = true; // the composer may shrink
                             }
                             Focus::Messages => {}
@@ -123,6 +129,7 @@ fn fit_app(app: &mut App, (w, h): (u16, u16)) {
         app.input_cursor(),
         app.active_buffer().is_some(),
     );
+    app.set_sidebar_height(g.sidebar.height);
     if app.size() != (g.messages.width, g.messages.height) {
         app.resize(g.messages.width, g.messages.height);
     } else {
@@ -145,7 +152,14 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, term_size: (u16, u16)) {
 
     match mouse.kind {
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-            if matches!(
+            if matches!(target, mouse::MouseTarget::SidebarRow(_)) {
+                let delta = if mouse.kind == MouseEventKind::ScrollUp {
+                    -MOUSE_SCROLL_LINES
+                } else {
+                    MOUSE_SCROLL_LINES
+                };
+                app.scroll_sidebar(delta);
+            } else if matches!(
                 target,
                 mouse::MouseTarget::MessageRow(_) | mouse::MouseTarget::MessageBlank
             ) {
@@ -158,7 +172,9 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, term_size: (u16, u16)) {
             }
         }
         MouseEventKind::Down(MouseButton::Left) => match target {
-            mouse::MouseTarget::SidebarRow(i) => app.click_sidebar_row(i),
+            mouse::MouseTarget::SidebarRow(index) => {
+                app.click_sidebar_row(index + app.sidebar_scroll_offset())
+            }
             mouse::MouseTarget::MessageRow(row) => match app.message_at_row(row) {
                 Some(index) => app.click_message(index),
                 None => app.focus_messages(),
@@ -173,11 +189,90 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, term_size: (u16, u16)) {
     // Hover follows the pointer (bounds-checked against the row list).
     let sidebar_len = app.sidebar_rows().len();
     app.set_hover_sidebar(match target {
-        mouse::MouseTarget::SidebarRow(i) if i < sidebar_len => Some(i),
+        mouse::MouseTarget::SidebarRow(index)
+            if index + app.sidebar_scroll_offset() < sidebar_len =>
+        {
+            Some(index + app.sidebar_scroll_offset())
+        }
         _ => None,
     });
     app.set_hover_message(match target {
         mouse::MouseTarget::MessageRow(row) => app.message_at_row(row),
         _ => None,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sidebar_mouse(kind: MouseEventKind, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 5,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn sidebar_wheel_hover_and_click_use_visible_offset() {
+        let mut app = App::new(40, 3);
+        app.open_server("srv");
+        let mut queries = Vec::new();
+        for index in 0..8 {
+            queries.push(app.open_query("srv", &format!("nick{index}")));
+        }
+        fit_app(&mut app, (70, 3));
+        handle_mouse(
+            &mut app,
+            sidebar_mouse(MouseEventKind::ScrollDown, 1),
+            (70, 3),
+        );
+        assert_eq!(app.sidebar_scroll_offset(), 3);
+        assert_eq!(app.sidebar_hovered(), Some(4));
+        app.tick(Duration::ZERO);
+        assert_eq!(app.sidebar_scroll_offset(), 3);
+        handle_mouse(
+            &mut app,
+            sidebar_mouse(MouseEventKind::Down(MouseButton::Left), 1),
+            (70, 3),
+        );
+        assert_eq!(app.active_buffer().unwrap().id, queries[3]);
+        assert_eq!(app.focus(), Focus::Composer);
+        handle_mouse(
+            &mut app,
+            sidebar_mouse(MouseEventKind::ScrollDown, 2),
+            (70, 3),
+        );
+        assert_eq!(app.sidebar_scroll_offset(), 6);
+        assert_eq!(app.sidebar_hovered(), Some(8));
+        handle_mouse(
+            &mut app,
+            sidebar_mouse(MouseEventKind::ScrollUp, 0),
+            (70, 3),
+        );
+        assert_eq!(app.sidebar_scroll_offset(), 3);
+        assert_eq!(app.sidebar_hovered(), Some(3));
+    }
+
+    #[test]
+    fn fit_first_selected_query_keeps_newest_and_reads_only_visible_messages() {
+        let mut app = App::new(40, 3);
+        app.open_server("srv");
+        let query = app.open_query("srv", "alice");
+        for _ in 0..8 {
+            app.session.push_message(crate::core::RoutedMessage {
+                server: "srv".into(),
+                target: crate::core::BufferKind::Query("alice".into()),
+                content: crate::core::MessageContent::chat("alice", "hello"),
+            });
+        }
+        app.session.select_buffer_id(query);
+        fit_app(&mut app, (70, 3));
+        assert!(app.buffer(query).unwrap().unread);
+        fit_app(&mut app, (70, 10));
+        assert!(app.is_at_bottom());
+        assert!(!app.buffer(query).unwrap().unread);
+    }
 }

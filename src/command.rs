@@ -14,6 +14,8 @@ pub enum SlashParseError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandAction {
+    Query(String),
+    Close,
     Nick(String),
     Away(Option<String>),
     Back,
@@ -38,6 +40,9 @@ impl SlashCommand {
         let single = !args.is_empty() && !args.chars().any(char::is_whitespace);
         let optional = || (!args.is_empty()).then(|| args.to_string());
         match self.name.as_str() {
+            "query" if crate::core::valid_query_nickname(args) => Ok(Query(args.into())),
+            "close" if args.is_empty() => Ok(Close),
+            "query" | "close" => Err(CommandError::InvalidArguments),
             "nick"
                 if single
                     && !args.contains([',', '*', '?', '!', '@', '.'])
@@ -77,6 +82,41 @@ pub fn parse_slash_command(input: &str) -> Option<Result<SlashCommand, SlashPars
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_and_close_are_local_commands() {
+        assert!(
+            parse_slash_command("/query Alice")
+                .unwrap()
+                .unwrap()
+                .action()
+                .is_ok()
+        );
+        assert!(
+            parse_slash_command("/close")
+                .unwrap()
+                .unwrap()
+                .action()
+                .is_ok()
+        );
+        for input in [
+            "/query",
+            "/query a b",
+            "/query a,b",
+            "/query #room",
+            "/query !room",
+            "/close alice",
+        ] {
+            assert!(
+                parse_slash_command(input)
+                    .unwrap()
+                    .unwrap()
+                    .action()
+                    .is_err(),
+                "{input}"
+            );
+        }
+    }
 
     #[test]
     fn identity_and_connection_commands_have_typed_arguments() {

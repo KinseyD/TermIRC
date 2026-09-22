@@ -1,6 +1,6 @@
 //! Application coordination and session state.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::command::{
     CommandAction, CommandError, SlashCommand, SlashParseError, parse_slash_command,
@@ -9,10 +9,15 @@ use crate::config::Config;
 use crate::connection::{ConnectionHandle, ConnectionState, IrcEvent};
 use crate::core::{
     BufferId, BufferKind, ConnectionCommand, DeliveryState, Direction, Draft, Message,
-    MessageContent, MessageKind, OutgoingMessage, RoutedMessage, ServerId,
+    MessageContent, MessageId, MessageKind, OutgoingMessage, RoutedMessage, ServerId,
 };
 use crate::history::{HistoryChange, HistoryStore};
 use crate::protocol::{SendError, encode_outgoing, validate_control};
+
+mod queries;
+
+#[cfg(test)]
+mod query_tests;
 
 /// Registered conversations retain their display names separately from identity.
 pub struct Buffer {
@@ -21,6 +26,9 @@ pub struct Buffer {
     pub server_label: String,
     pub kind: BufferKind,
     pub draft: Draft,
+    pub hidden: bool,
+    pub unread: bool,
+    pub send_blocked: bool,
     connection: ConnectionState,
 }
 
@@ -41,6 +49,14 @@ pub struct Session {
     servers: HashMap<ServerId, ServerState>,
     welcome_draft: Draft,
     next_buffer_id: u64,
+    pending_self_echoes: HashMap<BufferId, HashSet<MessageId>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SubmissionEffect {
+    #[default]
+    None,
+    Activate(BufferId),
 }
 
 impl Default for Session {
@@ -58,6 +74,22 @@ pub enum InputSubmission {
 }
 
 impl Session {
+    pub fn register_config(&mut self, config: &Config) {
+        for (name, server) in &config.servers {
+            self.open_server(name);
+            for channel in &server.channels {
+                self.open_channel(name, channel);
+            }
+            for nickname in &server.queries {
+                self.open_query(name, nickname);
+            }
+            self.apply_connection_event(&IrcEvent::Connection(
+                name.clone(),
+                ConnectionState::Connecting,
+            ));
+        }
+    }
+
     pub fn new(message_capacity: usize) -> Self {
         Self {
             buffers: Vec::new(),
@@ -66,6 +98,7 @@ impl Session {
             servers: HashMap::new(),
             welcome_draft: Draft::default(),
             next_buffer_id: 1,
+            pending_self_echoes: HashMap::new(),
         }
     }
 
@@ -97,6 +130,9 @@ impl Session {
             server_label: state.label.clone(),
             kind,
             draft: Draft::default(),
+            hidden: false,
+            unread: false,
+            send_blocked: false,
             connection: ConnectionState::Stopped,
         });
         id
@@ -130,7 +166,29 @@ impl Session {
 
     /// Known conversations receive exactly one history entry. Errors with no
     /// registered target remain visible in the originating server's console.
-    pub fn push_message(&mut self, message: RoutedMessage) -> Option<HistoryChange> {
+    pub fn push_message(&mut self, mut message: RoutedMessage) -> Option<HistoryChange> {
+        self.route_query_error(&mut message);
+        if matches!(message.target, BufferKind::Query(_)) {
+            if self.consume_self_echo(&message) {
+                return None;
+            }
+            let id = self.query_message_destination(&message);
+            let self_echo = message.content.direction == Direction::Outgoing
+                && matches!(&message.target, BufferKind::Query(nickname) if nickname.eq_ignore_ascii_case(&message.content.nick));
+            let change = self.history.append(id, message.content);
+            if self_echo && !change.evicted.contains(&change.inserted) {
+                self.pending_self_echoes
+                    .entry(id)
+                    .or_default()
+                    .insert(change.inserted);
+            }
+            if let Some(pending) = self.pending_self_echoes.get_mut(&id) {
+                for removed in &change.evicted {
+                    pending.remove(removed);
+                }
+            }
+            return Some(change);
+        }
         let known = self
             .buffers
             .iter()
@@ -220,13 +278,11 @@ impl Session {
                 server,
                 line: self.input().trim_start().to_owned(),
             },
-            BufferKind::Channel(target) => OutgoingMessage::Privmsg {
+            BufferKind::Channel(target) | BufferKind::Query(target) => OutgoingMessage::Privmsg {
                 server,
                 target: target.clone(),
                 text: self.input().trim().to_owned(),
             },
-            // The model supports queries; sending private messages is deferred.
-            BufferKind::Query(_) => return None,
         };
         Some(InputSubmission::Outgoing(outgoing))
     }
@@ -244,6 +300,7 @@ impl Session {
         self.server_state_mut(server).connection = connection;
         if connection != ConnectionState::Connected {
             let server = ServerId::new(server);
+            self.clear_self_echoes(&server);
             for buffer in &mut self.buffers {
                 if buffer.server == server {
                     buffer.connection = connection;
@@ -286,7 +343,16 @@ impl Session {
                 }
             }
             IrcEvent::Nickname(server, nickname) => {
+                if self
+                    .nickname(server)
+                    .is_some_and(|previous| !previous.eq_ignore_ascii_case(nickname))
+                {
+                    self.clear_self_echoes(&ServerId::new(server));
+                }
                 self.server_state_mut(server).nickname = Some(nickname.clone())
+            }
+            IrcEvent::PeerNickname(server, previous, nickname) => {
+                self.rename_query(server, previous, nickname)
             }
             IrcEvent::Away(server, away) => self.server_state_mut(server).away = *away,
             _ => {}
@@ -341,7 +407,8 @@ pub fn submit_composer(
     config: &Config,
     connections: &HashMap<String, ConnectionHandle>,
     status: &mut String,
-) {
+) -> SubmissionEffect {
+    let source = session.active;
     let invalid_characters = session.input().contains(['\r', '\n', '\0']);
     let Some(submission) = session.prepare_input() else {
         if session.active_buffer().is_some() && session.input().trim().is_empty() {
@@ -351,7 +418,7 @@ pub fn submit_composer(
                 session.clear_input();
             }
         }
-        return;
+        return SubmissionEffect::None;
     };
     let outgoing = match submission {
         InputSubmission::Slash(command) => {
@@ -367,19 +434,20 @@ pub fn submit_composer(
                     .and_then(|action| execute_command(session, connections, action))
             };
             match result {
-                Ok(()) => {
-                    session.clear_input();
+                Ok(effect) => {
+                    session.clear_source_draft(source);
                     tracing::debug!(target: "termirc::slash", outcome = "queued", "command accepted");
+                    return effect;
                 }
                 Err(reason) => {
                     tracing::debug!(target: "termirc::slash", outcome = "rejected", reason, "command rejected")
                 }
             }
-            return;
+            return SubmissionEffect::None;
         }
         InputSubmission::InvalidSlash(SlashParseError::MissingName) => {
             tracing::debug!(target: "termirc::slash", outcome = "rejected", reason = "missing_name", "slash input parse failed");
-            return;
+            return SubmissionEffect::None;
         }
         InputSubmission::Outgoing(message) => message,
     };
@@ -390,7 +458,7 @@ pub fn submit_composer(
     };
     if let Err(error) = validation {
         *status = format!("failed to send ({error})");
-        return;
+        return SubmissionEffect::None;
     }
     let (server, target, text) = match &outgoing {
         OutgoingMessage::Privmsg {
@@ -399,11 +467,21 @@ pub fn submit_composer(
             text,
         } => (
             server.clone(),
-            BufferKind::Channel(target.clone()),
+            session.active_buffer().map_or_else(
+                || BufferKind::Channel(target.clone()),
+                |buffer| buffer.kind.clone(),
+            ),
             text.clone(),
         ),
         OutgoingMessage::Raw { server, line } => (server.clone(), BufferKind::Server, line.clone()),
     };
+    if session
+        .active_buffer()
+        .is_some_and(|buffer| buffer.send_blocked)
+    {
+        *status = "query target changed; use /query to select a nickname".into();
+        return SubmissionEffect::None;
+    }
     let ready = session.connection_state(&server, None) == ConnectionState::Connected
         && target.channel().is_none_or(|channel| {
             session.connection_state(&server, Some(channel)) == ConnectionState::Connected
@@ -443,13 +521,34 @@ pub fn submit_composer(
         tracing::warn!("send failed on {server}: disconnected or busy");
         *status = format!("failed to send ({server} disconnected or busy)");
     }
+    SubmissionEffect::None
 }
 
 fn execute_command(
     session: &mut Session,
     connections: &HashMap<String, ConnectionHandle>,
     action: CommandAction,
-) -> Result<(), &'static str> {
+) -> Result<SubmissionEffect, &'static str> {
+    match &action {
+        CommandAction::Query(nickname) => {
+            let server = session
+                .active_buffer()
+                .ok_or("no_server")?
+                .server_label
+                .clone();
+            return Ok(SubmissionEffect::Activate(
+                session.open_query(&server, nickname),
+            ));
+        }
+        CommandAction::Close => {
+            let current = session.active.ok_or("no_query")?;
+            return session
+                .close_query(current)
+                .map(SubmissionEffect::Activate)
+                .ok_or("not_query");
+        }
+        _ => {}
+    }
     let explicit = match &action {
         CommandAction::Connect(server) | CommandAction::Reconnect(server) => server.as_deref(),
         _ => None,
@@ -480,6 +579,7 @@ fn execute_command(
         CommandAction::Nick(nick) => (ConnectionCommand::Nick(nick), None),
         CommandAction::Away(reason) => (ConnectionCommand::Away(reason), None),
         CommandAction::Back => (ConnectionCommand::Back, None),
+        CommandAction::Query(_) | CommandAction::Close => return Err("invalid_command"),
     };
     validate_control(&command).map_err(|_| "invalid_control")?;
     handle
@@ -489,7 +589,7 @@ fn execute_command(
     if let Some(state) = next {
         session.begin_connection_change(server, state);
     }
-    Ok(())
+    Ok(SubmissionEffect::None)
 }
 
 #[cfg(test)]

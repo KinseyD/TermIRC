@@ -119,16 +119,21 @@ pub fn decode_message(
     message: &WireMessage,
     server: &str,
     channels: &[String],
+    own_nickname: &str,
 ) -> Option<RoutedMessage> {
     let (target, nick, text, kind) = match &message.command {
         Command::PRIVMSG(target, body) => {
-            if !channels
+            let nick = message.source_nickname()?.to_owned();
+            let destination = if channels
                 .iter()
                 .any(|channel| channel.eq_ignore_ascii_case(target))
             {
+                BufferKind::Channel(target.clone())
+            } else if target.eq_ignore_ascii_case(own_nickname) {
+                BufferKind::Query(nick.clone())
+            } else {
                 return None;
-            }
-            let nick = message.source_nickname()?.to_owned();
+            };
             let body = body.trim_end_matches(['\r', '\n']);
             let (text, kind) = if let Some(ctcp) = body.strip_prefix('\x01') {
                 let action = ctcp.trim_end_matches('\x01').strip_prefix("ACTION ")?;
@@ -136,7 +141,18 @@ pub fn decode_message(
             } else {
                 (body.to_owned(), MessageKind::Chat)
             };
-            (BufferKind::Channel(target.clone()), nick, text, kind)
+            (destination, nick, text, kind)
+        }
+        Command::Response(Response::RPL_AWAY, args) => {
+            if args.len() < 3 {
+                return None;
+            }
+            (
+                BufferKind::Query(args[1].clone()),
+                String::new(),
+                args[1..].join(" "),
+                MessageKind::Console,
+            )
         }
         Command::Response(response, args) if (400..600).contains(&(*response as u16)) => {
             error_payload(*response as u16, args, channels)
@@ -258,6 +274,7 @@ mod tests {
             &line.parse().unwrap(),
             "OSU_IRC",
             &["#osu".into(), "#chinese".into()],
+            "me",
         )
     }
 
@@ -315,8 +332,79 @@ mod tests {
     }
 
     #[test]
-    fn privmsg_to_private_nick_is_ignored() {
-        assert!(decode(":bot!u@h PRIVMSG me :hello").is_none());
+    fn privmsg_to_own_nick_routes_to_sender_query() {
+        let before = SystemTime::now();
+        let message = decode("@custom=value :Alice!u@h PRIVMSG ME :hello").unwrap();
+        assert_eq!(message.server, ServerId::new("osu_irc"));
+        assert_eq!(message.target, BufferKind::Query("Alice".into()));
+        assert_eq!(message.content.nick, "Alice");
+        assert_eq!(message.content.text, "hello");
+        assert_eq!(message.content.kind, MessageKind::Chat);
+        assert_eq!(message.content.direction, Direction::Incoming);
+        assert_eq!(message.content.delivery, DeliveryState::Received);
+        assert!(message.content.received_at >= before);
+        assert!(message.content.received_at <= SystemTime::now());
+        assert_eq!(
+            message.content.tags,
+            vec![("custom".into(), Some("value".into()))]
+        );
+    }
+
+    #[test]
+    fn private_actions_route_to_sender_query() {
+        let message = decode(":alice!u@h PRIVMSG me :\x01ACTION waves\x01").unwrap();
+        assert_eq!(message.target, BufferKind::Query("alice".into()));
+        assert_eq!(message.content.nick, "alice");
+        assert_eq!(message.content.text, "* waves");
+        assert_eq!(message.content.kind, MessageKind::Action);
+    }
+
+    #[test]
+    fn self_addressed_messages_route_normally() {
+        let message = decode(":me!u@h PRIVMSG me :note to self").unwrap();
+        assert_eq!(message.target, BufferKind::Query("me".into()));
+        assert_eq!(message.content.nick, "me");
+        assert_eq!(message.content.text, "note to self");
+    }
+
+    #[test]
+    fn private_non_action_ctcp_and_non_self_targets_are_ignored() {
+        for line in [
+            ":alice!u@h PRIVMSG me :\x01VERSION\x01",
+            ":alice!u@h PRIVMSG somebody :hello",
+            ":alice!u@h PRIVMSG &unknown :hello",
+            ":server.example PRIVMSG me :hello",
+        ] {
+            assert!(decode(line).is_none(), "{line}");
+        }
+    }
+
+    #[test]
+    fn private_notices_stay_in_server_console() {
+        let message = decode(":alice!u@h NOTICE me :hello").unwrap();
+        assert_eq!(message.target, BufferKind::Server);
+        assert_eq!(message.content.kind, MessageKind::Console);
+        assert!(message.content.nick.is_empty());
+    }
+
+    #[test]
+    fn away_reply_routes_to_named_query_without_a_sender_nick() {
+        let message = decode("@custom=value :mock 301 me Alice :Gone for lunch").unwrap();
+        assert_eq!(message.target, BufferKind::Query("Alice".into()));
+        assert_eq!(message.content.kind, MessageKind::Console);
+        assert_eq!(message.content.text, "Alice Gone for lunch");
+        assert!(message.content.nick.is_empty());
+        assert_eq!(
+            message.content.tags,
+            vec![("custom".into(), Some("value".into()))]
+        );
+    }
+
+    #[test]
+    fn away_reply_without_a_target_or_reason_is_ignored() {
+        for line in [":mock 301 me", ":mock 301 me Alice"] {
+            assert!(decode(line).is_none(), "{line}");
+        }
     }
 
     #[test]

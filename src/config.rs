@@ -7,7 +7,7 @@ use anyhow::Context as _;
 use indexmap::IndexMap;
 use serde::Deserialize;
 
-use crate::core::ServerId;
+use crate::core::{ServerId, valid_query_nickname};
 
 /// Per-server connection settings, as written in the `[servers.<name>]` tables.
 #[derive(Clone, Deserialize)]
@@ -20,6 +20,8 @@ pub struct ServerConfig {
     pub use_tls: bool,
     pub port: u16,
     pub channels: Vec<String>,
+    #[serde(default)]
+    pub queries: Vec<String>,
 }
 
 impl std::fmt::Debug for ServerConfig {
@@ -33,6 +35,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("use_tls", &self.use_tls)
             .field("port", &self.port)
             .field("channels", &self.channels)
+            .field("queries", &self.queries)
             .finish()
     }
 }
@@ -65,6 +68,15 @@ impl Config {
                 );
             }
         }
+        for server in config.servers.values() {
+            anyhow::ensure!(
+                server
+                    .queries
+                    .iter()
+                    .all(|nickname| valid_query_nickname(nickname)),
+                "queries must contain individual nicknames, not channels or multiple targets"
+            );
+        }
         Ok(config)
     }
 
@@ -87,6 +99,25 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_invalid_query_targets() {
+        for nickname in [
+            "",
+            "alice bob",
+            "alice,bob",
+            "#room",
+            "&room",
+            "+room",
+            "!room",
+            "a\u{7}b",
+        ] {
+            let content = format!(
+                "[servers.test]\nusername='me'\nnickname='me'\npassword='secret'\nserver='localhost'\nport=6667\nchannels=[]\nqueries=[{nickname:?}]\n"
+            );
+            assert!(Config::parse(&content).is_err(), "accepted {nickname:?}");
+        }
+    }
 
     #[test]
     fn first_server_returns_first_in_file_order_not_alphabetical() {

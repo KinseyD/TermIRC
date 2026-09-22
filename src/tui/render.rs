@@ -253,18 +253,21 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
     let active = app.active_buffer();
     let rows = app.sidebar_rows();
 
-    for (i, row) in rows.iter().enumerate() {
-        let y = inner.y + i as u16;
+    for (visible, (index, row)) in rows
+        .iter()
+        .enumerate()
+        .skip(app.sidebar_scroll_offset())
+        .take(usize::from(inner.height))
+        .enumerate()
+    {
+        let y = inner.y + visible as u16;
         if y >= inner.y + inner.height {
             break;
         }
-        let is_cursor = focused && cursor == Some(i);
-        let is_active = active.is_some_and(|buffer| {
-            buffer.server == crate::core::ServerId::new(&row.server)
-                && buffer.kind.channel() == row.channel.as_deref()
-        });
+        let is_cursor = focused && cursor == Some(index);
+        let is_active = active.is_some_and(|buffer| row.id == Some(buffer.id));
 
-        let is_hovered = !is_active && !is_cursor && app.sidebar_hovered() == Some(i);
+        let is_hovered = !is_active && !is_cursor && app.sidebar_hovered() == Some(index);
 
         // Row background: the active channel row is brightest; a cursor row
         // is slightly brighter than the plain background; a hovered row is
@@ -284,7 +287,7 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
         }
 
         // Row text: a leading space reserves room for the block cursor.
-        let state = app.connection_state(&row.server, row.channel.as_deref());
+        let state = app.connection_state(&row.server, row.kind.channel());
         let (symbol, color) = match state {
             crate::connection::ConnectionState::Connected => ("● ", Color::Green),
             crate::connection::ConnectionState::Stopped => ("● ", Color::Red),
@@ -298,8 +301,8 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
             ),
         };
         let dot = Span::styled(symbol, Style::new().fg(color));
-        let line = match &row.channel {
-            None => Line::from(vec![
+        let line = match &row.kind {
+            crate::core::BufferKind::Server => Line::from(vec![
                 Span::raw(" "),
                 dot,
                 Span::styled(
@@ -307,12 +310,25 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
                     Style::new().add_modifier(Modifier::BOLD),
                 ),
             ]),
-            Some(channel) => Line::from(vec![
+            crate::core::BufferKind::Channel(channel) => Line::from(vec![
                 Span::raw(" "),
                 Span::raw("  "),
                 dot,
                 Span::styled(channel.as_str(), DIM_STYLE),
             ]),
+            crate::core::BufferKind::Query(nickname) => {
+                let unread = row
+                    .id
+                    .and_then(|id| app.buffer(id))
+                    .is_some_and(|buffer| buffer.unread);
+                Line::from(vec![
+                    Span::raw("   "),
+                    Span::styled(
+                        format!("@{nickname}{}", if unread { "*" } else { "" }),
+                        DIM_STYLE,
+                    ),
+                ])
+            }
         };
         frame.render_widget(Paragraph::new(line), row_rect);
 
@@ -732,6 +748,42 @@ fn inset(area: Rect, pad: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queries_render_nick_without_connection_dot_or_header_highlight() {
+        let mut app = App::new(40, 10);
+        app.open_server("srv");
+        app.open_buffer("srv", crate::core::BufferKind::Query("alice".into()));
+        app.select_buffer(1);
+        app.focus_composer();
+        let buffer = render_sized(&app, "", 70, 16);
+        assert!(buffer_line(&buffer, 1).contains("@alice"));
+        assert!(!buffer_line(&buffer, 1).contains('●'));
+        assert_eq!(buffer.cell((10, 1)).unwrap().bg, SIDEBAR_ACTIVE_BG);
+        assert_ne!(buffer.cell((10, 0)).unwrap().bg, SIDEBAR_ACTIVE_BG);
+    }
+
+    #[test]
+    fn unread_query_label_and_scrolled_sidebar_render_visible_slice() {
+        let mut app = App::new(40, 10);
+        app.open_server("srv");
+        for index in 0..8 {
+            app.open_query("srv", &format!("nick{index}"));
+        }
+        app.session.push_message(RoutedMessage {
+            server: "srv".into(),
+            target: BufferKind::Query("nick7".into()),
+            content: MessageContent::chat("nick7", "hello"),
+        });
+        app.set_sidebar_height(3);
+        for _ in 0..8 {
+            app.sidebar_down();
+        }
+        let buffer = render_sized(&app, "", 70, 3);
+        assert!(buffer_line(&buffer, 0).contains("@nick5"));
+        assert!(buffer_line(&buffer, 2).contains("@nick7*"));
+        assert!(!buffer_line(&buffer, 2).contains('●'));
+    }
     fn active_target(app: &App) -> Option<(&str, &str)> {
         app.active_buffer()
             .map(|b| (b.server_label.as_str(), b.kind.channel().unwrap_or("")))
