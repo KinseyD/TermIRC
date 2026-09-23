@@ -11,30 +11,22 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  native:
     name: build ${{ matrix.target }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            archive: tar.gz
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            archive: tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            archive: zip
+          - os: windows-latest
+            target: i686-pc-windows-msvc
           - os: windows-11-arm
             target: aarch64-pc-windows-msvc
-            archive: zip
-          - os: macos-latest
+          - os: macos-15-intel
             target: x86_64-apple-darwin
-            archive: tar.gz
           - os: macos-latest
             target: aarch64-apple-darwin
-            archive: tar.gz
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -46,35 +38,82 @@ jobs:
           key: ${{ matrix.target }}
       - run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: package (tar.gz)
-        if: matrix.archive == 'tar.gz'
-        run: |
-          asset="termirc-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
-          tar -czf "$asset" -C "target/${{ matrix.target }}/release" termirc
-          echo "asset=$asset" >> "$GITHUB_OUTPUT"
-        id: package-tar
-
-      - name: package (zip)
-        if: matrix.archive == 'zip'
+      - name: prepare Windows executable
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          Compress-Archive -Path "target/${{ matrix.target }}/release/termirc.exe" `
-            -DestinationPath "termirc-${{ github.ref_name }}-${{ matrix.target }}.zip"
+          Copy-Item "target/${{ matrix.target }}/release/termirc.exe" `
+            "termirc-${{ github.ref_name }}-${{ matrix.target }}.exe"
+
+      - name: prepare macOS executable
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          cp "target/${{ matrix.target }}/release/termirc" \
+            "termirc-${{ github.ref_name }}-${{ matrix.target }}"
 
       - uses: actions/upload-artifact@v7
         with:
           name: termirc-${{ matrix.target }}
-          path: termirc-${{ github.ref_name }}-${{ matrix.target }}.*
+          path: termirc-${{ github.ref_name }}-${{ matrix.target }}*
+          if-no-files-found: error
+
+  linux:
+    name: build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: i686-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: install i686 dependencies
+        if: matrix.target == 'i686-unknown-linux-gnu'
+        shell: bash
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install --yes gcc-multilib libssl-dev:i386
+          echo 'PKG_CONFIG_ALLOW_CROSS=1' >> "$GITHUB_ENV"
+          echo 'PKG_CONFIG_PATH=/usr/lib/i386-linux-gnu/pkgconfig' >> "$GITHUB_ENV"
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: package
+        shell: bash
+        run: |
+          tar -czf "termirc-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" \
+            -C "target/${{ matrix.target }}/release" termirc
+      - uses: actions/upload-artifact@v7
+        with:
+          name: termirc-${{ matrix.target }}
+          path: termirc-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
           if-no-files-found: error
 
   release:
-    needs: build
+    needs: [native, linux]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
+      - name: generate checksums
+        working-directory: dist
+        run: |
+          find . -maxdepth 1 -type f -printf '%P\0' |
+            sort -z |
+            xargs -0 sha256sum > SHA256SUMS
       - uses: softprops/action-gh-release@v3
         with:
           files: dist/*
