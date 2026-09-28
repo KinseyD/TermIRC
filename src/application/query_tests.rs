@@ -113,13 +113,13 @@ fn query_input_queues_privmsg_and_echoes_into_query_without_join() {
         }
     );
     assert!(commands.try_recv().is_err());
-    assert_eq!(session.messages_for(query)[0].nick, "me");
+    assert_eq!(session.messages_for(query)[1].nick, "me");
     assert_eq!(
-        session.messages_for(query)[0].delivery,
+        session.messages_for(query)[1].delivery,
         DeliveryState::Unconfirmed
     );
     assert_eq!(
-        session.messages_for(query)[0].direction,
+        session.messages_for(query)[1].direction,
         Direction::Outgoing
     );
     assert_eq!(session.input(), "");
@@ -402,7 +402,14 @@ fn query_send_failures_keep_text_cursor_and_history_unchanged() {
         submit_composer(&mut session, &config(), &handles, &mut status);
         assert_eq!(session.input(), text, "{failure}");
         assert_eq!(session.input_cursor(), 2);
-        assert!(session.messages_for(query).is_empty());
+        // The connection notice fans out here; the failed send must add no echo.
+        assert!(
+            session
+                .messages_for(query)
+                .iter()
+                .all(|m| m.content.kind == MessageKind::System),
+            "{failure}"
+        );
         assert!(!status.is_empty());
         if failure == "full" {
             received.try_recv().unwrap();

@@ -88,6 +88,9 @@ pub enum MessageKind {
     Chat,
     Action,
     Console,
+    /// A locally generated connection notice; laid out like a console line
+    /// (no nick column) but never selectable.
+    System,
     Error {
         code: u16,
         target: Option<String>,
@@ -138,6 +141,14 @@ impl MessageContent {
             ..Self::chat("", text)
         }
     }
+
+    /// A local connection notice; never originates from the IRC wire.
+    pub fn system(text: impl Into<String>) -> Self {
+        Self {
+            kind: MessageKind::System,
+            ..Self::chat("", text)
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,6 +163,13 @@ impl Deref for Message {
 
     fn deref(&self) -> &Self::Target {
         &self.content
+    }
+}
+
+impl Message {
+    /// System notices inform but never take the keyboard or mouse selection.
+    pub fn selectable(&self) -> bool {
+        !matches!(self.content.kind, MessageKind::System)
     }
 }
 

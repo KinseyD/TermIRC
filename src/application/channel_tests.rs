@@ -9,12 +9,15 @@ fn connected_session(
     tokio::sync::mpsc::Receiver<ConnectionCommand>,
 ) {
     let mut session = Session::default();
-    let console = session.open_server("SRV");
-    session.select_buffer_id(console);
+    // Seed the server state before any buffer exists: connection transitions
+    // now record system notes in every conversation, and these tests exercise
+    // channel commands, not connection notices.
     session.apply_connection_event(&IrcEvent::Connection(
         "srv".into(),
         ConnectionState::Connected,
     ));
+    let console = session.open_server("SRV");
+    session.select_buffer_id(console);
     let (outgoing, messages) = tokio::sync::mpsc::channel(capacity);
     let (control, commands) = tokio::sync::mpsc::channel(capacity);
     (
@@ -263,6 +266,9 @@ fn invalid_and_offline_commands_preserve_source_draft_and_do_not_open_buffers() 
     ] {
         let (mut session, connections, mut messages, mut commands) = connected_session(8);
         session.apply_connection_event(&IrcEvent::Connection("srv".into(), state));
+        // Transitions away from Connected record a system note; commands
+        // must not add anything on top of it.
+        let notes = session.messages().len();
         let mut inputs = vec![
             "/join #",
             "/join #one key",
@@ -289,7 +295,7 @@ fn invalid_and_offline_commands_preserve_source_draft_and_do_not_open_buffers() 
             assert_eq!(session.input(), input);
             assert_eq!(session.input_cursor(), 1);
             assert_eq!(session.buffer_count(), 1);
-            assert!(session.messages().is_empty());
+            assert_eq!(session.messages().len(), notes, "{state:?}: {input}");
             assert!(commands.try_recv().is_err());
             assert!(messages.try_recv().is_err());
         }

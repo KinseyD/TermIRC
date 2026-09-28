@@ -1550,3 +1550,70 @@ fn resize_measures_each_message_once_and_keeps_ids() {
     app.push_message(RoutedMessage::chat("srv", "#a", "n", "next"));
     assert_eq!(app.view().unwrap().layout.measurements - before, 5001);
 }
+
+#[test]
+fn system_messages_are_skipped_by_selection() {
+    let mut app = App::new(40, 10);
+    app.open_channel("srv", "#a");
+    app.select_buffer(0);
+    app.push_message(RoutedMessage::chat("srv", "#a", "u", "m0"));
+    app.push_message(RoutedMessage {
+        server: "srv".into(),
+        target: BufferKind::Channel("#a".into()),
+        content: MessageContent::system("note"),
+    });
+    app.push_message(RoutedMessage::chat("srv", "#a", "u", "m1"));
+
+    // Act / Assert: clicks and hovers never land on the system row.
+    app.click_message(1);
+    assert_eq!(app.selected(), None);
+    assert_eq!(app.focus(), Focus::Messages);
+    app.click_message(0);
+    assert_eq!(app.selected(), Some(0));
+    app.select_next();
+    assert_eq!(app.selected(), Some(2));
+    app.select_prev();
+    assert_eq!(app.selected(), Some(0));
+    app.set_hover_message(Some(1));
+    assert_eq!(app.hovered(), None);
+    app.set_hover_message(Some(0));
+    assert_eq!(app.hovered(), Some(0));
+}
+
+#[test]
+fn all_system_buffer_has_no_selection() {
+    let mut app = App::new(40, 10);
+    let console = app.open_server("srv");
+    app.activate_buffer(console);
+    app.session.apply_connection_event(&IrcEvent::Connection(
+        "srv".into(),
+        ConnectionState::Connected,
+    ));
+    app.sync_view();
+    app.tab();
+    assert_eq!(app.selected(), None);
+    app.select_next();
+    assert_eq!(app.selected(), None);
+}
+
+#[test]
+fn evicted_selection_falls_back_past_system_messages() {
+    let mut app = App::with_caps(40, 10, 2, 50_000);
+    app.open_channel("srv", "#a");
+    app.select_buffer(0);
+    app.push_message(RoutedMessage::chat("srv", "#a", "u", "m0"));
+    app.push_message(RoutedMessage {
+        server: "srv".into(),
+        target: BufferKind::Channel("#a".into()),
+        content: MessageContent::system("s0"),
+    });
+    app.click_message(0);
+    assert_eq!(app.selected(), Some(0));
+    app.push_message(RoutedMessage {
+        server: "srv".into(),
+        target: BufferKind::Channel("#a".into()),
+        content: MessageContent::system("s1"),
+    });
+    app.sync_view();
+    assert_eq!(app.selected(), None);
+}

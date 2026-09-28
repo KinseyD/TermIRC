@@ -153,7 +153,7 @@ impl App {
             .selected
             .is_some_and(|id| !messages.iter().any(|m| m.id == id))
         {
-            view.selected = messages.front().map(|m| m.id);
+            view.selected = messages.iter().find(|m| m.selectable()).map(|m| m.id);
         }
         if view
             .hovered
@@ -266,7 +266,10 @@ impl App {
         self.view()?.layout.span(self.view()?.hovered?)
     }
     pub fn set_hover_message(&mut self, index: Option<usize>) {
-        let id = index.and_then(|i| self.messages().get(i)).map(|m| m.id);
+        let id = index
+            .and_then(|i| self.messages().get(i))
+            .filter(|m| m.selectable())
+            .map(|m| m.id);
         if let Some(s) = self.view_mut() {
             s.hovered = id;
         }
@@ -277,11 +280,13 @@ impl App {
             .message_at(self.scroll_offset() + usize::from(row))
     }
     pub fn click_message(&mut self, index: usize) {
-        let id = self.messages().get(index).map(|m| m.id);
-        if let Some(id) = id
-            && let Some(s) = self.view_mut()
-        {
-            s.selected = Some(id);
+        let id = self
+            .messages()
+            .get(index)
+            .filter(|m| m.selectable())
+            .map(|m| m.id);
+        if let Some(s) = self.view_mut() {
+            s.selected = id;
         }
         self.focus = Focus::Messages;
     }
@@ -294,7 +299,17 @@ impl App {
         let id = self
             .view()
             .and_then(|v| v.layout.last_fully_visible(off, end))
-            .or_else(|| self.messages().back().map(|m| m.id));
+            .or_else(|| self.messages().back().map(|m| m.id))
+            .and_then(|id| {
+                let messages = self.messages();
+                let position = messages.iter().position(|m| m.id == id)?;
+                messages
+                    .iter()
+                    .take(position + 1)
+                    .rev()
+                    .find(|m| m.selectable())
+                    .map(|m| m.id)
+            });
         if let Some(s) = self.view_mut() {
             s.selected = id;
         }
@@ -317,9 +332,16 @@ impl App {
             return;
         }
         self.ensure_selection();
-        if let Some(i) = self.selected() {
-            let next = (i + 1).min(self.messages().len() - 1);
-            let id = self.messages()[next].id;
+        let next_id = if let Some(i) = self.selected() {
+            self.messages()
+                .iter()
+                .skip(i + 1)
+                .find(|m| m.selectable())
+                .map(|m| m.id)
+        } else {
+            None
+        };
+        if let Some(id) = next_id {
             self.view_mut().unwrap().selected = Some(id);
         }
         self.reveal_selection();
@@ -329,8 +351,17 @@ impl App {
             return;
         }
         self.ensure_selection();
-        if let Some(i) = self.selected() {
-            let id = self.messages()[i.saturating_sub(1)].id;
+        let prev_id = if let Some(i) = self.selected() {
+            self.messages()
+                .iter()
+                .take(i)
+                .rev()
+                .find(|m| m.selectable())
+                .map(|m| m.id)
+        } else {
+            None
+        };
+        if let Some(id) = prev_id {
             self.view_mut().unwrap().selected = Some(id);
         }
         self.reveal_selection();

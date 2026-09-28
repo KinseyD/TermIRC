@@ -136,6 +136,9 @@ the retry budget. `/connect` or `/reconnect` starts a fresh retry budget
 after stopping. Reconnection retains the confirmed nickname in memory,
 rejoins channels with current join intent and clears away status. Queued messages from a
 previous connection are discarded, never replayed on the new connection.
+Connect, connection-lost, and disconnect notices appear as system lines in
+every conversation of the server; they cannot be selected and never mark
+conversations unread.
 
 Opening a channel jumps to its newest messages, and the view follows new
 ones while you stay at the bottom. Returning to a previously opened conversation

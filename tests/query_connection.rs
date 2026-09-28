@@ -340,7 +340,13 @@ fn query_ui_commands_and_worker_preserve_conversation_across_reconnect() {
         app.session.handle_event(event);
     }
     assert!(app.buffer(query).unwrap().hidden);
-    assert_eq!(app.messages_for(query).len(), 4);
+    // The reconnect fan-out appends connection notices to the hidden query too.
+    assert_eq!(app.messages_for(query).len(), 6);
+    assert_eq!(
+        app.messages_for(query)[4].text,
+        "Connection lost, reconnecting to srv"
+    );
+    assert_eq!(app.messages_for(query)[5].text, "Connected to srv");
     transport.send(":Alice!u@h NICK :Alicia\r\n:mock NOTICE * :renamed\r\n");
     for event in transport.receive_until(
         |event| matches!(event, IrcEvent::Message(message) if message.content.text == "renamed"),

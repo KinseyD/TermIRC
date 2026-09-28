@@ -165,3 +165,37 @@ fn clipped_composer_keeps_cursor_row_visible_and_mouse_geometry_matches() {
         );
     }
 }
+
+#[test]
+fn system_message_renders_inline_like_console_rows() {
+    use ratatui::{Terminal, backend::TestBackend};
+    use termirc::core::{BufferKind, MessageContent};
+    use termirc::tui::render::{self, Chrome};
+    let mut app = App::new(40, 10);
+    app.open_channel("srv", "#a");
+    app.select_buffer(0);
+    app.push_message(RoutedMessage::chat("srv", "#a", "u", "hello"));
+    app.push_message(RoutedMessage {
+        server: "srv".into(),
+        target: BufferKind::Channel("#a".into()),
+        content: MessageContent::system("Connected to srv"),
+    });
+    let g = render::geometry(80, 24, app.input(), app.input_cursor(), true);
+    app.resize(g.messages.width, g.messages.height);
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|f| render::draw(f, &app, &Chrome { status: "" }))
+        .unwrap();
+    let text = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|c| c.symbol())
+        .collect::<String>();
+    // The system row shares the message list (chat row still present) but has
+    // no nick column.
+    assert!(text.contains("hello"));
+    assert!(text.contains("Connected to srv"));
+    assert!(!text.contains(": Connected"));
+}

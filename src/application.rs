@@ -307,12 +307,15 @@ impl Session {
     }
 
     fn update_connection_state(&mut self, server: &str, connection: ConnectionState) {
-        self.server_state_mut(server).connection = connection;
+        let server_id = ServerId::new(server);
+        let state = self.server_state_mut(server);
+        let previous = state.connection;
+        let label = state.label.clone();
+        state.connection = connection;
         if connection != ConnectionState::Connected {
-            let server = ServerId::new(server);
-            self.clear_self_echoes(&server);
+            self.clear_self_echoes(&server_id);
             for buffer in &mut self.buffers {
-                if buffer.server == server && matches!(buffer.kind, BufferKind::Channel(_)) {
+                if buffer.server == server_id && matches!(buffer.kind, BufferKind::Channel(_)) {
                     buffer.channel_status.state = if connection == ConnectionState::Connecting
                         && buffer.channel_status.desired
                     {
@@ -320,6 +323,33 @@ impl Session {
                     } else {
                         ChannelState::NotJoined
                     };
+                }
+            }
+        }
+        let note = match (previous, connection) {
+            (_, ConnectionState::Connected) if previous != ConnectionState::Connected => {
+                Some(format!("Connected to {label}"))
+            }
+            (ConnectionState::Connected, ConnectionState::Connecting) => {
+                Some(format!("Connection lost, reconnecting to {label}"))
+            }
+            (ConnectionState::Connected, ConnectionState::Stopped) => {
+                Some(format!("Disconnected from {label}"))
+            }
+            _ => None,
+        };
+        if let Some(text) = note {
+            for buffer in &self.buffers {
+                if buffer.server != server_id {
+                    continue;
+                }
+                let change = self
+                    .history
+                    .append(buffer.id, MessageContent::system(text.clone()));
+                if let Some(pending) = self.pending_self_echoes.get_mut(&buffer.id) {
+                    for removed in &change.evicted {
+                        pending.remove(removed);
+                    }
                 }
             }
         }
@@ -669,6 +699,92 @@ fn execute_command(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn connection_notes_fan_out_to_all_server_buffers_without_unread() {
+        use super::*;
+        let mut session = Session::default();
+        let console = session.open_server("srv");
+        let channel = session.open_channel("srv", "#a");
+        let query = session.open_query("srv", "alice");
+        session
+            .buffers
+            .iter_mut()
+            .find(|buffer| buffer.id == query)
+            .unwrap()
+            .hidden = true;
+        session.apply_connection_event(&IrcEvent::Connection(
+            "srv".into(),
+            ConnectionState::Connected,
+        ));
+        for id in [console, channel, query] {
+            let last = session.messages_for(id).back().unwrap();
+            assert_eq!(last.kind, MessageKind::System, "{id:?}");
+            assert_eq!(last.text, "Connected to srv", "{id:?}");
+        }
+        assert!(!session.buffer(query).unwrap().unread);
+        assert!(session.buffer(query).unwrap().hidden);
+    }
+
+    #[test]
+    fn connection_notes_follow_state_transitions() {
+        use super::*;
+        let mut session = Session::default();
+        let console = session.open_server("srv");
+        session.apply_connection_event(&IrcEvent::Connection(
+            "srv".into(),
+            ConnectionState::Connecting,
+        ));
+        assert_eq!(session.messages_for(console).len(), 0);
+        session.apply_connection_event(&IrcEvent::Connection(
+            "srv".into(),
+            ConnectionState::Connected,
+        ));
+        assert_eq!(session.messages_for(console).len(), 1);
+        session.apply_connection_event(&IrcEvent::Connection(
+            "srv".into(),
+            ConnectionState::Connected,
+        ));
+        assert_eq!(session.messages_for(console).len(), 1);
+        session.apply_connection_event(&IrcEvent::Connection(
+            "srv".into(),
+            ConnectionState::Connecting,
+        ));
+        assert_eq!(session.messages_for(console).len(), 2);
+        assert_eq!(
+            session.messages_for(console)[1].text,
+            "Connection lost, reconnecting to srv"
+        );
+        session.apply_connection_event(&IrcEvent::Connection(
+            "srv".into(),
+            ConnectionState::Stopped,
+        ));
+        assert_eq!(session.messages_for(console).len(), 2);
+
+        let mut fresh = Session::default();
+        let console = fresh.open_server("srv");
+        fresh.apply_connection_event(&IrcEvent::Connection(
+            "srv".into(),
+            ConnectionState::Connected,
+        ));
+        fresh.apply_connection_event(&IrcEvent::Connection(
+            "srv".into(),
+            ConnectionState::Stopped,
+        ));
+        assert_eq!(fresh.messages_for(console)[1].text, "Disconnected from srv");
+    }
+
+    #[test]
+    fn connection_notes_use_display_label() {
+        use super::*;
+        let mut session = Session::default();
+        let console = session.open_server("OSU");
+        session.apply_connection_event(&IrcEvent::Connection(
+            "osu".into(),
+            ConnectionState::Connected,
+        ));
+        assert_eq!(session.messages_for(console)[0].text, "Connected to OSU");
+    }
+
+    #[test]
     fn supported_slash_commands_route_without_echo_or_ui_feedback() {
         use super::*;
         for console in [false, true] {
@@ -720,7 +836,12 @@ mod tests {
                 );
                 assert_eq!(ctrl_rx.try_recv().unwrap(), expected, "{input}");
                 assert!(out_rx.try_recv().is_err());
-                assert!(app.messages().is_empty());
+                assert!(
+                    app.messages()
+                        .iter()
+                        .all(|m| m.content.kind == MessageKind::System),
+                    "{input}"
+                );
 
                 assert_eq!(status, "existing status");
                 assert_eq!(app.input(), "");
@@ -890,7 +1011,11 @@ mod tests {
             app.restore_input("must not send".into());
             submit_composer(&mut app, &config, &connections, &mut String::new());
             assert!(messages.try_recv().is_err());
-            assert!(app.messages().is_empty());
+            assert!(
+                app.messages()
+                    .iter()
+                    .all(|m| m.content.kind == MessageKind::System)
+            );
             // The worker barrier releases fresh events from the new session.
             app.apply_connection_event(&IrcEvent::ControlApplied("srv".into()));
             app.apply_connection_event(&IrcEvent::Connection(
@@ -1073,9 +1198,9 @@ mod tests {
                         }
                     };
                     assert_eq!(rx.try_recv().unwrap(), expected);
-                    assert_eq!(app.messages().len(), 1);
-                    assert_eq!(app.messages()[0].text, input);
-                    assert_eq!(app.messages()[0].nick, "confirmed_nick");
+                    assert_eq!(app.messages().len(), 2);
+                    assert_eq!(app.messages()[1].text, input);
+                    assert_eq!(app.messages()[1].nick, "confirmed_nick");
                     assert_eq!(app.input(), "");
                 } else {
                     assert!(app.messages().is_empty());
@@ -1145,7 +1270,11 @@ mod tests {
             assert!(messages.try_recv().is_err());
             assert_eq!(session.input(), input);
             assert_eq!(session.input_cursor(), 4);
-            assert!(session.messages().is_empty());
+            assert_eq!(session.messages().len(), 1);
+            assert!(matches!(
+                session.messages()[0].content.kind,
+                MessageKind::System
+            ));
             assert!(status.contains("512"));
         }
     }
@@ -1165,7 +1294,11 @@ mod tests {
         submit_composer(&mut session, &empty_config(), &connections, &mut status);
         assert_eq!(session.input(), "  original 世界  ");
         assert_eq!(session.input_cursor(), 3);
-        assert!(session.messages().is_empty());
+        assert_eq!(session.messages().len(), 1);
+        assert!(matches!(
+            session.messages()[0].content.kind,
+            MessageKind::System
+        ));
         assert!(status.contains("failed to send"));
     }
 
@@ -1188,9 +1321,9 @@ mod tests {
         );
         assert_eq!(session.input(), "");
         assert_eq!(session.input_cursor(), 0);
-        assert_eq!(session.messages()[0].text, "PRIVMSG #a :hello  world  ");
-        assert_eq!(session.messages()[0].direction, Direction::Outgoing);
-        assert_eq!(session.messages()[0].delivery, DeliveryState::Unconfirmed);
+        assert_eq!(session.messages()[1].text, "PRIVMSG #a :hello  world  ");
+        assert_eq!(session.messages()[1].direction, Direction::Outgoing);
+        assert_eq!(session.messages()[1].delivery, DeliveryState::Unconfirmed);
     }
 
     #[test]
@@ -1261,7 +1394,11 @@ mod tests {
             assert_eq!(session.input(), input);
             assert_eq!(session.input_cursor(), 2);
             assert_eq!(status, "unchanged");
-            assert!(session.messages().is_empty());
+            assert_eq!(session.messages().len(), 1);
+            assert!(matches!(
+                session.messages()[0].content.kind,
+                MessageKind::System
+            ));
             assert_eq!(
                 session.connection_state("srv", None),
                 ConnectionState::Connected
