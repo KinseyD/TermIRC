@@ -210,18 +210,6 @@ Network tests use mock servers bound to `127.0.0.1`; the benchmark reads no
 user configuration and opens no connections. See the
 [refactor record](docs/refactor-2026-09-17.md) for regression coverage and measurements.
 
-## Roadmap
-
-- [x] Mouse support
-- [ ] Adaptive, flexible layout
-- [ ] Dynamic shortcut hints
-- [x] Logging
-- [ ] Persistent chat history
-- [ ] Show system messages (joins, parts, notices)
-- [ ] More complete IRC protocol support
-- [ ] Web previews / images in the terminal
-- [ ] Polished keybinding behavior
-
 ## Troubleshooting
 
 - **`failed to load config from …`** — create
