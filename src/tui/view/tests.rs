@@ -3,7 +3,107 @@ use crate::application::InputSubmission;
 use crate::command::SlashCommand;
 use crate::connection::{ConnectionState, IrcEvent};
 use crate::core::OutgoingMessage;
-use crate::core::{BufferKind, MessageContent, RoutedMessage};
+use crate::core::{BufferKind, ChannelState, ChannelStatus, MessageContent, RoutedMessage};
+
+#[test]
+fn dynamic_channel_insertion_keeps_queries_after_channels_and_tracks_sidebar_identity() {
+    let mut app = App::new(40, 3);
+    app.open_server("srv");
+    let query = app.open_query("srv", "alice");
+    app.activate_buffer(query);
+    app.restore_input_at("query draft".into(), 3);
+    app.focus_composer();
+    app.tab();
+    app.set_hover_sidebar(Some(1));
+    app.session.handle_event(IrcEvent::Channel(
+        "srv".into(),
+        "#dynamic".into(),
+        ChannelStatus {
+            state: ChannelState::Joined,
+            desired: true,
+        },
+    ));
+    app.tick(std::time::Duration::ZERO);
+    let rows = app.sidebar_rows();
+    assert_eq!(
+        rows.iter().map(|row| row.kind.clone()).collect::<Vec<_>>(),
+        vec![
+            BufferKind::Server,
+            BufferKind::Channel("#dynamic".into()),
+            BufferKind::Query("alice".into())
+        ]
+    );
+    assert_eq!(app.sidebar_cursor(), Some(2));
+    assert_eq!(app.sidebar_hovered(), Some(2));
+    assert_eq!(app.active_buffer().unwrap().id, query);
+    assert_eq!(app.input(), "query draft");
+    assert_eq!(app.input_cursor(), 3);
+    app.sidebar_up();
+    app.sidebar_enter();
+    assert_eq!(
+        app.active_buffer().unwrap().kind,
+        BufferKind::Channel("#dynamic".into())
+    );
+    assert_eq!(app.focus(), Focus::Composer);
+}
+
+#[test]
+fn join_command_focuses_channel_and_reuses_saved_view_and_destination_draft() {
+    use crate::application::submit_composer;
+    use crate::connection::ConnectionHandle;
+    use crate::core::ConnectionCommand;
+    let mut app = App::new(40, 3);
+    let console = app.open_server("srv");
+    app.open_query("srv", "alice");
+    app.activate_buffer(console);
+    app.apply_connection_event(&IrcEvent::Connection(
+        "srv".into(),
+        ConnectionState::Connected,
+    ));
+    let (outgoing, mut messages) = tokio::sync::mpsc::channel(8);
+    let (control, mut commands) = tokio::sync::mpsc::channel(8);
+    let connections =
+        std::collections::HashMap::from([("srv".into(), ConnectionHandle { outgoing, control })]);
+    let config = crate::config::Config {
+        servers: Default::default(),
+    };
+    app.restore_input("/join #New".into());
+    let effect = submit_composer(&mut app.session, &config, &connections, &mut String::new());
+    app.apply_submission_effect(effect);
+    let channel = app.active_buffer().unwrap().id;
+    assert_eq!(
+        commands.try_recv().unwrap(),
+        ConnectionCommand::Join("#New".into())
+    );
+    assert_eq!(app.focus(), Focus::Composer);
+    assert_eq!(app.sidebar_rows()[1].id, Some(channel));
+    assert_eq!(app.sidebar_cursor(), None);
+    assert!(messages.try_recv().is_err());
+    for index in 0..8 {
+        app.push_message(RoutedMessage::chat(
+            "srv",
+            "#New",
+            "alice",
+            &format!("message {index}"),
+        ));
+    }
+    app.click_message(5);
+    app.restore_input_at("channel draft".into(), 4);
+    let offset = app.scroll_offset();
+    let selected = app.selected();
+    app.apply_submission_effect(SubmissionEffect::Activate(console));
+    app.restore_input("/join #NEW".into());
+    let effect = submit_composer(&mut app.session, &config, &connections, &mut String::new());
+    app.apply_submission_effect(effect);
+    assert_eq!(app.active_buffer().unwrap().id, channel);
+    assert_eq!(app.scroll_offset(), offset);
+    assert_eq!(app.selected(), selected);
+    assert_eq!(app.input(), "channel draft");
+    assert_eq!(app.input_cursor(), 4);
+    assert!(app.buffer(console).unwrap().draft.text().is_empty());
+    assert!(commands.try_recv().is_err());
+    assert_eq!(app.messages().len(), 8);
+}
 
 #[test]
 fn sidebar_groups_interleaved_registrations_by_first_server() {
@@ -225,6 +325,14 @@ fn msg_to(server: &str, channel: &str, nick: &str, text: &str) -> RoutedMessage 
 fn consecutive_connection_requests_wait_for_every_worker_acknowledgement() {
     let mut app = App::new(40, 10);
     app.open_channel("srv", "#a");
+    app.apply_connection_event(&IrcEvent::Channel(
+        "srv".into(),
+        "#a".into(),
+        ChannelStatus {
+            state: ChannelState::Joined,
+            desired: true,
+        },
+    ));
     app.begin_connection_change("srv", ConnectionState::Stopped);
     app.begin_connection_change("srv", ConnectionState::Connecting);
     app.apply_connection_event(&IrcEvent::ControlApplied("srv".into()));
@@ -235,7 +343,10 @@ fn consecutive_connection_requests_wait_for_every_worker_acknowledgement() {
     app.apply_connection_event(&IrcEvent::Channel(
         "srv".into(),
         "#a".into(),
-        ConnectionState::Connected,
+        ChannelStatus {
+            state: ChannelState::Joined,
+            desired: true,
+        },
     ));
     assert_eq!(
         app.connection_state("srv", None),
@@ -253,7 +364,10 @@ fn consecutive_connection_requests_wait_for_every_worker_acknowledgement() {
     app.apply_connection_event(&IrcEvent::Channel(
         "srv".into(),
         "#a".into(),
-        ConnectionState::Connected,
+        ChannelStatus {
+            state: ChannelState::Joined,
+            desired: true,
+        },
     ));
     assert_eq!(
         app.connection_state("srv", None),

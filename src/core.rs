@@ -264,6 +264,35 @@ pub enum ConnectionCommand {
     Nick(String),
     Away(Option<String>),
     Back,
+    Join(String),
+    Part {
+        channel: String,
+        reason: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChannelState {
+    #[default]
+    NotJoined,
+    Joining,
+    Joined,
+    Parting,
+    Uncertain,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ChannelStatus {
+    pub state: ChannelState,
+    pub desired: bool,
+}
+
+pub fn valid_channel_name(channel: &str) -> bool {
+    channel.len() > 1
+        && channel.starts_with(['#', '&'])
+        && !channel.chars().any(|character| {
+            character.is_whitespace() || character.is_control() || matches!(character, ',' | ':')
+        })
 }
 
 /// A message the user wants to send through one of our connections.

@@ -6,6 +6,7 @@
 //! way through a bounded tokio channel (`OutgoingMessage`). One thread is
 //! spawned per configured server, each joining all of that server's channels.
 
+mod channels;
 mod session;
 
 use std::sync::mpsc;
@@ -14,7 +15,7 @@ use std::thread;
 use irc::client::prelude::Config as IrcClientConfig;
 
 use crate::config::ServerConfig;
-use crate::core::{ConnectionCommand, OutgoingMessage, RoutedMessage};
+use crate::core::{ChannelStatus, ConnectionCommand, OutgoingMessage, RoutedMessage};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConnectionState {
@@ -52,7 +53,8 @@ pub enum IrcEvent {
     /// Ordered barrier: the worker has consumed a manual disconnect/reconnect.
     ControlApplied(String),
     Connection(String, ConnectionState),
-    Channel(String, String, ConnectionState),
+    Channel(String, String, ChannelStatus),
+    ChannelControlApplied(String, String),
     Nickname(String, String),
     PeerNickname(String, String, String),
     Away(String, bool),
@@ -70,9 +72,8 @@ pub enum IrcEvent {
 /// starts failing (the UI never blocks on a send).
 const OUTGOING_CAPACITY: usize = 64;
 
-/// Map our server settings onto the irc crate's client configuration,
-/// joining every channel in `channels`.
-pub fn build_client_config(server: &ServerConfig, channels: &[String]) -> IrcClientConfig {
+/// Map transport settings without enabling the IRC library's automatic JOIN.
+pub fn build_client_config(server: &ServerConfig) -> IrcClientConfig {
     IrcClientConfig {
         nickname: Some(server.nickname.clone()),
         username: Some(server.username.clone()),
@@ -81,7 +82,7 @@ pub fn build_client_config(server: &ServerConfig, channels: &[String]) -> IrcCli
         port: Some(server.port),
         password: Some(server.password.clone()),
         use_tls: Some(server.use_tls),
-        channels: channels.to_vec(),
+        channels: Vec::new(),
         ..Default::default()
     }
 }
@@ -147,7 +148,7 @@ mod tests {
         let server = server_config();
 
         // Act
-        let client_config = build_client_config(&server, &server.channels);
+        let client_config = build_client_config(&server);
 
         // Assert
         assert_eq!(client_config.server.as_deref(), Some("irc.example.org"));
@@ -159,15 +160,14 @@ mod tests {
     }
 
     #[test]
-    fn joins_every_configured_channel() {
+    fn leaves_automatic_join_to_the_worker() {
         // Arrange
         let server = server_config();
 
         // Act
-        let client_config = build_client_config(&server, &server.channels);
+        let client_config = build_client_config(&server);
 
-        // Assert: both channels are joined, in config order.
-        assert_eq!(client_config.channels, server.channels);
+        assert!(client_config.channels.is_empty());
     }
 
     #[test]
@@ -176,7 +176,7 @@ mod tests {
         let server = server_config();
 
         // Act
-        let client_config = build_client_config(&server, &server.channels);
+        let client_config = build_client_config(&server);
 
         // Assert
         assert_eq!(client_config.realname.as_deref(), Some("alice_"));

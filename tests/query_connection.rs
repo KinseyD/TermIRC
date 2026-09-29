@@ -264,6 +264,7 @@ fn private_reply_numerics_preserve_query_and_structured_error_destinations() {
 #[test]
 fn outgoing_private_message_reaches_wire_before_any_join_confirmation() {
     let mut session = MockSession::start(vec!["#pending".into()]);
+    assert_eq!(session.read_line(), "JOIN #pending\r\n");
     session
         .handle
         .as_ref()
