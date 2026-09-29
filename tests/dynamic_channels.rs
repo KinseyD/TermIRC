@@ -94,6 +94,9 @@ impl MockSession {
                 Err(error) => panic!("accept failed: {error}"),
             }
         };
+        // Windows: accepted sockets inherit the listener's non-blocking mode;
+        // restore blocking reads so read timeouts work on every platform.
+        socket.set_nonblocking(false).unwrap();
         socket.set_read_timeout(Some(WAIT)).unwrap();
         socket.set_write_timeout(Some(WAIT)).unwrap();
         self.socket = Some(BufReader::new(socket));
