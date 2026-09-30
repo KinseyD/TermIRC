@@ -161,6 +161,12 @@ impl MockSession {
             if line.starts_with("PING ") && line.contains("wire-barrier") {
                 return lines;
             }
+            // The irc crate pings once right after the MOTD (its interval's
+            // first tick is immediate), and heavy CI runners delay that write
+            // into this capture window; keepalive payloads are bare timestamps.
+            if line.starts_with("PING ") && line[5..].bytes().all(|b| b.is_ascii_digit()) {
+                continue;
+            }
             lines.push(line);
         }
     }
