@@ -417,3 +417,195 @@ fn query_send_failures_keep_text_cursor_and_history_unchanged() {
         assert!(received.try_recv().is_err());
     }
 }
+
+fn connected_session(server_buffer: usize) -> Session {
+    let mut session = Session::default();
+    session.open_server("srv");
+    session.select_buffer(server_buffer);
+    session.apply_connection_event(&IrcEvent::Connection(
+        "srv".into(),
+        ConnectionState::Connected,
+    ));
+    session.apply_connection_event(&IrcEvent::Nickname("srv".into(), "me".into()));
+    session
+}
+
+fn handles() -> (
+    HashMap<String, ConnectionHandle>,
+    tokio::sync::mpsc::Receiver<OutgoingMessage>,
+) {
+    let (outgoing, received) = tokio::sync::mpsc::channel(4);
+    let (control, commands) = tokio::sync::mpsc::channel(4);
+    std::mem::forget(commands);
+    (
+        HashMap::from([("srv".into(), ConnectionHandle { outgoing, control })]),
+        received,
+    )
+}
+
+#[test]
+fn echoed_channel_message_confirms_local_echo_without_duplicating() {
+    let mut session = connected_session(0);
+    let channel = session.open_channel("srv", "#chan");
+    session.apply_connection_event(&IrcEvent::Channel(
+        "srv".into(),
+        "#chan".into(),
+        ChannelStatus {
+            state: ChannelState::Joined,
+            desired: true,
+        },
+    ));
+    session.push_message(RoutedMessage {
+        server: "srv".into(),
+        target: BufferKind::Channel("#chan".into()),
+        content: MessageContent {
+            direction: Direction::Outgoing,
+            delivery: DeliveryState::Unconfirmed,
+            ..MessageContent::chat("me", "hi there")
+        },
+    });
+    assert_eq!(session.messages_for(channel).len(), 1);
+    session.handle_event(IrcEvent::Message(RoutedMessage {
+        server: "srv".into(),
+        target: BufferKind::Channel("#chan".into()),
+        content: MessageContent::chat("me", "hi there"),
+    }));
+    assert_eq!(session.messages_for(channel).len(), 1);
+    assert_eq!(
+        session.messages_for(channel)[0].delivery,
+        DeliveryState::Confirmed
+    );
+    assert_eq!(
+        session.messages_for(channel)[0].direction,
+        Direction::Outgoing
+    );
+}
+
+#[test]
+fn self_channel_message_without_local_echo_appends_confirmed() {
+    let mut session = connected_session(0);
+    let channel = session.open_channel("srv", "#chan");
+    session.apply_connection_event(&IrcEvent::Channel(
+        "srv".into(),
+        "#chan".into(),
+        ChannelStatus {
+            state: ChannelState::Joined,
+            desired: true,
+        },
+    ));
+    session.handle_event(IrcEvent::Message(RoutedMessage {
+        server: "srv".into(),
+        target: BufferKind::Channel("#chan".into()),
+        content: MessageContent::chat("me", "hi there"),
+    }));
+    assert_eq!(session.messages_for(channel).len(), 1);
+    assert_eq!(
+        session.messages_for(channel)[0].delivery,
+        DeliveryState::Confirmed
+    );
+    assert_eq!(
+        session.messages_for(channel)[0].direction,
+        Direction::Incoming
+    );
+}
+
+#[test]
+fn msg_command_opens_query_sends_privmsg_and_activates() {
+    let mut session = connected_session(0);
+    session.restore_input("/msg alice hi there".into());
+    let (handles, mut received) = handles();
+    let effect = submit_composer(&mut session, &config(), &handles, &mut String::new());
+    assert_eq!(
+        received.try_recv().unwrap(),
+        OutgoingMessage::Privmsg {
+            server: "srv".into(),
+            target: "alice".into(),
+            text: "hi there".into(),
+        }
+    );
+    let query = session.open_buffer("srv", BufferKind::Query("alice".into()));
+    assert_eq!(effect, SubmissionEffect::Activate(query));
+    let messages = session.messages_for(query);
+    assert_eq!(messages[0].text, "hi there");
+    assert_eq!(messages[0].nick, "me");
+    assert_eq!(messages[0].delivery, DeliveryState::Unconfirmed);
+    assert_eq!(session.input(), "");
+}
+
+#[test]
+fn msg_command_sends_to_joined_channel_without_activation() {
+    let mut session = connected_session(0);
+    let channel = session.open_channel("srv", "#chan");
+    session.apply_connection_event(&IrcEvent::Channel(
+        "srv".into(),
+        "#chan".into(),
+        ChannelStatus {
+            state: ChannelState::Joined,
+            desired: true,
+        },
+    ));
+    session.restore_input("/msg #CHAN hello".into());
+    let (handles, mut received) = handles();
+    let effect = submit_composer(&mut session, &config(), &handles, &mut String::new());
+    assert_eq!(
+        received.try_recv().unwrap(),
+        OutgoingMessage::Privmsg {
+            server: "srv".into(),
+            target: "#CHAN".into(),
+            text: "hello".into(),
+        }
+    );
+    assert_eq!(effect, SubmissionEffect::None);
+    assert_eq!(session.messages_for(channel)[0].text, "hello");
+    assert_eq!(
+        session.messages_for(channel)[0].delivery,
+        DeliveryState::Unconfirmed
+    );
+}
+
+#[test]
+fn msg_command_rejects_channel_target_we_have_not_joined() {
+    let mut session = connected_session(0);
+    session.open_channel("srv", "#chan");
+    session.restore_input("/msg #chan hello".into());
+    let (handles, mut received) = handles();
+    let effect = submit_composer(&mut session, &config(), &handles, &mut String::new());
+    assert_eq!(effect, SubmissionEffect::None);
+    assert!(received.try_recv().is_err());
+    assert_eq!(session.input(), "/msg #chan hello");
+}
+
+#[test]
+fn me_command_sends_ctcp_action_and_echoes_display_form() {
+    let mut session = connected_session(0);
+    let query = session.open_query("srv", "alice");
+    session.select_buffer_id(query);
+    session.restore_input("/me dances".into());
+    let (handles, mut received) = handles();
+    let effect = submit_composer(&mut session, &config(), &handles, &mut String::new());
+    assert_eq!(effect, SubmissionEffect::None);
+    assert_eq!(
+        received.try_recv().unwrap(),
+        OutgoingMessage::Privmsg {
+            server: "srv".into(),
+            target: "alice".into(),
+            text: "\u{1}ACTION dances\u{1}".into(),
+        }
+    );
+    let messages = session.messages_for(query);
+    assert_eq!(messages[0].kind, MessageKind::Action);
+    assert_eq!(messages[0].text, "* dances");
+    assert_eq!(messages[0].delivery, DeliveryState::Unconfirmed);
+    assert_eq!(session.input(), "");
+}
+
+#[test]
+fn me_command_rejects_console_and_unjoined_channel_buffers() {
+    let mut session = connected_session(0);
+    session.restore_input("/me dances".into());
+    let (handles, mut received) = handles();
+    let effect = submit_composer(&mut session, &config(), &handles, &mut String::new());
+    assert_eq!(effect, SubmissionEffect::None);
+    assert!(received.try_recv().is_err());
+    assert_eq!(session.input(), "/me dances");
+}

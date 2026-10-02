@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use crate::core::{BufferId, Message, MessageContent, MessageId};
+use crate::core::{BufferId, DeliveryState, Direction, Message, MessageContent, MessageId};
 
 /// IDs affected by an append, used to maintain viewport and selection anchors.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +53,25 @@ impl HistoryStore {
             evicted.push(messages.pop_front().expect("nonempty history").id);
         }
         HistoryChange { inserted, evicted }
+    }
+
+    /// Mark the newest outgoing unconfirmed echo whose text matches as
+    /// confirmed. The server's echo-message replaces our local copy instead
+    /// of appending a duplicate; false means no pending echo matched.
+    pub fn confirm_echo(&mut self, buffer: BufferId, text: &str) -> bool {
+        let Some(messages) = self.buffers.get_mut(&buffer) else {
+            return false;
+        };
+        messages
+            .iter_mut()
+            .rev()
+            .find(|message| {
+                message.direction == Direction::Outgoing
+                    && message.delivery == DeliveryState::Unconfirmed
+                    && message.text == text
+            })
+            .map(|message| message.content.delivery = DeliveryState::Confirmed)
+            .is_some()
     }
 
     /// Messages ordered oldest first; unknown buffers have an empty history.

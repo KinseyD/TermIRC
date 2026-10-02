@@ -21,6 +21,10 @@ pub struct ServerConfig {
     pub port: u16,
     pub channels: Vec<String>,
     #[serde(default)]
+    pub sasl_username: Option<String>,
+    #[serde(default)]
+    pub sasl_password: Option<String>,
+    #[serde(default)]
     pub queries: Vec<String>,
 }
 
@@ -35,6 +39,8 @@ impl std::fmt::Debug for ServerConfig {
             .field("use_tls", &self.use_tls)
             .field("port", &self.port)
             .field("channels", &self.channels)
+            .field("sasl_username", &self.sasl_username)
+            .field("sasl_password", &"<redacted>")
             .field("queries", &self.queries)
             .finish()
     }
@@ -83,6 +89,27 @@ impl Config {
                     .all(|nickname| valid_query_nickname(nickname)),
                 "queries must contain individual nicknames, not channels or multiple targets"
             );
+            let sasl = match (&server.sasl_username, &server.sasl_password) {
+                (Some(username), Some(password)) => Some((username, password)),
+                (None, None) => None,
+                _ => anyhow::bail!(
+                    "sasl_requires_username_and_password: set both sasl_username and sasl_password, or neither"
+                ),
+            };
+            if let Some((username, password)) = sasl {
+                anyhow::ensure!(
+                    !username.contains(['\0', '\r', '\n'])
+                        && !password.contains(['\0', '\r', '\n']),
+                    "sasl credentials must not contain NUL, CR, or LF characters"
+                );
+                // AUTHENTICATE carries at most 400 base64 characters per
+                // line; refusing longer payloads keeps SASL PLAIN unchunked.
+                let payload = 2 + username.len() + password.len();
+                anyhow::ensure!(
+                    4 * payload.div_ceil(3) <= 400,
+                    "sasl_credentials_too_long: encoded SASL PLAIN payload would exceed 400 bytes"
+                );
+            }
         }
         Ok(config)
     }
@@ -106,6 +133,57 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn server_toml(extra: &str) -> String {
+        format!(
+            "[servers.test]\nusername='me'\nnickname='me'\npassword=''\nserver='localhost'\nport=6667\nchannels=[]\n{extra}"
+        )
+    }
+
+    #[test]
+    fn sasl_credentials_must_be_set_together_and_bounded() {
+        assert!(
+            Config::parse(&server_toml(
+                "sasl_username='jilles'\nsasl_password='sesame'\n"
+            ))
+            .is_ok()
+        );
+        for extra in [
+            "sasl_username='jilles'\n",
+            "sasl_password='sesame'\n",
+            "sasl_username=\"a\\u0000b\"\nsasl_password=\"x\"\n",
+            "sasl_username=\"a\"\nsasl_password=\"b\\u000d\"\n",
+        ] {
+            let error = Config::parse(&server_toml(extra)).unwrap_err().to_string();
+            assert!(
+                error.contains("sasl_requires_username_and_password")
+                    || error.contains("NUL, CR, or LF"),
+                "accepted {extra:?} ({error})"
+            );
+        }
+        let long = "x".repeat(400);
+        let error = Config::parse(&server_toml(&format!(
+            "sasl_username='user'\nsasl_password='{long}'\n"
+        )))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("sasl_credentials_too_long"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn debug_output_redacts_sasl_password() {
+        let config = Config::parse(&server_toml(
+            "sasl_username='jilles'\nsasl_password='sesame'\n",
+        ))
+        .unwrap();
+        let rendered = format!("{:?}", config.servers["test"]);
+        assert!(rendered.contains("sasl_username"));
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains("sesame"));
+    }
 
     #[test]
     fn rejects_unmanaged_configured_channels() {

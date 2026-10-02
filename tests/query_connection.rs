@@ -34,6 +34,8 @@ impl MockSession {
             use_tls: false,
             channels: channels.clone(),
             queries: vec![],
+            sasl_username: None,
+            sasl_password: None,
         };
         let (sender, events) = mpsc::channel();
         let (worker, handle) = spawn_irc_with_policy(

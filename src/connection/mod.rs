@@ -7,6 +7,7 @@
 //! spawned per configured server, each joining all of that server's channels.
 
 mod channels;
+mod sasl;
 mod session;
 
 use std::sync::mpsc;
@@ -139,6 +140,8 @@ mod tests {
             port: 6667,
             channels: vec!["#osu".to_string(), "#chinese".to_string()],
             queries: vec![],
+            sasl_username: None,
+            sasl_password: None,
         }
     }
 

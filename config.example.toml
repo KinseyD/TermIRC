@@ -1,7 +1,10 @@
 [servers.example]
 username = "YourName"
 nickname = "YourName"
-password = ""
+# SASL PLAIN authentication (optional): set both keys together or neither.
+# On failure the server connection stops permanently instead of retrying.
+# sasl_username = "YourAccount"
+# sasl_password = "YourSaslPassword"
 server = "irc.example.org"
 use_tls = true
 port = 6697

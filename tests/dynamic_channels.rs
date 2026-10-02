@@ -46,6 +46,8 @@ impl MockSession {
             port: listener.local_addr().unwrap().port(),
             channels: channels.iter().map(|channel| (*channel).into()).collect(),
             queries: vec![],
+            sasl_username: None,
+            sasl_password: None,
         };
         let config = Config {
             servers: [("srv".into(), server.clone())].into_iter().collect(),

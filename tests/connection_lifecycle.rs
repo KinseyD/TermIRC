@@ -19,6 +19,8 @@ fn config(port: u16) -> ServerConfig {
         use_tls: false,
         channels: vec!["#ok".into(), "#bad".into()],
         queries: vec![],
+        sasl_username: None,
+        sasl_password: None,
     }
 }
 

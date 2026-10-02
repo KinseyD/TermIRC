@@ -28,6 +28,8 @@ fn server_config_for(port: u16) -> ServerConfig {
         port,
         channels: vec!["#test".to_string(), "#test2".to_string()],
         queries: vec![],
+        sasl_username: None,
+        sasl_password: None,
     }
 }
 

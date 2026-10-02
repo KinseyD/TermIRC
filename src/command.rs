@@ -23,6 +23,11 @@ pub enum CommandAction {
     Close,
     Nick(String),
     Away(Option<String>),
+    Msg {
+        target: String,
+        text: String,
+    },
+    Me(String),
     Back,
     Connect(Option<String>),
     Reconnect(Option<String>),
@@ -78,6 +83,27 @@ impl SlashCommand {
             }
             "away" => Ok(Away(optional())),
             "back" if args.is_empty() => Ok(Back),
+            "msg" => {
+                let Some(end) = args.find(char::is_whitespace) else {
+                    return Err(CommandError::InvalidArguments);
+                };
+                let target = &args[..end];
+                let text = args[end..].trim_start();
+                if target.is_empty() || target.starts_with(':') || text.is_empty() {
+                    return Err(CommandError::InvalidArguments);
+                }
+                Ok(Msg {
+                    target: target.into(),
+                    text: text.into(),
+                })
+            }
+            "me" => {
+                let text = args.trim();
+                if text.is_empty() {
+                    return Err(CommandError::InvalidArguments);
+                }
+                Ok(Me(text.into()))
+            }
             "connect" if args.is_empty() || single => Ok(Connect(optional())),
             "reconnect" if args.is_empty() || single => Ok(Reconnect(optional())),
             "disconnect" | "quit" => Ok(Disconnect(args.into())),
@@ -108,6 +134,61 @@ pub fn parse_slash_command(input: &str) -> Option<Result<SlashCommand, SlashPars
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn msg_requires_target_and_text_without_prefix_colon() {
+        for (input, expected) in [
+            (
+                "/msg alice hi  there",
+                CommandAction::Msg {
+                    target: "alice".into(),
+                    text: "hi  there".into(),
+                },
+            ),
+            (
+                "/MSG #Room hello",
+                CommandAction::Msg {
+                    target: "#Room".into(),
+                    text: "hello".into(),
+                },
+            ),
+        ] {
+            assert_eq!(
+                parse_slash_command(input).unwrap().unwrap().action(),
+                Ok(expected),
+                "{input}"
+            );
+        }
+        for input in ["/msg", "/msg alice", "/msg alice ", "/msg :prefixed hello"] {
+            assert_eq!(
+                parse_slash_command(input).unwrap().unwrap().action(),
+                Err(CommandError::InvalidArguments),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn me_requires_nonempty_trimmed_text() {
+        assert_eq!(
+            parse_slash_command("/me dances").unwrap().unwrap().action(),
+            Ok(CommandAction::Me("dances".into()))
+        );
+        assert_eq!(
+            parse_slash_command("/ME   waves  ")
+                .unwrap()
+                .unwrap()
+                .action(),
+            Ok(CommandAction::Me("waves".into()))
+        );
+        for input in ["/me", "/me   "] {
+            assert_eq!(
+                parse_slash_command(input).unwrap().unwrap().action(),
+                Err(CommandError::InvalidArguments),
+                "{input}"
+            );
+        }
+    }
 
     #[test]
     fn join_and_part_are_channel_commands() {

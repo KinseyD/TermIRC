@@ -13,7 +13,9 @@ use crate::core::{
     ServerId,
 };
 use crate::history::{HistoryChange, HistoryStore};
-use crate::protocol::{SendError, channel_control_from_raw, encode_outgoing, validate_control};
+use crate::protocol::{
+    SendError, action_display, channel_control_from_raw, encode_outgoing, validate_control,
+};
 
 mod channels;
 mod queries;
@@ -178,6 +180,33 @@ impl Session {
     /// registered target remain visible in the originating server's console.
     pub fn push_message(&mut self, mut message: RoutedMessage) -> Option<HistoryChange> {
         self.route_query_error(&mut message);
+        // With echo-message, a PRIVMSG from our confirmed nick echoes what we
+        // already optimistically displayed: confirm that copy and drop the
+        // duplicate instead of appending a second line.
+        if message.content.direction == Direction::Incoming
+            && matches!(
+                message.content.kind,
+                MessageKind::Chat | MessageKind::Action
+            )
+            && self
+                .servers
+                .get(&message.server)
+                .and_then(|state| state.nickname.as_deref())
+                .is_some_and(|nick| nick.eq_ignore_ascii_case(&message.content.nick))
+        {
+            let buffer = self
+                .buffers
+                .iter()
+                .find(|buffer| {
+                    buffer.server == message.server && buffer.kind.matches(&message.target)
+                })
+                .map(|buffer| buffer.id);
+            if buffer.is_some_and(|id| self.history.confirm_echo(id, &message.content.text)) {
+                return None;
+            }
+            // Not ours to confirm (never echoed locally); still authoritative.
+            message.content.delivery = DeliveryState::Confirmed;
+        }
         if matches!(message.target, BufferKind::Query(_)) {
             if self.consume_self_echo(&message) {
                 return None;
@@ -494,7 +523,15 @@ pub fn submit_composer(
                         CommandError::Unsupported => "unsupported",
                         CommandError::InvalidArguments => "invalid_arguments",
                     })
-                    .and_then(|action| execute_command(session, connections, action))
+                    .and_then(|action| {
+                        Composer {
+                            session,
+                            config,
+                            connections,
+                            status,
+                        }
+                        .execute_command(action)
+                    })
             };
             match result {
                 Ok(effect) => {
@@ -534,7 +571,14 @@ pub fn submit_composer(
                     },
                     _ => return SubmissionEffect::None,
                 };
-                return match execute_command(session, connections, action) {
+                let outcome = Composer {
+                    session,
+                    config,
+                    connections,
+                    status,
+                }
+                .execute_command(action);
+                return match outcome {
                     Ok(effect) => {
                         session.clear_source_draft(source);
                         effect
@@ -616,84 +660,226 @@ pub fn submit_composer(
     SubmissionEffect::None
 }
 
-fn execute_command(
-    session: &mut Session,
-    connections: &HashMap<String, ConnectionHandle>,
-    action: CommandAction,
-) -> Result<SubmissionEffect, &'static str> {
-    match &action {
-        CommandAction::Query(nickname) => {
-            let server = session
-                .active_buffer()
-                .ok_or("no_server")?
-                .server_label
-                .clone();
-            return Ok(SubmissionEffect::Activate(
-                session.open_query(&server, nickname),
-            ));
+/// The composer's send environment: session state plus the configuration,
+/// live connections, and status line used to report send failures.
+struct Composer<'a> {
+    session: &'a mut Session,
+    config: &'a Config,
+    connections: &'a HashMap<String, ConnectionHandle>,
+    status: &'a mut String,
+}
+
+impl Composer<'_> {
+    fn execute_command(&mut self, action: CommandAction) -> Result<SubmissionEffect, &'static str> {
+        match &action {
+            CommandAction::Query(nickname) => {
+                let server = self
+                    .session
+                    .active_buffer()
+                    .ok_or("no_server")?
+                    .server_label
+                    .clone();
+                return Ok(SubmissionEffect::Activate(
+                    self.session.open_query(&server, nickname),
+                ));
+            }
+            CommandAction::Close => {
+                let current = self.session.active.ok_or("no_query")?;
+                return self
+                    .session
+                    .close_query(current)
+                    .map(SubmissionEffect::Activate)
+                    .ok_or("not_query");
+            }
+            CommandAction::Msg { target, text } => {
+                let server = self
+                    .session
+                    .active_buffer()
+                    .ok_or("no_server")?
+                    .server_label
+                    .clone();
+                let (kind, effect) = if target.starts_with(['#', '&']) {
+                    let index = self
+                        .session
+                        .channel_index(&server, target)
+                        .ok_or("not_on_channel")?;
+                    if self.session.buffers[index].channel_status.state != ChannelState::Joined {
+                        return Err("not_on_channel");
+                    }
+                    (BufferKind::Channel(target.clone()), SubmissionEffect::None)
+                } else {
+                    let id = self.session.open_query(&server, target);
+                    (
+                        BufferKind::Query(target.clone()),
+                        SubmissionEffect::Activate(id),
+                    )
+                };
+                return self
+                    .send_with_local_echo(
+                        &server,
+                        kind,
+                        text.clone(),
+                        text.clone(),
+                        MessageKind::Chat,
+                    )
+                    .map(|sent| {
+                        if matches!(effect, SubmissionEffect::None) {
+                            sent
+                        } else {
+                            effect
+                        }
+                    });
+            }
+            CommandAction::Me(text) => {
+                let (server, kind) = {
+                    let buffer = self.session.active_buffer().ok_or("no_chat_target")?;
+                    match &buffer.kind {
+                        BufferKind::Query(_) => (buffer.server_label.clone(), buffer.kind.clone()),
+                        BufferKind::Channel(channel)
+                            if self
+                                .session
+                                .channel_status(&buffer.server_label, channel)
+                                .state
+                                == ChannelState::Joined =>
+                        {
+                            (buffer.server_label.clone(), buffer.kind.clone())
+                        }
+                        _ => return Err("no_chat_target"),
+                    }
+                };
+                let wire = format!("\u{1}ACTION {text}\u{1}");
+                let display = action_display(&wire).unwrap_or_else(|| text.clone());
+                return self.send_with_local_echo(
+                    &server,
+                    kind,
+                    wire,
+                    display,
+                    MessageKind::Action,
+                );
+            }
+            _ => {}
         }
-        CommandAction::Close => {
-            let current = session.active.ok_or("no_query")?;
-            return session
-                .close_query(current)
-                .map(SubmissionEffect::Activate)
-                .ok_or("not_query");
+        let explicit = match &action {
+            CommandAction::Connect(server) | CommandAction::Reconnect(server) => server.as_deref(),
+            _ => None,
+        };
+        let requested = explicit
+            .or_else(|| {
+                self.session
+                    .active_buffer()
+                    .map(|buffer| buffer.server_label.as_str())
+            })
+            .ok_or("no_server")?;
+        let (server, handle) = self
+            .connections
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(requested))
+            .ok_or("unknown_server")?;
+        let current = self.session.connection_state(server, None);
+        let (command, next) = match action {
+            CommandAction::Connect(_) => (ConnectionCommand::Connect, None),
+            CommandAction::Reconnect(_) => (
+                ConnectionCommand::Reconnect,
+                Some(ConnectionState::Connecting),
+            ),
+            CommandAction::Disconnect(reason) => (
+                ConnectionCommand::Disconnect(reason),
+                Some(ConnectionState::Stopped),
+            ),
+            _ if current != ConnectionState::Connected => return Err("not_connected"),
+            CommandAction::Nick(nick) => (ConnectionCommand::Nick(nick), None),
+            CommandAction::Away(reason) => (ConnectionCommand::Away(reason), None),
+            CommandAction::Back => (ConnectionCommand::Back, None),
+            CommandAction::Join(channel) => {
+                return self.session.join_channel(server, &channel, handle);
+            }
+            CommandAction::Part { channel, reason } => {
+                let channel = channel
+                    .or_else(|| {
+                        self.session
+                            .active_buffer()
+                            .and_then(|buffer| buffer.kind.channel())
+                            .map(str::to_owned)
+                    })
+                    .ok_or("no_channel")?;
+                return self.session.part_channel(server, &channel, reason, handle);
+            }
+            CommandAction::Query(_)
+            | CommandAction::Close
+            | CommandAction::Msg { .. }
+            | CommandAction::Me(_) => return Err("invalid_command"),
+        };
+        validate_control(&command).map_err(|_| "invalid_control")?;
+        handle
+            .control
+            .try_send(command)
+            .map_err(|_| "disconnected_or_busy")?;
+        if let Some(state) = next {
+            self.session.begin_connection_change(server, state);
         }
-        _ => {}
+        Ok(SubmissionEffect::None)
     }
-    let explicit = match &action {
-        CommandAction::Connect(server) | CommandAction::Reconnect(server) => server.as_deref(),
-        _ => None,
-    };
-    let requested = explicit
-        .or_else(|| {
-            session
-                .active_buffer()
-                .map(|buffer| buffer.server_label.as_str())
-        })
-        .ok_or("no_server")?;
-    let (server, handle) = connections
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case(requested))
-        .ok_or("unknown_server")?;
-    let current = session.connection_state(server, None);
-    let (command, next) = match action {
-        CommandAction::Connect(_) => (ConnectionCommand::Connect, None),
-        CommandAction::Reconnect(_) => (
-            ConnectionCommand::Reconnect,
-            Some(ConnectionState::Connecting),
-        ),
-        CommandAction::Disconnect(reason) => (
-            ConnectionCommand::Disconnect(reason),
-            Some(ConnectionState::Stopped),
-        ),
-        _ if current != ConnectionState::Connected => return Err("not_connected"),
-        CommandAction::Nick(nick) => (ConnectionCommand::Nick(nick), None),
-        CommandAction::Away(reason) => (ConnectionCommand::Away(reason), None),
-        CommandAction::Back => (ConnectionCommand::Back, None),
-        CommandAction::Join(channel) => return session.join_channel(server, &channel, handle),
-        CommandAction::Part { channel, reason } => {
-            let channel = channel
-                .or_else(|| {
-                    session
-                        .active_buffer()
-                        .and_then(|buffer| buffer.kind.channel())
-                        .map(str::to_owned)
-                })
-                .ok_or("no_channel")?;
-            return session.part_channel(server, &channel, reason, handle);
+
+    /// Send one outgoing PRIVMSG and display the optimistic local echo,
+    /// shared by `/msg` and `/me`. Wire text and displayed text differ for
+    /// CTCP ACTION.
+    fn send_with_local_echo(
+        &mut self,
+        server: &str,
+        target: BufferKind,
+        wire_text: String,
+        echo_text: String,
+        kind: MessageKind,
+    ) -> Result<SubmissionEffect, &'static str> {
+        let (BufferKind::Channel(name) | BufferKind::Query(name)) = &target else {
+            return Err("no_chat_target");
+        };
+        let outgoing = OutgoingMessage::Privmsg {
+            server: server.to_owned(),
+            target: name.clone(),
+            text: wire_text,
+        };
+        encode_outgoing(&outgoing).map_err(|error| {
+            *self.status = format!("failed to send ({error})");
+            "message_rejected"
+        })?;
+        let ready = self.session.connection_state(server, None) == ConnectionState::Connected
+            && target.channel().is_none_or(|channel| {
+                self.session.connection_state(server, Some(channel)) == ConnectionState::Connected
+            });
+        let handle = self
+            .connections
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(server))
+            .map(|(_, handle)| handle);
+        if !ready || handle.is_none_or(|handle| handle.outgoing.try_send(outgoing).is_err()) {
+            *self.status = format!("failed to send ({server} disconnected or busy)");
+            tracing::warn!("send failed on {server}: disconnected or busy");
+            return Err("disconnected_or_busy");
         }
-        CommandAction::Query(_) | CommandAction::Close => return Err("invalid_command"),
-    };
-    validate_control(&command).map_err(|_| "invalid_control")?;
-    handle
-        .control
-        .try_send(command)
-        .map_err(|_| "disconnected_or_busy")?;
-    if let Some(state) = next {
-        session.begin_connection_change(server, state);
+        let nickname = self
+            .session
+            .nickname(server)
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                self.config
+                    .servers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(server))
+                    .map_or_else(|| server.to_owned(), |(_, config)| config.nickname.clone())
+            });
+        self.session.push_message(RoutedMessage {
+            server: ServerId::new(server),
+            target,
+            content: MessageContent {
+                kind,
+                direction: Direction::Outgoing,
+                delivery: DeliveryState::Unconfirmed,
+                ..MessageContent::chat(nickname, echo_text)
+            },
+        });
+        Ok(SubmissionEffect::None)
     }
-    Ok(SubmissionEffect::None)
 }
 
 #[cfg(test)]
@@ -1064,7 +1250,7 @@ mod tests {
                 "/quit",
                 "/raw JOIN #new",
                 "/unknown a b",
-                "/MSG alice hello  世界",
+                "/notice alice hello  世界",
                 "  /nick newname  ",
                 "//hello",
                 "/private-command-name sensitive-payload-260909",

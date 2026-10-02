@@ -109,6 +109,9 @@ pub enum DeliveryState {
     Received,
     /// A local echo that has not been acknowledged by the server.
     Unconfirmed,
+    /// A local echo the server confirmed via echo-message (or a matching
+    /// echoed PRIVMSG); visually identical to `Received`.
+    Confirmed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

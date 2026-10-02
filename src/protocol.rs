@@ -1,6 +1,9 @@
 //! IRC wire adaptation and validation. Core messages never expose IRC crate types.
 
-use std::{fmt, time::SystemTime};
+use std::{
+    fmt,
+    time::{Duration, SystemTime},
+};
 
 use irc::proto::{Command, Message as WireMessage, Response};
 
@@ -155,6 +158,93 @@ const IGNORED_NUMERICS: &[Response] = &[
     Response::RPL_ENDOFNAMES,
 ];
 
+/// Render a CTCP ACTION payload (`\x01ACTION text\x01`) as the shared
+/// `* text` display form; `None` for any other CTCP request or malformed body.
+pub(crate) fn action_display(body: &str) -> Option<String> {
+    let ctcp = body.strip_prefix('\x01')?;
+    let action = ctcp.trim_end_matches('\x01').strip_prefix("ACTION ")?;
+    Some(format!("* {action}"))
+}
+
+/// Manual numeric parsing helper: ASCII digits in `range` as a `u32`.
+fn digits(bytes: &[u8], range: std::ops::Range<usize>) -> Option<u32> {
+    let text = bytes.get(range)?;
+    if text.iter().any(|b| !b.is_ascii_digit()) {
+        return None;
+    }
+    std::str::from_utf8(text).ok()?.parse().ok()
+}
+
+/// Parse the IRCv3 `time` tag (ISO 8601 / RFC 3339) into a UTC `SystemTime`
+/// without pulling in a time library. Accepts `T`/`t` separators, optional
+/// fractional seconds, and `Z`/`z` or `±HH:MM` offsets; anything else is None.
+fn parse_server_time(value: &str) -> Option<SystemTime> {
+    let bytes = value.as_bytes();
+    if bytes.len() < 20 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return None;
+    }
+    let year = digits(bytes, 0..4)? as i64;
+    let month = digits(bytes, 5..7)?;
+    let day = digits(bytes, 8..10)?;
+    if !matches!(bytes[10], b'T' | b't' | b' ') || bytes[13] != b':' || bytes[16] != b':' {
+        return None;
+    }
+    let hour = digits(bytes, 11..13)?;
+    let minute = digits(bytes, 14..16)?;
+    let second = digits(bytes, 17..19)?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    let mut rest = &bytes[19..];
+    let mut nanos = 0u32;
+    if rest.first() == Some(&b'.') {
+        let digits_end = 1 + rest[1..].iter().position(|b| !b.is_ascii_digit())?;
+        let fraction = std::str::from_utf8(&rest[1..digits_end]).ok()?;
+        rest = &rest[digits_end..];
+        nanos = fraction
+            .chars()
+            .take(9)
+            .fold(0u32, |acc, c| acc * 10 + c.to_digit(10).unwrap())
+            * 10u32.pow(9 - fraction.chars().take(9).count() as u32);
+    }
+    // Offset in seconds east of UTC: `Z`, `+HH:MM`, or `-HH:MM`.
+    let offset = match rest.first()? {
+        b'Z' | b'z' if rest.len() == 1 => 0,
+        sign @ (b'+' | b'-') if rest.len() == 6 && rest[3] == b':' => {
+            let hours = digits(rest, 1..3)?;
+            let minutes = digits(rest, 4..6)?;
+            if hours > 23 || minutes > 59 {
+                return None;
+            }
+            let magnitude = hours as i64 * 3600 + minutes as i64 * 60;
+            if *sign == b'+' { magnitude } else { -magnitude }
+        }
+        _ => return None,
+    };
+    // Days since the Unix epoch from a civil date (Howard Hinnant's algorithm).
+    let (y, m) = if month > 2 {
+        (year, month)
+    } else {
+        (year - 1, month + 12)
+    };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let day_of_year = (153 * (m as i64 - 3) + 2) / 5 + day as i64 - 1;
+    let day_of_era = yoe * 365 + yoe / 4 - yoe / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    let utc = days * 86_400 + hour as i64 * 3_600 + minute as i64 * 60 + second as i64 - offset;
+    if utc >= 0 {
+        SystemTime::UNIX_EPOCH.checked_add(Duration::new(utc as u64, nanos))
+    } else {
+        SystemTime::UNIX_EPOCH.checked_sub(Duration::new(utc.unsigned_abs(), 0))
+    }
+}
+
 /// Decode one incoming wire message into one typed destination and payload.
 pub fn decode_message(
     message: &WireMessage,
@@ -176,9 +266,9 @@ pub fn decode_message(
                 return None;
             };
             let body = body.trim_end_matches(['\r', '\n']);
-            let (text, kind) = if let Some(ctcp) = body.strip_prefix('\x01') {
-                let action = ctcp.trim_end_matches('\x01').strip_prefix("ACTION ")?;
-                (format!("* {action}"), MessageKind::Action)
+            let (text, kind) = if body.starts_with('\x01') {
+                // Other CTCP kinds are dropped, matching prior behavior.
+                (action_display(body)?, MessageKind::Action)
             } else {
                 (body.to_owned(), MessageKind::Chat)
             };
@@ -234,6 +324,14 @@ pub fn decode_message(
     if text.is_empty() && kind == MessageKind::Console {
         return None;
     }
+    let received_at = message
+        .tags
+        .iter()
+        .flatten()
+        .find(|tag| tag.0 == "time")
+        .and_then(|tag| tag.1.as_deref())
+        .and_then(parse_server_time)
+        .unwrap_or(SystemTime::now());
     Some(RoutedMessage {
         server: ServerId::new(server),
         target,
@@ -242,7 +340,7 @@ pub fn decode_message(
             text,
             kind,
             direction: Direction::Incoming,
-            received_at: SystemTime::now(),
+            received_at,
             tags: message
                 .tags
                 .iter()
@@ -309,6 +407,49 @@ fn error_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn action_display_matches_well_formed_and_lenient_bodies() {
+        assert_eq!(
+            action_display("\u{1}ACTION dances\u{1}").as_deref(),
+            Some("* dances")
+        );
+        assert_eq!(
+            action_display("\u{1}ACTION  spaces  kept \u{1}").as_deref(),
+            Some("*  spaces  kept ")
+        );
+        assert_eq!(
+            action_display("\u{1}ACTION no trailing delimiter").as_deref(),
+            Some("* no trailing delimiter")
+        );
+        assert_eq!(action_display("\u{1}VERSION\u{1}"), None);
+        assert_eq!(action_display("plain chat"), None);
+    }
+
+    #[test]
+    fn parse_server_time_accepts_rfc3339_forms_and_rejects_others() {
+        let expected = SystemTime::UNIX_EPOCH + Duration::new(1_790_899_200, 0);
+        // 2026-10-02T00:00:00Z, exercised through every accepted shape.
+        assert_eq!(parse_server_time("2026-10-02T00:00:00Z"), Some(expected));
+        assert_eq!(parse_server_time("2026-10-02t00:00:00z"), Some(expected));
+        assert_eq!(
+            parse_server_time("2026-10-02T00:00:00.250Z"),
+            Some(SystemTime::UNIX_EPOCH + Duration::new(1_790_899_200, 250_000_000))
+        );
+        assert_eq!(
+            parse_server_time("2026-10-02T09:00:00+09:00"),
+            Some(expected)
+        );
+        assert_eq!(
+            parse_server_time("2026-10-01T16:00:00-08:00"),
+            Some(expected)
+        );
+        assert_eq!(parse_server_time("2026-10-02"), None);
+        assert_eq!(parse_server_time("2026-13-02T00:00:00Z"), None);
+        assert_eq!(parse_server_time("2026-10-02T25:00:00Z"), None);
+        assert_eq!(parse_server_time("not a timestamp"), None);
+        assert_eq!(parse_server_time("2026-10-02T00:00:00"), None);
+    }
 
     #[test]
     fn raw_channel_operations_reject_unmanaged_targets() {

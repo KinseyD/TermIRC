@@ -57,8 +57,9 @@ once at startup — restart to pick up changes.
 | `server`   | yes      | —       | hostname                             |
 | `port`     | yes      | —       | usually 6667 (plain) or 6697 (TLS)   |
 | `use_tls`  | no       | `false` | connect over TLS                     |
+| `sasl_username` | no | —    | SASL PLAIN account name; must be set together with `sasl_password` |
+| `sasl_password` | no | —    | SASL PLAIN password; see authentication notes below |
 | `channels` | yes      | —       | startup channel intent, in order; runtime changes are not persisted |
-| `queries`  | no       | `[]`    | private conversations to show at startup, in order |
 
 `queries` contains individual nicknames, not channels or comma-separated targets.
 Repeated names are deduplicated within each server using ASCII case-insensitive
@@ -78,6 +79,23 @@ Security notes:
 - The file holds a credential — on Unix, `chmod 600` it.
 - With `use_tls = false` the password crosses the network unencrypted.
   If your network offers TLS, set `use_tls = true` and the TLS port.
+
+Authentication and capability notes:
+
+- SASL PLAIN authenticates during registration when both `sasl_username` and
+  `sasl_password` are set (both, or neither). It composes with `password`,
+  which is still sent as PASS first. A failed SASL exchange (or a server that
+  does not offer SASL when credentials are configured) stops that server's
+  connection permanently — no silent unauthenticated downgrade, no retries.
+- Every registration starts an IRCv3 capability negotiation
+  (`CAP LS 302`). When the server offers them, TermIRC requests
+  `server-time` (message timestamps taken from the server's `time` tag) and
+  `echo-message` (the server's echo of your own message confirms its local
+  echo instead of displaying a duplicate line). Servers without CAP support
+  skip the exchange automatically with no extra registration traffic.
+- SASL credentials must not contain NUL, CR or LF, and their encoded SASL
+  PLAIN payload must fit one 400-byte `AUTHENTICATE` line; larger
+  combinations are rejected when loading the config.
 
 ## Using TermIRC
 
@@ -103,6 +121,8 @@ channel, identity and connection commands are:
 | `/part [#channel] [reason]` | Leave the named channel, or the current channel when omitted; retain its buffer and history. |
 | `/query <nickname>` | Create or reopen a private conversation on the current server and focus its composer; works while disconnected. |
 | `/close` | Hide the current private conversation and return to its server console; not available on channels or server consoles. |
+| `/msg <target> <text>` | Send a message without switching conversation. A `#`/`&` target must be a joined channel; a nickname target opens (or reopens) its private conversation and focuses it. |
+| `/me <action>` | Send a CTCP ACTION to the current private conversation or joined channel, shown as `* <action>`. |
 | `/nick <nickname>` | Request a nickname change on the current server; local echoes use the new nickname after the server confirms it. |
 | `/away [reason]` | Set an away message. With no argument, toggle between away (default reason `Away`) and back, using the confirmed away state. |
 | `/back` | Clear away status on the current server. |
@@ -150,7 +170,9 @@ Outgoing IRC lines are limited to 512 UTF-8 bytes including the command,
 target and terminating CRLF. Oversized lines retain the full draft and cursor
 for editing; they are not split or queued. Raw console commands preserve the
 spaces within their trailing parameter. Local echoes mean the message was
-queued, not acknowledged by the server. Server errors for known channels
+queued, not acknowledged by the server; when the server has acknowledged
+`echo-message`, its echo of the same line confirms that local entry in place
+instead of adding a second copy. Server errors for known channels
 appear there once as system messages; other errors appear in the server console.
 
 ### Dynamic channels
@@ -210,7 +232,8 @@ in memory until exit. Opening it again or receiving another private message
 restores it. Closing sends no PART or QUIT and does not block the sender.
 `/query`, incoming messages and `/close` never write the configuration file.
 Configured `queries` appear again on restart; runtime-only conversations do not.
-There is no new close shortcut, persistent history, `/msg` or `/me` command.
+There is no close shortcut and no persistent history; `/msg <nickname> <text>`
+starts or reopens a private conversation from anywhere on that server.
 
 Confirmed peer nickname changes update the conversation's name and send target
 without changing its identity or configuration. If the new nickname already has
@@ -218,8 +241,10 @@ a conversation, both histories and drafts are preserved separately: the old
 conversation explains the change and blocks sending to the old nickname. Use
 `/query <new-nickname>` to continue, or explicitly `/query <old-nickname>` to
 select that old nickname again and unblock it. Identity changes while offline
-are not inferred; server-specific CASEMAPPING and IRCv3 echo negotiation remain
-unsupported. Sending to yourself displays the matching local echo only once.
+are not inferred; server-specific CASEMAPPING remains unsupported. Sending to
+yourself displays the matching local echo only once; with `echo-message`
+negotiated, the server's echo confirms the local line in place (channel
+messages), leaving no duplicate.
 
 ## Architecture and development
 

@@ -1,6 +1,7 @@
 //! Serial connection lifecycle: cancellation, bounded retries and confirmed state.
 
 use super::channels::Channels;
+use super::sasl::encode_sasl_plain;
 use crate::{
     config::ServerConfig,
     connection::{ConnectionState, IrcEvent, RetryPolicy, build_client_config},
@@ -9,7 +10,7 @@ use crate::{
 };
 use futures_util::StreamExt;
 use irc::client::{Client, ClientStream};
-use irc::proto::{Command, Message, Response};
+use irc::proto::{CapSubCommand, Command, Message, NegotiationVersion, Response, caps::Capability};
 use std::{sync::mpsc, time::Duration};
 use tokio::{
     sync::mpsc::Receiver,
@@ -151,8 +152,30 @@ async fn session(
             }
         }
     };
-    if client.identify().is_err() {
+    // IRCv3 negotiation is driven manually (the crate's helpers cover single
+    // lines, not the exchange): CAP LS goes first so negotiation overlaps the
+    // classic PASS/NICK/USER triplet, and CAP END waits for the exchange to
+    // resolve. Servers without CAP just send 001 and the exchange abandons
+    // itself with zero extra traffic.
+    let mut negotiation = Negotiation::new(server);
+    if client.send_cap_ls(NegotiationVersion::V302).is_err() {
         return failed(false, None);
+    }
+    let registration = [
+        (!server.password.is_empty()).then(|| Command::PASS(server.password.clone())),
+        Some(Command::NICK(server.nickname.clone())),
+        Some(Command::USER(
+            server.username.clone(),
+            "0".into(),
+            server.nickname.clone(),
+        )),
+    ]
+    .into_iter()
+    .flatten();
+    for wire in registration {
+        if client.send(wire).is_err() {
+            return failed(false, None);
+        }
     }
     let Ok(mut stream) = client.stream() else {
         return failed(false, None);
@@ -232,7 +255,62 @@ async fn session(
                     _ => return failed(false, registered_at),
                 };
                 match &message.command {
+                    Command::CAP(_, sub, third, fourth) if !negotiation.finished() => {
+                        match negotiation.on_cap(*sub, third.as_deref(), fourth.as_deref()) {
+                            NegotiationAction::Ignore => {}
+                            NegotiationAction::Send(lines) => {
+                                for wire in lines {
+                                    if client.send(wire).is_err() {
+                                        return failed(false, registered_at);
+                                    }
+                                }
+                            }
+                            NegotiationAction::Fatal(reason) => {
+                                let _ = tx.send(IrcEvent::Error(label.into(), reason.into()));
+                                return failed(true, None);
+                            }
+                        }
+                    }
+                    Command::AUTHENTICATE(data) if negotiation.authenticating() => {
+                        if let NegotiationAction::Send(lines) = negotiation.on_challenge(data) {
+                            for wire in lines {
+                                if client.send(wire).is_err() {
+                                    return failed(false, registered_at);
+                                }
+                            }
+                        }
+                    }
+                    Command::Response(
+                        Response::RPL_SASLSUCCESS | Response::RPL_LOGGEDIN,
+                        _,
+                    ) if negotiation.authenticating() => {
+                        if let NegotiationAction::Send(lines) = negotiation.on_sasl_success() {
+                            for wire in lines {
+                                if client.send(wire).is_err() {
+                                    return failed(false, registered_at);
+                                }
+                            }
+                        }
+                    }
+                    Command::Response(
+                        Response::ERR_SASLFAIL
+                        | Response::ERR_NICKLOCKED
+                        | Response::ERR_SASLTOOLONG,
+                        _,
+                    ) if negotiation.authenticating() => {
+                        let _ = tx.send(IrcEvent::Error(
+                            label.into(),
+                            "sasl authentication failed".into(),
+                        ));
+                        return failed(true, None);
+                    }
+                    Command::Response(Response::ERR_UNKNOWNCOMMAND, _)
+                        if !negotiation.finished() =>
+                    {
+                        negotiation.abandon();
+                    }
                     Command::Response(Response::RPL_WELCOME, args) if registered_at.is_none() => {
+                        negotiation.abandon();
                         if let Some(nick) = args.first() { server.nickname.clone_from(nick); }
                         discard_chat(outgoing, channels);
                         registered_at = Some(Instant::now());
@@ -295,6 +373,193 @@ async fn session(
                 }
             }
         }
+    }
+}
+
+/// What the registration CAP exchange wants the session loop to do next.
+enum NegotiationAction {
+    /// Not negotiation traffic; continue with normal handling.
+    Ignore,
+    /// Send these lines and continue.
+    Send(Vec<Command>),
+    /// Registration cannot proceed authenticated; stop without retrying.
+    Fatal(&'static str),
+}
+
+/// One step of the registration-time IRCv3 CAP exchange.
+#[derive(Debug)]
+enum CapPhase {
+    /// Accumulating `CAP LS` lines; IRCv3.2 servers may split the list.
+    Ls(Vec<String>),
+    /// Waiting for `CAP ACK`; the flag records whether `sasl` was requested.
+    Ack(bool),
+    /// Waiting for the SASL round-trip to complete.
+    Authenticating,
+    /// Exchange closed (nothing requested, or `CAP END` sent).
+    Complete,
+    /// Server proceeded without CAP; no further negotiation traffic.
+    Abandoned,
+}
+
+struct Negotiation {
+    phase: CapPhase,
+    /// Configured SASL PLAIN credentials; `None` skips SASL entirely.
+    sasl: Option<(String, String)>,
+}
+
+fn cap_end() -> Command {
+    Command::CAP(None, CapSubCommand::END, None, None)
+}
+
+fn cap_request(wanted: &[Capability]) -> Command {
+    let list = wanted
+        .iter()
+        .map(|capability| capability.as_ref())
+        .collect::<Vec<_>>()
+        .join(" ");
+    Command::CAP(None, CapSubCommand::REQ, None, Some(list))
+}
+
+/// IRCv3.2 advertises values as `name=value`; names alone are compared.
+fn offers(tokens: &[String], name: &str) -> bool {
+    tokens.iter().any(|token| {
+        token
+            .split('=')
+            .next()
+            .is_some_and(|capability| capability.eq_ignore_ascii_case(name))
+    })
+}
+
+impl Negotiation {
+    fn new(server: &ServerConfig) -> Self {
+        Self {
+            phase: CapPhase::Ls(Vec::new()),
+            sasl: server
+                .sasl_username
+                .as_ref()
+                .zip(server.sasl_password.as_ref())
+                .map(|(username, password)| (username.clone(), password.clone())),
+        }
+    }
+
+    fn finished(&self) -> bool {
+        matches!(self.phase, CapPhase::Complete | CapPhase::Abandoned)
+    }
+
+    fn authenticating(&self) -> bool {
+        matches!(self.phase, CapPhase::Authenticating)
+    }
+
+    /// A server that rejects CAP wholesale or registers us mid-exchange
+    /// abandons it: no `CAP END`, keeping post-registration traffic clean.
+    fn abandon(&mut self) {
+        if !self.finished() {
+            self.phase = CapPhase::Abandoned;
+        }
+    }
+
+    fn on_cap(
+        &mut self,
+        sub: CapSubCommand,
+        third: Option<&str>,
+        fourth: Option<&str>,
+    ) -> NegotiationAction {
+        match sub {
+            CapSubCommand::LS => {
+                let CapPhase::Ls(advertised) = &mut self.phase else {
+                    return NegotiationAction::Ignore;
+                };
+                // irc-proto parks the list in the fourth slot when a 302
+                // version token precedes it, and in the third otherwise;
+                // a continuation line marks itself with a lone "*".
+                let (tokens, done) = match (third, fourth) {
+                    (Some("*"), Some(list)) => (list, false),
+                    (_, Some(list)) => (list, true),
+                    (Some(list), None) => (list, true),
+                    (None, None) => ("", true),
+                };
+                advertised.extend(tokens.split_whitespace().map(str::to_owned));
+                if !done {
+                    return NegotiationAction::Ignore;
+                }
+                // Configured SASL must be negotiable: never silently
+                // register unauthenticated when credentials are configured.
+                if self.sasl.is_some() && !offers(advertised, "sasl") {
+                    return NegotiationAction::Fatal("sasl unsupported by server");
+                }
+                let mut wanted = Vec::new();
+                if offers(advertised, "server-time") {
+                    wanted.push(Capability::ServerTime);
+                }
+                if offers(advertised, "echo-message") {
+                    wanted.push(Capability::EchoMessage);
+                }
+                if self.sasl.is_some() {
+                    wanted.push(Capability::Sasl);
+                }
+                if wanted.is_empty() {
+                    self.phase = CapPhase::Complete;
+                    return NegotiationAction::Send(vec![cap_end()]);
+                }
+                let sasl = self.sasl.is_some();
+                self.phase = CapPhase::Ack(sasl);
+                NegotiationAction::Send(vec![cap_request(&wanted)])
+            }
+            CapSubCommand::ACK => {
+                let CapPhase::Ack(sasl_requested) = self.phase else {
+                    return NegotiationAction::Ignore;
+                };
+                let list = fourth.or(third).unwrap_or("");
+                let acked: Vec<String> = list.split_whitespace().map(str::to_owned).collect();
+                if sasl_requested && !offers(&acked, "sasl") {
+                    return NegotiationAction::Fatal("sasl unsupported by server");
+                }
+                if sasl_requested {
+                    self.phase = CapPhase::Authenticating;
+                    NegotiationAction::Send(vec![Command::AUTHENTICATE("PLAIN".into())])
+                } else {
+                    self.phase = CapPhase::Complete;
+                    NegotiationAction::Send(vec![cap_end()])
+                }
+            }
+            CapSubCommand::NAK => {
+                let CapPhase::Ack(sasl_requested) = self.phase else {
+                    return NegotiationAction::Ignore;
+                };
+                if sasl_requested {
+                    return NegotiationAction::Fatal("sasl unsupported by server");
+                }
+                self.phase = CapPhase::Complete;
+                NegotiationAction::Send(vec![cap_end()])
+            }
+            CapSubCommand::LIST
+            | CapSubCommand::NEW
+            | CapSubCommand::DEL
+            | CapSubCommand::REQ
+            | CapSubCommand::END => NegotiationAction::Ignore,
+        }
+    }
+
+    /// `AUTHENTICATE +` challenges us to send the encoded PLAIN credentials.
+    fn on_challenge(&mut self, data: &str) -> NegotiationAction {
+        if !self.authenticating() || data != "+" {
+            return NegotiationAction::Ignore;
+        }
+        let Some((username, password)) = &self.sasl else {
+            return NegotiationAction::Ignore;
+        };
+        NegotiationAction::Send(vec![Command::AUTHENTICATE(encode_sasl_plain(
+            username, password,
+        ))])
+    }
+
+    /// 900/903 close a successful SASL exchange; `CAP END` finishes it.
+    fn on_sasl_success(&mut self) -> NegotiationAction {
+        if !self.authenticating() {
+            return NegotiationAction::Ignore;
+        }
+        self.phase = CapPhase::Complete;
+        NegotiationAction::Send(vec![cap_end()])
     }
 }
 
