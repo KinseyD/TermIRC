@@ -63,6 +63,11 @@ impl Session {
             )));
         } else {
             self.buffers[index].kind = BufferKind::Query(nickname.into());
+            // Only the clean path writes a rename record; the collision path
+            // keeps two separate conversations and the archive stays honest.
+            if let Some(sink) = self.persist.as_mut() {
+                sink.record_rename(&server, previous, nickname);
+            }
         }
     }
 

@@ -51,6 +51,7 @@ impl MockSession {
         };
         let config = Config {
             servers: [("srv".into(), server.clone())].into_iter().collect(),
+            history: Default::default(),
         };
         let mut app = App::new(40, 5);
         app.session.register_config(&config);

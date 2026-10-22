@@ -12,5 +12,6 @@ pub mod logging;
 pub mod application;
 pub mod core;
 pub mod history;
+pub mod persist;
 pub mod protocol;
 pub mod tui;

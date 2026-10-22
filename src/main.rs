@@ -92,6 +92,13 @@ fn run(terminal: &mut ratatui::DefaultTerminal, config: &Config) -> anyhow::Resu
     drop(tx);
 
     let mut app = App::new(1, 1);
-    app.session.register_config(config);
+    // Persistence is opt-in: assemble the sink from configuration the same
+    // way logging is, and run without history rather than not run.
+    if config.history.persist
+        && let Some(root) = dirs::data_dir().map(|dir| dir.join("termirc"))
+        && let Some(sink) = termirc::persist::HistorySink::open(&root, &config.history)
+    {
+        app.session = termirc::application::Session::with_persist(5_000, sink);
+    }
     termirc::tui::events::run(terminal, config, app, outgoing, rx)
 }

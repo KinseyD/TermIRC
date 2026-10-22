@@ -67,6 +67,14 @@ matching; the same nickname on different servers is a separate conversation.
 These entries only create sidebar conversations: they do not send JOIN or any
 private message, and do not indicate whether the other user is online.
 
+An optional `[history]` table controls persistent chat history:
+
+| Key              | Required | Default | Meaning                              |
+|------------------|----------|---------|--------------------------------------|
+| `persist`        | no       | `false` | store chat history across restarts   |
+| `retention_days` | no       | `7`     | days to keep archived messages       |
+| `exclude`        | no       | `[]`    | buffers never archived; a bare name applies to every server, `"server/name"` to one server |
+
 `channels` seeds the channels to join at startup. Each entry must be one `#` or
 `&` channel name with at least one character after the prefix; whitespace,
 control characters, commas and colons are not allowed. Invalid configured names
@@ -266,7 +274,12 @@ ranges survive layout-text cache eviction; the 50,000-row cache budget does not
 limit history. Rendering constructs text only for visible rows. The composer
 uses the same display-width geometry for wrapping, sizing and mouse regions.
 
-Persistent history is not implemented; conversations live in memory only.
+Persistent history is opt-in via the `[history]` table. When `persist = true`,
+chat and action lines are stored in a local SQLite database at
+`~/.local/share/termirc/history.sqlite` and replayed when their buffer is
+opened again; console and system lines are never stored, records older than
+`retention_days` are deleted at startup, and buffers listed in `exclude` are
+skipped. Deleting the file with `rm` deletes the history.
 
 Run local validation with cached dependencies:
 

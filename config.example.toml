@@ -12,3 +12,14 @@ port = 6697
 # Runtime /join and /part changes are kept in memory, not written to this file.
 channels = ["#example"]
 queries = ["alice", "bob"]
+
+# Persistent chat history (optional). Off by default; when enabled, chat and
+# action lines for channels and queries are stored in a local SQLite file at
+# ~/.local/share/termirc/history.sqlite and replayed when a buffer is opened.
+[history]
+persist = false
+# Days to keep archived messages (applied at startup).
+retention_days = 7
+# Buffers never written to or restored from the archive: a bare name applies
+# to every server, "server/name" to one server.
+exclude = ["#overflow", "libera/#huge"]

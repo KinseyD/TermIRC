@@ -26,6 +26,9 @@ mod query_tests;
 #[cfg(test)]
 mod channel_tests;
 
+#[cfg(test)]
+mod history_tests;
+
 /// Registered conversations retain their display names separately from identity.
 pub struct Buffer {
     pub id: BufferId,
@@ -58,6 +61,9 @@ pub struct Session {
     welcome_draft: Draft,
     next_buffer_id: u64,
     pending_self_echoes: HashMap<BufferId, HashSet<MessageId>>,
+    /// Optional SQLite archive; injected by `main` per configuration and
+    /// absent in tests that do not exercise persistence.
+    persist: Option<crate::persist::HistorySink>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -110,6 +116,17 @@ impl Session {
             welcome_draft: Draft::default(),
             next_buffer_id: 1,
             pending_self_echoes: HashMap::new(),
+            persist: None,
+        }
+    }
+
+    /// `Session::new` with an injected persistence sink, mirroring
+    /// `App::with_caps`: `main` assembles this from configuration so the
+    /// application layer owns the seam and tests stay DB-free by default.
+    pub fn with_persist(message_capacity: usize, persist: crate::persist::HistorySink) -> Self {
+        Self {
+            persist: Some(persist),
+            ..Self::new(message_capacity)
         }
     }
 
@@ -135,9 +152,10 @@ impl Session {
             .next_buffer_id
             .checked_add(1)
             .expect("buffer identity space exhausted");
+        let persisted_kind = kind.clone();
         self.buffers.push(Buffer {
             id,
-            server: server_id,
+            server: server_id.clone(),
             server_label: state.label.clone(),
             channel_status: ChannelStatus::default(),
             kind,
@@ -147,7 +165,28 @@ impl Session {
             send_blocked: false,
             pending_channel_changes: 0,
         });
+        self.drain_persisted(&server_id, &persisted_kind, id);
         id
+    }
+
+    /// Replay this server's archived records into a freshly created buffer.
+    ///
+    /// Restored messages go straight through `HistoryStore::append`: message
+    /// IDs are reminted, `unread` stays untouched, capacity trims apply, and
+    /// nothing is written back to the archive.
+    fn drain_persisted(&mut self, server: &ServerId, kind: &BufferKind, id: BufferId) {
+        let Some(sink) = self.persist.as_ref() else {
+            return;
+        };
+        let records = sink.load(server);
+        for (recorded, messages) in records {
+            if !recorded.matches(kind) {
+                continue;
+            }
+            for content in messages {
+                let _ = self.history.append(id, content);
+            }
+        }
     }
 
     pub fn open_channel(&mut self, server: &str, channel: &str) -> BufferId {
@@ -214,6 +253,9 @@ impl Session {
             let id = self.query_message_destination(&message);
             let self_echo = message.content.direction == Direction::Outgoing
                 && matches!(&message.target, BufferKind::Query(nickname) if nickname.eq_ignore_ascii_case(&message.content.nick));
+            // The archive hook rides the same commit as the in-memory append:
+            // only lines that reach a history also reach the disk.
+            self.persist_append(&message);
             let change = self.history.append(id, message.content);
             if self_echo && !change.evicted.contains(&change.inserted) {
                 self.pending_self_echoes
@@ -243,13 +285,22 @@ impl Session {
                 self.open_server(&label)
             }
             None if self.buffers.is_empty() => {
-                let id = self.open_buffer(message.server.as_str(), message.target);
+                let id = self.open_buffer(message.server.as_str(), message.target.clone());
                 self.active = Some(id);
                 id
             }
             None => return None,
         };
+        self.persist_append(&message);
         Some(self.history.append(id, message.content))
+    }
+
+    /// Persist one routed message if a sink is attached; delivery state,
+    /// tags, and message IDs are session-scoped and never written.
+    fn persist_append(&mut self, message: &RoutedMessage) {
+        if let Some(sink) = self.persist.as_mut() {
+            sink.append(&message.server, &message.target, &message.content);
+        }
     }
 
     fn draft(&self) -> &Draft {
@@ -1016,6 +1067,7 @@ mod tests {
                     &mut app,
                     &Config {
                         servers: Default::default(),
+                        history: Default::default(),
                     },
                     &connections,
                     &mut status,
@@ -1055,6 +1107,7 @@ mod tests {
                 &mut app,
                 &Config {
                     servers: Default::default(),
+                    history: Default::default(),
                 },
                 &Default::default(),
                 &mut status,
@@ -1095,6 +1148,7 @@ mod tests {
             &mut app,
             &Config {
                 servers: Default::default(),
+                history: Default::default(),
             },
             &connections,
             &mut String::new(),
@@ -1136,6 +1190,7 @@ mod tests {
                 &mut app,
                 &Config {
                     servers: Default::default(),
+                    history: Default::default(),
                 },
                 &connections,
                 &mut String::new(),
@@ -1176,6 +1231,7 @@ mod tests {
             )]);
             let config = Config {
                 servers: Default::default(),
+                history: Default::default(),
             };
             app.restore_input(input.into());
             submit_composer(&mut app, &config, &connections, &mut String::new());
@@ -1271,6 +1327,7 @@ mod tests {
                 let old_cursor = app.input_cursor();
                 let config = Config {
                     servers: Default::default(),
+                    history: Default::default(),
                 };
                 let (tx, mut rx) = tokio::sync::mpsc::channel(8);
                 let outgoing = std::collections::HashMap::from([(
@@ -1356,6 +1413,7 @@ mod tests {
                 }
                 let config = Config {
                     servers: Default::default(),
+                    history: Default::default(),
                 };
                 let (tx, mut rx) = tokio::sync::mpsc::channel(8);
                 let mut outgoing = std::collections::HashMap::new();
@@ -1438,6 +1496,7 @@ mod tests {
     fn empty_config() -> Config {
         Config {
             servers: Default::default(),
+            history: Default::default(),
         }
     }
 

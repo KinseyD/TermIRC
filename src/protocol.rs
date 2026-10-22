@@ -178,7 +178,7 @@ fn digits(bytes: &[u8], range: std::ops::Range<usize>) -> Option<u32> {
 /// Parse the IRCv3 `time` tag (ISO 8601 / RFC 3339) into a UTC `SystemTime`
 /// without pulling in a time library. Accepts `T`/`t` separators, optional
 /// fractional seconds, and `Z`/`z` or `±HH:MM` offsets; anything else is None.
-fn parse_server_time(value: &str) -> Option<SystemTime> {
+pub(crate) fn parse_server_time(value: &str) -> Option<SystemTime> {
     let bytes = value.as_bytes();
     if bytes.len() < 20 || bytes[4] != b'-' || bytes[7] != b'-' {
         return None;

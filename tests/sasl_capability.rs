@@ -59,6 +59,7 @@ impl CapMock {
         let server = server_config(listener.local_addr().unwrap().port(), password, sasl);
         let config = Config {
             servers: [("srv".into(), server.clone())].into_iter().collect(),
+            history: Default::default(),
         };
         let (tx, rx) = mpsc::channel();
         let (worker, handle) = spawn_irc_with_policy(

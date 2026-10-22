@@ -187,7 +187,7 @@ impl App {
         }
     }
     pub fn tick(&mut self, elapsed: std::time::Duration) {
-        self.connecting_dot_visible = (elapsed.as_millis() / 500).is_multiple_of(2);
+        self.connecting_dot_visible = elapsed.as_millis() / 500 % 2 == 0;
         self.sync_view();
     }
     pub fn connecting_dot_visible(&self) -> bool {

@@ -56,10 +56,53 @@ impl ServerConfig {
 /// Root configuration: a map of named servers.
 ///
 /// `IndexMap` (with toml's `preserve_order`) keeps the order in which servers
+/// Persistent-history settings from the optional `[history]` table.
+///
+/// Persistence is opt-in (`persist = false` by default) so existing
+/// configurations keep their in-memory-only behavior.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct HistoryConfig {
+    pub persist: bool,
+    pub retention_days: u64,
+    /// Bare names exclude a target on every server; `"server/name"` entries
+    /// are scoped to one server. Matching is ASCII case-insensitive, like
+    /// `BufferKind::matches`.
+    pub exclude: Vec<String>,
+}
+
+impl Default for HistoryConfig {
+    fn default() -> Self {
+        Self {
+            persist: false,
+            retention_days: 7,
+            exclude: Vec::new(),
+        }
+    }
+}
+
+impl HistoryConfig {
+    pub fn excludes(&self, server: &str, name: &str) -> bool {
+        self.exclude
+            .iter()
+            .any(|entry| match entry.split_once('/') {
+                Some((scoped, target)) => {
+                    scoped.eq_ignore_ascii_case(server) && target.eq_ignore_ascii_case(name)
+                }
+                None => entry.eq_ignore_ascii_case(name),
+            })
+    }
+}
+
+/// Root configuration: a map of named servers.
+///
+/// `IndexMap` (with toml's `preserve_order`) keeps the order in which servers
 /// appear in the file, so `first_server` means "first written", not alphabetical.
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub servers: IndexMap<String, ServerConfig>,
+    #[serde(default)]
+    pub history: HistoryConfig,
 }
 
 impl Config {
@@ -171,6 +214,37 @@ mod tests {
             error.contains("sasl_credentials_too_long"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn history_table_is_optional_with_opt_in_defaults() {
+        // Arrange/Act
+        let default = Config::parse("[servers.s]\nusername=\"u\"\nnickname=\"n\"\npassword=\"\"\nserver=\"h\"\nport=1\nchannels=[]\n").unwrap();
+
+        // Assert: opt-in persistence, seven-day retention, nothing excluded.
+        assert_eq!(default.history, HistoryConfig::default());
+        assert!(!default.history.persist);
+        assert_eq!(default.history.retention_days, 7);
+        assert!(default.history.exclude.is_empty());
+    }
+
+    #[test]
+    fn history_table_parses_keys_and_excludes_match_case_insensitively() {
+        // Arrange
+        let config = Config::parse(
+            "[servers.s]\nusername=\"u\"\nnickname=\"n\"\npassword=\"\"\nserver=\"h\"\nport=1\nchannels=[]\n\
+             [history]\npersist=true\nretention_days=30\nexclude=[\"#Huge\", \"srv/alice\"]\n",
+        )
+        .unwrap();
+
+        // Act/Assert: bare names exclude everywhere, scoped entries only
+        // their server, both ASCII case-insensitively.
+        assert!(config.history.persist);
+        assert_eq!(config.history.retention_days, 30);
+        assert!(config.history.excludes("other", "#huge"));
+        assert!(config.history.excludes("SRV", "Alice"));
+        assert!(!config.history.excludes("other", "alice"));
+        assert!(!config.history.excludes("srv", "#other"));
     }
 
     #[test]
