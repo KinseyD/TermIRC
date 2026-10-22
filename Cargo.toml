@@ -1,3 +1,4 @@
+# NOTE: this comment exists only so pushes can re-trigger the paths-filtered CI workflow.
 [package]
 name = "termirc"
 version = "0.6.0"
