@@ -38,6 +38,7 @@ fn submit(
         session,
         &Config {
             servers: Default::default(),
+            history: Default::default(),
         },
         connections,
         &mut String::new(),

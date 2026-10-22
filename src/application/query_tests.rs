@@ -11,6 +11,7 @@ fn incoming(nick: &str, text: &str) -> RoutedMessage {
 fn config() -> Config {
     Config {
         servers: Default::default(),
+        history: Default::default(),
     }
 }
 
