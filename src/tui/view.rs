@@ -6,6 +6,46 @@ use std::ops::{Deref, DerefMut};
 const MAX_MESSAGES: usize = 5000;
 use super::layout::{LayoutCache, LayoutLine};
 
+/// At most this many matching commands fill the inline hint bar.
+const MAX_HINT_ROWS: usize = 5;
+
+/// The draft's leading command word without its `/`, ASCII-lowercased.
+/// `None` when the draft (after trimming) does not start a slash command.
+fn hint_word(input: &str) -> Option<String> {
+    let rest = input.trim().strip_prefix('/')?;
+    let word = rest.split_whitespace().next()?;
+    Some(word.to_ascii_lowercase())
+}
+
+/// Table-order command suggestions whose names strictly extend `prefix`,
+/// capped at `cap`. An exact match yields nothing: the hint bar only
+/// suggests completions still left to type.
+fn prefix_matches(
+    table: &[(&'static str, &'static str)],
+    prefix: &str,
+    cap: usize,
+) -> Vec<(&'static str, &'static str)> {
+    table
+        .iter()
+        .filter(|(name, _)| name.starts_with(prefix) && name.len() > prefix.len())
+        .take(cap)
+        .copied()
+        .collect()
+}
+
+/// The hint bar's items for `input`: [`prefix_matches`] over the command
+/// table, but only while the composer is focused (the bar lives on the
+/// composer, so it hides whenever the composer does).
+fn hint_matches(input: &str, composer_focused: bool) -> Vec<(&'static str, &'static str)> {
+    if !composer_focused {
+        return Vec::new();
+    }
+    let Some(prefix) = hint_word(input) else {
+        return Vec::new();
+    };
+    prefix_matches(&crate::command::COMMANDS, &prefix, MAX_HINT_ROWS)
+}
+
 pub const MAX_CACHED_LINES: usize = 50_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -55,6 +95,11 @@ pub struct App {
     running: bool,
     connecting_dot_visible: bool,
     cache_budget: usize,
+    /// The hint bar's highlight: the leading word it was last moved on
+    /// (`join`, no slash) and the row index chosen then. A different word
+    /// means a different item list, so the highlight reads back as row 0.
+    hint_selection_word: String,
+    hint_selected: usize,
 }
 impl Deref for App {
     type Target = Session;
@@ -91,6 +136,8 @@ impl App {
             viewport_height,
             running: true,
             connecting_dot_visible: true,
+            hint_selection_word: String::new(),
+            hint_selected: 0,
             cache_budget,
         }
     }
@@ -134,6 +181,7 @@ impl App {
     }
     /// Reconcile histories after application/network events without recomputing unchanged messages.
     pub fn sync_view(&mut self) {
+        self.observe_hint_word();
         self.reconcile_sidebar();
         let follow =
             self.is_at_bottom() && !(self.focus == Focus::Messages && self.selected().is_some());
@@ -391,6 +439,128 @@ impl App {
             }
             Focus::Messages => Focus::Composer,
         };
+    }
+
+    /// The hint bar's items for the current draft: `(name, description)`
+    /// pairs in table order, capped at [`MAX_HINT_ROWS`]. Hidden unless the
+    /// composer is focused on an opened buffer and the draft's leading word
+    /// strictly extends at least one command name.
+    pub fn command_hints(&self) -> Vec<(&'static str, &'static str)> {
+        hint_matches(
+            self.input(),
+            self.focus == Focus::Composer && self.active_buffer().is_some(),
+        )
+    }
+
+    pub fn is_hint_active(&self) -> bool {
+        !self.command_hints().is_empty()
+    }
+
+    /// Rows the hint bar reserves between the message pane and the composer:
+    /// one separator rule plus one row per visible item. Zero while hidden.
+    pub fn hint_rows(&self) -> u16 {
+        let items = self.command_hints();
+        if items.is_empty() {
+            return 0;
+        }
+        u16::try_from(items.len() + 1).unwrap_or(u16::MAX)
+    }
+
+    /// The highlighted hint row. Reading resets to the first row whenever
+    /// the item list changed (a different leading word), and clamps to the
+    /// last row so a shrunken list can never point past its end.
+    pub fn hint_selected(&self) -> usize {
+        let items = self.command_hints();
+        if items.is_empty() {
+            return 0;
+        }
+        if self.hint_selection_word == hint_word(self.input()).unwrap_or_default() {
+            self.hint_selected.min(items.len() - 1)
+        } else {
+            0
+        }
+    }
+
+    pub fn hint_up(&mut self) {
+        self.move_hint_selection(false);
+    }
+
+    pub fn hint_down(&mut self) {
+        self.move_hint_selection(true);
+    }
+
+    /// Clamp-move the hint highlight without wrapping; a no-op while the
+    /// bar is hidden.
+    fn move_hint_selection(&mut self, down: bool) {
+        let items = self.command_hints();
+        if items.is_empty() {
+            return;
+        }
+        let word = hint_word(self.input()).unwrap_or_default();
+        let current = if self.hint_selection_word == word {
+            self.hint_selected.min(items.len() - 1)
+        } else {
+            0
+        };
+        let next = if down {
+            (current + 1).min(items.len() - 1)
+        } else {
+            current.saturating_sub(1)
+        };
+        self.hint_selection_word = word;
+        self.hint_selected = next;
+    }
+
+    /// Complete the highlighted command into the draft: the leading word
+    /// becomes `/name ` (trailing space) with the cursor right after it,
+    /// which leaves the exact name and deactivates the bar. The whitespace
+    /// run after the old word is swallowed so completion never doubles the
+    /// separator the user already typed.
+    pub fn complete_hint(&mut self) {
+        let selected = self.hint_selected();
+        let Some(&(name, _)) = self.command_hints().get(selected) else {
+            return;
+        };
+        let text = self.input().to_string();
+        let chars: Vec<char> = text.chars().collect();
+        let start = chars.iter().position(|c| !c.is_whitespace()).unwrap_or(0);
+        let word_end = (start..chars.len())
+            .find(|&i| chars[i].is_whitespace())
+            .unwrap_or(chars.len());
+        let rest = (word_end..chars.len())
+            .find(|&i| !chars[i].is_whitespace())
+            .unwrap_or(chars.len());
+        let replacement = format!("/{name} ");
+        let mut composed = String::with_capacity(text.len() + replacement.len());
+        composed.extend(chars[..start].iter());
+        composed.push_str(&replacement);
+        composed.extend(chars[rest..].iter());
+        self.restore_input_at(composed, start + replacement.chars().count());
+    }
+
+    /// Adopt the draft's leading word as the highlight's home: a different
+    /// word means a different item list, so the highlight restarts at the
+    /// first row. Reading it back also resets on mismatch as a fallback for
+    /// draft edits that bypass these wrappers (typing, submissions).
+    fn observe_hint_word(&mut self) {
+        let word = hint_word(self.input()).unwrap_or_default();
+        if self.hint_selection_word != word {
+            self.hint_selection_word = word;
+            self.hint_selected = 0;
+        }
+    }
+
+    /// Session draft restoration, re-based so a restored draft resets the
+    /// hint highlight the same moment the item list changes.
+    pub fn restore_input_at(&mut self, text: String, cursor: usize) {
+        self.session.restore_input_at(text, cursor);
+        self.observe_hint_word();
+    }
+
+    /// [`Self::restore_input_at`] for the cursor-at-end convenience form.
+    pub fn restore_input(&mut self, text: String) {
+        self.session.restore_input(text);
+        self.observe_hint_word();
     }
     pub fn sidebar_rows(&self) -> Vec<SidebarRow> {
         let mut seen = Vec::new();

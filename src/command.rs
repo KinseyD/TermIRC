@@ -131,6 +131,37 @@ pub fn parse_slash_command(input: &str) -> Option<Result<SlashCommand, SlashPars
     }))
 }
 
+/// The supported slash commands with a one-line description each, in the
+/// order the TUI's hint bar lists them. Kept beside the parser so a new
+/// command cannot gain an action without also gaining its hint text.
+pub(crate) const COMMANDS: [(&str, &str); 13] = [
+    ("join", "Join or focus a channel on the current server"),
+    (
+        "part",
+        "Leave the named or current channel, keeping its buffer",
+    ),
+    (
+        "query",
+        "Open or reopen a private conversation and focus it",
+    ),
+    ("close", "Hide the current private conversation"),
+    ("msg", "Send a message without switching conversation"),
+    ("me", "Send a CTCP ACTION to the current conversation"),
+    ("nick", "Request a nickname change on the current server"),
+    ("away", "Set an away message; no argument toggles"),
+    ("back", "Clear away status on the current server"),
+    (
+        "connect",
+        "Connect a stopped server, defaulting to the current one",
+    ),
+    ("reconnect", "Restart the connection, or connect if stopped"),
+    (
+        "disconnect",
+        "Disconnect the current server and stop retries",
+    ),
+    ("quit", "Alias for disconnect; the application stays open"),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,6 +445,51 @@ mod tests {
                     arguments: arguments.into(),
                 })),
                 "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn description_table_keys_are_exactly_the_supported_commands() {
+        assert_eq!(
+            COMMANDS.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+            [
+                "join",
+                "part",
+                "query",
+                "close",
+                "msg",
+                "me",
+                "nick",
+                "away",
+                "back",
+                "connect",
+                "reconnect",
+                "disconnect",
+                "quit"
+            ]
+        );
+    }
+
+    #[test]
+    fn descriptions_are_non_empty_one_liners() {
+        for (name, description) in COMMANDS {
+            assert!(!description.is_empty(), "/{name} has no description");
+            assert!(
+                !description.contains(['\n', '\r']),
+                "/{name} description spans several lines"
+            );
+        }
+    }
+
+    #[test]
+    fn description_table_names_all_parse_to_supported_actions() {
+        for (name, _) in COMMANDS {
+            let parsed = parse_slash_command(&format!("/{name}"))
+                .unwrap_or_else(|| panic!("/{name} stopped parsing as a command"));
+            assert!(
+                matches!(parsed, Ok(command) if command.action() != Err(CommandError::Unsupported)),
+                "/{name} is listed but rejected as unsupported"
             );
         }
     }

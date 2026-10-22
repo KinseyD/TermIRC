@@ -39,7 +39,7 @@ pub fn hit(x: u16, y: u16, g: &ScreenGeometry) -> MouseTarget {
 mod tests {
     use super::*;
     fn hit(x: u16, y: u16, w: u16, h: u16, composer_rows: u16) -> MouseTarget {
-        let g = crate::tui::render::geometry(w, h, "", 0, composer_rows > 0);
+        let g = crate::tui::render::geometry(w, h, "", 0, composer_rows > 0, 0);
         super::hit(x, y, &g)
     }
 
