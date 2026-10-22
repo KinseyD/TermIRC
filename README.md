@@ -138,6 +138,10 @@ channel, identity and connection commands are:
 | `/msg <target> <text>` | Send a message without switching conversation. A `#`/`&` target must be a joined channel; a nickname target opens (or reopens) its private conversation and focuses it. |
 | `/me <action>` | Send a CTCP ACTION to the current private conversation or joined channel, shown as `* <action>`. |
 | `/nick <nickname>` | Request a nickname change on the current server; local echoes use the new nickname after the server confirms it. |
+| `/topic [#channel]` | Query the topic of the named channel, or the current channel when omitted; the topic reply appears in that channel's buffer. |
+| `/names [#channel]` | List the members of the named channel, or the current channel when omitted, as a system line; the replies refresh the sidebar's member completion cache. |
+| `/mode [target [mode]]` | Send a MODE query or change, passed through to the server. With no argument, query the modes of the current channel. |
+| `/whois <nickname>` | Query who a nickname is on the current server; the whois replies appear in the buffer that issued the command. |
 | `/away [reason]` | Set an away message. With no argument, toggle between away (default reason `Away`) and back, using the confirmed away state. |
 | `/back` | Clear away status on the current server. |
 | `/connect [server]` | Connect a stopped server using its configuration key; defaults to the current server. |
@@ -223,7 +227,8 @@ PART does not hide or delete the channel: history, draft and reading position
 remain available. Joining an existing channel reuses its buffer. Incoming
 messages for unknown channels are ignored; our own server-confirmed JOIN first
 registers a newly discovered channel, so its first message is not lost.
-There are no topic, names, modes or other new channel-management commands.
+`/topic`, `/names` and `/mode` query or change channel state on the
+registered server; their replies are shown in the channel's buffer.
 
 ### Private conversations
 
