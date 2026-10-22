@@ -12,6 +12,7 @@ fn config() -> Config {
     Config {
         servers: Default::default(),
         history: Default::default(),
+        theme: Default::default(),
     }
 }
 

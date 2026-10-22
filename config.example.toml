@@ -34,3 +34,28 @@ retention_days = 7
 # Buffers never written to or restored from the archive: a bare name applies
 # to every server, "server/name" to one server.
 exclude = ["#overflow", "libera/#huge"]
+
+# Color theme (optional). Each key below is one of the renderer's color roles;
+# values are named ANSI-16 colors ("black", "red", ..., "white",
+# "bright-black", ..., "bright-white"), 256-color indices (0-255), or
+# "#rrggbb" hex strings. Roles not listed keep the built-in dark theme, so an
+# absent [theme] table changes nothing. Unknown roles or malformed colors are
+# rejected when the config is loaded.
+#
+# A light-theme example:
+# [theme]
+# global_bg = "#f5f5f0"        # screen background
+# input_bg = "#e8e8e2"         # composer panel background
+# separator = "#aaaaaa"        # sidebar/main divider
+# accent = "#2f7d4f"           # composer/selection accent
+# accent_dim = "#9dbfa9"       # accent while unfocused
+# nick = "blue"                # message author prefix
+# dim = "#666666"              # channel names, hint descriptions
+# sidebar_active_bg = "#d8d8d0"
+# sidebar_cursor_bg = "#c8c8c0"
+# message_select_bg = "#d0d0c8"
+# hover_bg = "#e0e0da"
+# input_cursor_bg = "#333333"  # text cursor block
+# status_ok = "green"
+# status_err = "red"
+# status_pending = "bright-black"

@@ -103,6 +103,7 @@ fn history_beyond_u16_range_supports_scroll_selection_and_hit_testing() {
 fn chinese_input_renders_every_character_and_tiny_windows_do_not_panic() {
     use ratatui::{Terminal, backend::TestBackend};
     use termirc::tui::render::{self, Chrome};
+    let theme = termirc::theme::Theme::default();
     let mut app = App::new(16, 13);
     app.open_channel("srv", "#a");
     app.select_buffer(0);
@@ -112,7 +113,16 @@ fn chinese_input_renders_every_character_and_tiny_windows_do_not_panic() {
     }
     let mut terminal = Terminal::new(TestBackend::new(44, 20)).unwrap();
     terminal
-        .draw(|f| render::draw(f, &app, &Chrome { status: "" }))
+        .draw(|f| {
+            render::draw(
+                f,
+                &app,
+                &Chrome {
+                    status: "",
+                    theme: &theme,
+                },
+            )
+        })
         .unwrap();
     let text = terminal
         .backend()
@@ -130,7 +140,16 @@ fn chinese_input_renders_every_character_and_tiny_windows_do_not_panic() {
             let g = render::geometry(w, h, app.input(), app.input_cursor(), true, app.hint_rows());
             app.resize(g.messages.width, g.messages.height);
             terminal
-                .draw(|f| render::draw(f, &app, &Chrome { status: "" }))
+                .draw(|f| {
+                    render::draw(
+                        f,
+                        &app,
+                        &Chrome {
+                            status: "",
+                            theme: &theme,
+                        },
+                    )
+                })
                 .unwrap();
         }
     }
@@ -143,6 +162,7 @@ fn clipped_composer_keeps_cursor_row_visible_and_mouse_geometry_matches() {
         mouse::{self, MouseTarget},
         render::{self, Chrome},
     };
+    let theme = termirc::theme::Theme::default();
     let mut app = App::new(16, 13);
     app.open_channel("srv", "#a");
     app.select_buffer(0);
@@ -164,7 +184,16 @@ fn clipped_composer_keeps_cursor_row_visible_and_mouse_geometry_matches() {
         app.resize(g.messages.width, g.messages.height);
         let mut terminal = Terminal::new(TestBackend::new(44, height)).unwrap();
         terminal
-            .draw(|f| render::draw(f, &app, &Chrome { status: "" }))
+            .draw(|f| {
+                render::draw(
+                    f,
+                    &app,
+                    &Chrome {
+                        status: "",
+                        theme: &theme,
+                    },
+                )
+            })
             .unwrap();
         assert_eq!(
             terminal.backend().buffer()[(cursor_x, cursor_y)].bg,
@@ -178,6 +207,7 @@ fn system_message_renders_inline_like_console_rows() {
     use ratatui::{Terminal, backend::TestBackend};
     use termirc::core::{BufferKind, MessageContent};
     use termirc::tui::render::{self, Chrome};
+    let theme = termirc::theme::Theme::default();
     let mut app = App::new(40, 10);
     app.open_channel("srv", "#a");
     app.select_buffer(0);
@@ -198,7 +228,16 @@ fn system_message_renders_inline_like_console_rows() {
     app.resize(g.messages.width, g.messages.height);
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     terminal
-        .draw(|f| render::draw(f, &app, &Chrome { status: "" }))
+        .draw(|f| {
+            render::draw(
+                f,
+                &app,
+                &Chrome {
+                    status: "",
+                    theme: &theme,
+                },
+            )
+        })
         .unwrap();
     let text = terminal
         .backend()
