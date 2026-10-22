@@ -21,6 +21,10 @@ pub enum CommandAction {
     },
     Query(String),
     Close,
+    Topic(Option<String>),
+    Names(Option<String>),
+    Mode(String),
+    Whois(String),
     Nick(String),
     Away(Option<String>),
     Msg {
@@ -104,6 +108,11 @@ impl SlashCommand {
                 }
                 Ok(Me(text.into()))
             }
+            "topic" => channel_argument(args, single).map(Topic),
+            "names" => channel_argument(args, single).map(Names),
+            "mode" => Ok(Mode(args.to_string())),
+            "whois" if single && crate::core::valid_query_nickname(args) => Ok(Whois(args.into())),
+            "whois" => Err(CommandError::InvalidArguments),
             "connect" if args.is_empty() || single => Ok(Connect(optional())),
             "reconnect" if args.is_empty() || single => Ok(Reconnect(optional())),
             "disconnect" | "quit" => Ok(Disconnect(args.into())),
@@ -131,10 +140,22 @@ pub fn parse_slash_command(input: &str) -> Option<Result<SlashCommand, SlashPars
     }))
 }
 
+/// An optional `#channel` argument: absent means "the current channel" and
+/// is resolved by the application layer, which knows the active buffer.
+fn channel_argument(args: &str, single: bool) -> Result<Option<String>, CommandError> {
+    if args.is_empty() {
+        Ok(None)
+    } else if single && crate::core::valid_channel_name(args) {
+        Ok(Some(args.to_string()))
+    } else {
+        Err(CommandError::InvalidArguments)
+    }
+}
+
 /// The supported slash commands with a one-line description each, in the
 /// order the TUI's hint bar lists them. Kept beside the parser so a new
 /// command cannot gain an action without also gaining its hint text.
-pub(crate) const COMMANDS: [(&str, &str); 13] = [
+pub(crate) const COMMANDS: [(&str, &str); 17] = [
     ("join", "Join or focus a channel on the current server"),
     (
         "part",
@@ -148,6 +169,13 @@ pub(crate) const COMMANDS: [(&str, &str); 13] = [
     ("msg", "Send a message without switching conversation"),
     ("me", "Send a CTCP ACTION to the current conversation"),
     ("nick", "Request a nickname change on the current server"),
+    ("topic", "View the topic of the named or current channel"),
+    ("names", "List members of the named or current channel"),
+    (
+        "mode",
+        "Query or change channel or user modes, passed through",
+    ),
+    ("whois", "Query who a nickname is on the current server"),
     ("away", "Set an away message; no argument toggles"),
     ("back", "Clear away status on the current server"),
     (
@@ -340,6 +368,46 @@ mod tests {
     }
 
     #[test]
+    fn channel_query_commands_accept_optional_channels_and_raw_passthrough() {
+        for (input, expected) in [
+            ("/topic", CommandAction::Topic(None)),
+            ("/topic  #Room", CommandAction::Topic(Some("#Room".into()))),
+            ("/TOPIC #Room", CommandAction::Topic(Some("#Room".into()))),
+            ("/names", CommandAction::Names(None)),
+            ("/names #Room", CommandAction::Names(Some("#Room".into()))),
+            ("/mode", CommandAction::Mode(String::new())),
+            ("/mode #Room", CommandAction::Mode("#Room".into())),
+            (
+                "/mode #Room +m foo",
+                CommandAction::Mode("#Room +m foo".into()),
+            ),
+            ("/whois alice", CommandAction::Whois("alice".into())),
+        ] {
+            assert_eq!(
+                parse_slash_command(input).unwrap().unwrap().action(),
+                Ok(expected),
+                "{input}"
+            );
+        }
+        for input in [
+            "/topic room",
+            "/topic #Room extra",
+            "/topic #",
+            "/names two tokens",
+            "/whois",
+            "/whois ",
+            "/whois two tokens",
+            "/whois #Room",
+        ] {
+            assert_eq!(
+                parse_slash_command(input).unwrap().unwrap().action(),
+                Err(CommandError::InvalidArguments),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
     fn identity_and_connection_commands_have_typed_arguments() {
         for (input, expected) in [
             ("/nick Alice", CommandAction::Nick("Alice".into())),
@@ -461,6 +529,10 @@ mod tests {
                 "msg",
                 "me",
                 "nick",
+                "topic",
+                "names",
+                "mode",
+                "whois",
                 "away",
                 "back",
                 "connect",
