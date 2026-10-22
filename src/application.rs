@@ -41,6 +41,9 @@ pub struct Buffer {
     pub send_blocked: bool,
     pub channel_status: ChannelStatus,
     pending_channel_changes: usize,
+    /// Channel members from NAMES replies, deduplicated ASCII-case-
+    /// insensitively in arrival order; feeds nick completion and /names.
+    members: Vec<String>,
 }
 
 #[derive(Default)]
@@ -61,6 +64,9 @@ pub struct Session {
     welcome_draft: Draft,
     next_buffer_id: u64,
     pending_self_echoes: HashMap<BufferId, HashSet<MessageId>>,
+    /// The buffer that issued the most recent unanswered /whois per server;
+    /// whois replies are redirected there until 318 (or an error) arrives.
+    pending_whois: HashMap<ServerId, BufferId>,
     /// Optional SQLite archive; injected by `main` per configuration and
     /// absent in tests that do not exercise persistence.
     persist: Option<crate::persist::HistorySink>,
@@ -116,6 +122,7 @@ impl Session {
             welcome_draft: Draft::default(),
             next_buffer_id: 1,
             pending_self_echoes: HashMap::new(),
+            pending_whois: HashMap::new(),
             persist: None,
         }
     }
@@ -164,6 +171,7 @@ impl Session {
             unread: false,
             send_blocked: false,
             pending_channel_changes: 0,
+            members: Vec::new(),
         });
         self.drain_persisted(&server_id, &persisted_kind, id);
         id
@@ -238,6 +246,7 @@ impl Session {
     /// registered target remain visible in the originating server's console.
     pub fn push_message(&mut self, mut message: RoutedMessage) -> Option<HistoryChange> {
         self.route_query_error(&mut message);
+        self.apply_info_reply(&mut message);
         // With echo-message, a PRIVMSG from our confirmed nick echoes what we
         // already optimistically displayed: confirm that copy and drop the
         // duplicate instead of appending a second line.
@@ -312,6 +321,70 @@ impl Session {
         };
         self.persist_append(&message);
         Some(self.history.append(id, message.content))
+    }
+
+    /// Redirect or mine numeric info replies (topic/names/mode/whois) that
+    /// the protocol layer decoded as `MessageKind::Info`.
+    fn apply_info_reply(&mut self, message: &mut RoutedMessage) {
+        let ends_whois = |code: u16| code == 318;
+        let redirect_to_origin = match &message.content.kind {
+            MessageKind::Info { code } if crate::protocol::is_whois_numeric(*code) => true,
+            // Errors that answer a pending /whois land beside its replies;
+            // without a pending whois their routing is unchanged.
+            MessageKind::Error {
+                code: 401 | 402 | 431 | 432 | 461,
+                ..
+            } if message.target == BufferKind::Server => true,
+            _ => false,
+        };
+        if redirect_to_origin {
+            let ends = matches!(&message.content.kind, MessageKind::Info { code } if ends_whois(*code))
+                || matches!(&message.content.kind, MessageKind::Error { .. });
+            let origin = if ends {
+                self.pending_whois.remove(&message.server)
+            } else {
+                self.pending_whois.get(&message.server).copied()
+            };
+            if let Some(origin) = origin
+                && let Some(buffer) = self.buffers.iter().find(|buffer| buffer.id == origin)
+            {
+                message.target = buffer.kind.clone();
+            }
+        }
+        if matches!(&message.content.kind, MessageKind::Info { code: 353 })
+            && let BufferKind::Channel(_) = message.target
+            && let Some(index) = self.buffers.iter().position(|buffer| {
+                buffer.server == message.server && buffer.kind.matches(&message.target)
+            })
+        {
+            self.merge_members(index, &message.content.text);
+        }
+    }
+
+    /// Merge one NAMES nick list into a channel buffer's member cache,
+    /// ignoring membership sigils and ASCII-case duplicates.
+    fn merge_members(&mut self, index: usize, names: &str) {
+        let buffer = &mut self.buffers[index];
+        for token in names.split_whitespace() {
+            let nick = token.trim_start_matches(['@', '+', '~', '&', '%']);
+            if !nick.is_empty()
+                && !buffer
+                    .members
+                    .iter()
+                    .any(|member| member.eq_ignore_ascii_case(nick))
+            {
+                buffer.members.push(nick.to_owned());
+            }
+        }
+    }
+
+    /// The cached channel members from the latest NAMES replies, in arrival
+    /// order; empty for non-channel buffers and parted channels.
+    pub fn channel_members(&self, buffer: BufferId) -> &[String] {
+        self.buffers
+            .iter()
+            .find(|buffer_| buffer_.id == buffer)
+            .map_or(&[], |buffer| buffer.members.as_slice())
     }
 
     /// Persist one routed message if a sink is attached; delivery state,
@@ -491,6 +564,11 @@ impl Session {
                     let buffer = &mut self.buffers[index];
                     if buffer.pending_channel_changes == 0 {
                         buffer.channel_status = *status;
+                        // Parting, being kicked, or losing membership
+                        // invalidates the NAMES cache.
+                        if buffer.channel_status.state != ChannelState::Joined {
+                            buffer.members.clear();
+                        }
                     }
                 } else if crate::core::valid_channel_name(channel) {
                     let id = self.open_channel(server, channel);
@@ -827,6 +905,12 @@ impl Composer<'_> {
                     MessageKind::Action,
                 );
             }
+            CommandAction::Topic(_)
+            | CommandAction::Names(_)
+            | CommandAction::Mode(_)
+            | CommandAction::Whois(_) => {
+                return self.send_info_command(&action);
+            }
             _ => {}
         }
         let explicit = match &action {
@@ -877,7 +961,11 @@ impl Composer<'_> {
             CommandAction::Query(_)
             | CommandAction::Close
             | CommandAction::Msg { .. }
-            | CommandAction::Me(_) => return Err("invalid_command"),
+            | CommandAction::Me(_)
+            | CommandAction::Topic(_)
+            | CommandAction::Names(_)
+            | CommandAction::Mode(_)
+            | CommandAction::Whois(_) => return Err("invalid_command"),
         };
         validate_control(&command).map_err(|_| "invalid_control")?;
         handle
@@ -886,6 +974,76 @@ impl Composer<'_> {
             .map_err(|_| "disconnected_or_busy")?;
         if let Some(state) = next {
             self.session.begin_connection_change(server, state);
+        }
+        Ok(SubmissionEffect::None)
+    }
+
+    /// Send /topic, /names, /mode and /whois. These ride
+    /// `OutgoingMessage::Raw`: unlike console JOIN/PART they carry no local
+    /// channel-intent to track, so no `CommandAction` interception via
+    /// `channel_control_from_raw` is needed — replies come back as numerics
+    /// routed by `protocol::decode_message`. Bare commands resolve to the
+    /// current channel; /whois records the issuing buffer so its replies can
+    /// be redirected there.
+    fn send_info_command(
+        &mut self,
+        action: &CommandAction,
+    ) -> Result<SubmissionEffect, &'static str> {
+        let buffer = self.session.active_buffer().ok_or("no_server")?;
+        let server = buffer.server_label.clone();
+        let origin = buffer.id;
+        let current_channel = buffer.kind.channel().map(str::to_owned);
+        let line = match action {
+            CommandAction::Topic(channel) => {
+                let channel = channel
+                    .clone()
+                    .or(current_channel)
+                    .ok_or("topic_requires_channel")?;
+                format!("TOPIC {channel}")
+            }
+            CommandAction::Names(channel) => {
+                let channel = channel
+                    .clone()
+                    .or(current_channel)
+                    .ok_or("names_requires_channel")?;
+                format!("NAMES {channel}")
+            }
+            CommandAction::Mode(arguments) => match arguments.trim() {
+                "" => {
+                    let channel = current_channel.ok_or("mode_requires_channel")?;
+                    format!("MODE {channel}")
+                }
+                arguments => format!("MODE {arguments}"),
+            },
+            CommandAction::Whois(nickname) => format!("WHOIS {nickname}"),
+            _ => return Err("invalid_command"),
+        };
+        if self.session.connection_state(&server, None) != ConnectionState::Connected {
+            return Err("not_connected");
+        }
+        let handle = self
+            .connections
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(&server))
+            .map(|(_, handle)| handle)
+            .ok_or("unknown_server")?;
+        let outgoing = OutgoingMessage::Raw {
+            server: server.clone(),
+            line,
+        };
+        encode_outgoing(&outgoing).map_err(|error| {
+            *self.status = format!("failed to send ({error})");
+            "message_rejected"
+        })?;
+        handle
+            .outgoing
+            .try_send(outgoing)
+            .map_err(|_| "disconnected_or_busy")?;
+        if matches!(action, CommandAction::Whois(_)) {
+            // Supersedes any earlier unanswered /whois on this server.
+            self.session
+                .pending_whois
+                .insert(ServerId::new(&server), origin);
         }
         Ok(SubmissionEffect::None)
     }

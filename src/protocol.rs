@@ -145,6 +145,8 @@ pub fn channel_control_from_raw(line: &str) -> Result<Option<ConnectionCommand>,
 
 // Presence and automatic registration floods stay hidden. User-requested
 // replies and all 4xx/5xx errors remain available to the application.
+// NAMES replies (353/366) are decoded by `info_payload` instead: they feed
+// the channel member cache and the /names display.
 const IGNORED_NUMERICS: &[Response] = &[
     Response::RPL_ISUPPORT,
     Response::RPL_LUSERCLIENT,
@@ -154,8 +156,6 @@ const IGNORED_NUMERICS: &[Response] = &[
     Response::RPL_LUSERME,
     Response::RPL_LOCALUSERS,
     Response::RPL_GLOBALUSERS,
-    Response::RPL_NAMREPLY,
-    Response::RPL_ENDOFNAMES,
 ];
 
 /// Render a CTCP ACTION payload (`\x01ACTION text\x01`) as the shared
@@ -296,6 +296,24 @@ pub fn decode_message(
         {
             error_payload(command.parse().ok()?, args, known_channels)
         }
+        // Topic, names, mode and whois replies for the /topic, /names,
+        // /mode and /whois commands: routed to the channel buffer when the
+        // channel is known, otherwise to the server console. Whois replies
+        // target the console here; the application layer redirects them to
+        // the buffer that issued the command.
+        Command::Response(response, args) if info_reply_code(*response as u16).is_some() => {
+            info_payload(*response as u16, args, known_channels)?
+        }
+        // Numerics the IRC crate does not model (329 creation time,
+        // 338 whois host) arrive as raw commands with numeric names.
+        Command::Raw(command, args)
+            if command
+                .parse::<u16>()
+                .is_ok_and(|code| info_reply_code(code).is_some()) =>
+        {
+            let code = command.parse().ok()?;
+            info_payload(code, args, known_channels)?
+        }
         Command::Response(response, _) if IGNORED_NUMERICS.contains(response) => return None,
         Command::Response(_, args) => {
             if args.len() <= 1 || args.iter().any(|arg| is_channel(arg)) {
@@ -402,6 +420,62 @@ fn error_payload(
             reason,
         },
     )
+}
+
+/// The numeric whose reply ends a WHOIS/WHOWAS run; the application layer
+/// uses this to stop redirecting whois replies to the issuing buffer.
+pub fn is_whois_numeric(code: u16) -> bool {
+    matches!(code, 311 | 312 | 313 | 314 | 317 | 318 | 319 | 338)
+}
+
+/// Codes decoded by `info_payload`; `None` leaves prior handling untouched.
+fn info_reply_code(code: u16) -> Option<u16> {
+    match code {
+        // Topic, channel modes, names.
+        324 | 329 | 331 | 332 | 333 | 353 | 366 => Some(code),
+        code if is_whois_numeric(code) => Some(code),
+        _ => None,
+    }
+}
+
+/// Decode topic/names/mode/whois replies. Channel-scoped codes land in the
+/// channel buffer when it is known, otherwise the server console; whois
+/// replies always target the server console here and are redirected by the
+/// application layer to the buffer that issued the command. `None` drops
+/// malformed replies, matching the generic numeric branch's behavior.
+fn info_payload(
+    code: u16,
+    args: &[String],
+    channels: &[String],
+) -> Option<(BufferKind, String, String, MessageKind)> {
+    let text = if code == 353 {
+        // RPL_NAMREPLY is <me> <symbol> <channel> :<nicks>: the trailing
+        // nick list (with @/+ style sigils) is the last parameter and is
+        // kept verbatim for the member cache; four parameters are required
+        // so the channel itself is never mistaken for the nick list.
+        if args.len() < 4 {
+            return None;
+        }
+        args.last().cloned().unwrap_or_default()
+    } else {
+        args.get(1..).unwrap_or_default().join(" ")
+    };
+    if text.trim().is_empty() {
+        return None;
+    }
+    let channel = args
+        .iter()
+        .skip(1)
+        .find(|arg| is_channel(arg))
+        .filter(|channel| {
+            channels
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(channel))
+        })
+        .map_or(BufferKind::Server, |channel| {
+            BufferKind::Channel(channel.clone())
+        });
+    Some((channel, String::new(), text, MessageKind::Info { code }))
 }
 
 #[cfg(test)]
@@ -727,10 +801,14 @@ mod tests {
 
     #[test]
     fn channel_param_replies_are_blocked_from_the_console() {
+        // 332/353 for known channels now route to the channel buffer (see
+        // topic_and_names_replies_route_to_the_channel_buffer); other
+        // channel-parameter replies stay out of the console, and
+        // topic/names replies for unknown channels never invent buffers.
         for line in [
-            ":mock 332 smoke #osu :Welcome to #osu",
+            ":mock 341 smoke #osu alice",
+            ":mock 346 smoke #osu alice!a@b",
             ":mock NOTICE #osu :spam",
-            ":mock 353 smoke = #osu :a b",
         ] {
             assert!(decode(line).is_none(), "{line}");
         }
@@ -747,9 +825,86 @@ mod tests {
     }
 
     #[test]
-    fn names_replies_are_blocked_from_the_console() {
-        assert!(decode(":mock 353 smoke = #test :smoke alice bob").is_none());
-        assert!(decode(":mock 366 smoke #test :End of /NAMES list").is_none());
+    fn names_replies_for_unknown_channels_fall_back_to_the_console() {
+        // #test is not a known channel: the reply stays visible in the
+        // server console instead of being dropped.
+        let names = decode(":mock 353 smoke = #test :smoke alice bob").unwrap();
+        assert_eq!(names.target, BufferKind::Server);
+        assert_eq!(names.content.text, "smoke alice bob");
+        assert_eq!(names.content.kind, MessageKind::Info { code: 353 });
+        let end = decode(":mock 366 smoke #test :End of /NAMES list").unwrap();
+        assert_eq!(end.target, BufferKind::Server);
+        assert_eq!(end.content.kind, MessageKind::Info { code: 366 });
+    }
+
+    #[test]
+    fn topic_and_names_replies_route_to_the_channel_buffer() {
+        let topic = decode(":mock 332 smoke #OSU :Welcome to #osu").unwrap();
+        assert_eq!(topic.target, BufferKind::Channel("#OSU".into()));
+        assert_eq!(topic.content.text, "#OSU Welcome to #osu");
+        assert_eq!(topic.content.kind, MessageKind::Info { code: 332 });
+
+        let no_topic = decode(":mock 331 smoke #osu :No topic is set").unwrap();
+        assert_eq!(no_topic.target, BufferKind::Channel("#osu".into()));
+        assert_eq!(no_topic.content.kind, MessageKind::Info { code: 331 });
+
+        let who = decode(":mock 333 smoke #osu alice!a@b 1700000000").unwrap();
+        assert_eq!(who.target, BufferKind::Channel("#osu".into()));
+        assert_eq!(who.content.kind, MessageKind::Info { code: 333 });
+
+        // The nick list is the trailing parameter, sigils included.
+        let names = decode(":mock 353 smoke = #osu :smoke @op +voice").unwrap();
+        assert_eq!(names.target, BufferKind::Channel("#osu".into()));
+        assert_eq!(names.content.text, "smoke @op +voice");
+        assert_eq!(names.content.kind, MessageKind::Info { code: 353 });
+
+        let end = decode(":mock 366 smoke #osu :End of /NAMES list").unwrap();
+        assert_eq!(end.target, BufferKind::Channel("#osu".into()));
+        assert_eq!(end.content.kind, MessageKind::Info { code: 366 });
+    }
+
+    #[test]
+    fn mode_replies_route_to_the_channel_buffer() {
+        let modes = decode(":mock 324 smoke #osu +nrt").unwrap();
+        assert_eq!(modes.target, BufferKind::Channel("#osu".into()));
+        assert_eq!(modes.content.kind, MessageKind::Info { code: 324 });
+
+        // 329 is not modelled by the IRC dependency and arrives raw.
+        let created = decode(":mock 329 smoke #osu 1700000000").unwrap();
+        assert_eq!(created.target, BufferKind::Channel("#osu".into()));
+        assert_eq!(created.content.text, "#osu 1700000000");
+        assert_eq!(created.content.kind, MessageKind::Info { code: 329 });
+    }
+
+    #[test]
+    fn whois_replies_target_the_server_console_for_redirection() {
+        for (line, code) in [
+            (":mock 311 smoke alice ~a host * :real name", 311),
+            (":mock 312 smoke alice mock :server info", 312),
+            (":mock 313 smoke alice :is an IRC operator", 313),
+            (":mock 314 smoke alice ~a host * :was here", 314),
+            (":mock 317 smoke alice 42 :seconds idle", 317),
+            (":mock 318 smoke alice :End of /WHOIS list", 318),
+            (":mock 319 smoke alice :@#osu", 319),
+            // 338 is not modelled by the IRC dependency and arrives raw.
+            (":mock 338 smoke alice ~a@host :actually using host", 338),
+        ] {
+            let message = decode(line).unwrap_or_else(|| panic!("{line}"));
+            assert_eq!(message.target, BufferKind::Server, "{line}");
+            assert_eq!(message.content.kind, MessageKind::Info { code }, "{line}");
+        }
+    }
+
+    #[test]
+    fn malformed_info_replies_are_dropped() {
+        for line in [
+            ":mock 332 smoke",
+            ":mock 332 smoke  ",
+            ":mock 353 smoke = #osu",
+            ":mock 311 smoke",
+        ] {
+            assert!(decode(line).is_none(), "{line}");
+        }
     }
 
     #[test]

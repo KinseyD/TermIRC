@@ -480,3 +480,231 @@ channels=["#Room"]
     );
     assert!(session.active_buffer().is_none());
 }
+
+#[test]
+fn channel_commands_resolve_targets_and_ride_the_raw_outgoing_path() {
+    for (source, input, expected) in [
+        (
+            BufferKind::Channel("#Room".into()),
+            "/topic",
+            Some("TOPIC #Room"),
+        ),
+        (
+            BufferKind::Channel("#Room".into()),
+            "/names",
+            Some("NAMES #Room"),
+        ),
+        (
+            BufferKind::Channel("#Room".into()),
+            "/mode",
+            Some("MODE #Room"),
+        ),
+        (
+            BufferKind::Channel("#Room".into()),
+            "/mode #Room +m",
+            Some("MODE #Room +m"),
+        ),
+        (
+            BufferKind::Channel("#Room".into()),
+            "/whois alice",
+            Some("WHOIS alice"),
+        ),
+        (BufferKind::Server, "/topic #Room", Some("TOPIC #Room")),
+        (
+            BufferKind::Query("alice".into()),
+            "/names #Room",
+            Some("NAMES #Room"),
+        ),
+        (BufferKind::Server, "/topic", None),
+        (BufferKind::Query("alice".into()), "/names", None),
+        (BufferKind::Server, "/mode", None),
+    ] {
+        let (mut session, connections, mut messages, mut commands) = connected_session(8);
+        session.open_channel("srv", "#Room");
+        let source = session.open_buffer("srv", source);
+        session.select_buffer_id(source);
+        let effect = submit(&mut session, &connections, input);
+        assert_eq!(effect, SubmissionEffect::None, "{input}");
+        if let Some(line) = expected {
+            assert_eq!(
+                messages.try_recv(),
+                Ok(OutgoingMessage::Raw {
+                    server: "srv".into(),
+                    line: line.into(),
+                }),
+                "{input}"
+            );
+            assert!(session.input().is_empty(), "{input}");
+        } else {
+            // Bare channel commands without a channel keep the draft for
+            // editing and never reach the wire.
+            assert_eq!(session.input(), input, "{input}");
+            assert!(messages.try_recv().is_err(), "{input}");
+        }
+        assert!(commands.try_recv().is_err(), "{input}");
+    }
+}
+
+fn info_message(server: &str, target: BufferKind, code: u16, text: &str) -> RoutedMessage {
+    RoutedMessage {
+        server: ServerId::new(server),
+        target,
+        content: MessageContent {
+            kind: MessageKind::Info { code },
+            ..MessageContent::console(text)
+        },
+    }
+}
+
+#[test]
+fn topic_and_names_replies_land_in_the_channel_buffer_or_the_console() {
+    let (mut session, _connections, _messages, _commands) = connected_session(8);
+    let console = session.active_buffer().unwrap().id;
+    let channel = session.open_channel("srv", "#Room");
+    session.handle_event(IrcEvent::Message(info_message(
+        "srv",
+        BufferKind::Channel("#room".into()),
+        332,
+        "#Room Welcome",
+    )));
+    let history = session.messages_for(channel);
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].text, "#Room Welcome");
+    assert_eq!(history[0].kind, MessageKind::Info { code: 332 });
+    // A reply whose channel has no buffer falls back to the console.
+    session.handle_event(IrcEvent::Message(info_message(
+        "srv",
+        BufferKind::Server,
+        366,
+        "#Gone End of /NAMES list",
+    )));
+    assert_eq!(
+        session.messages_for(console)[0].text,
+        "#Gone End of /NAMES list"
+    );
+}
+
+#[test]
+fn whois_replies_follow_the_issuing_buffer_until_the_list_ends() {
+    let (mut session, connections, mut messages, mut commands) = connected_session(8);
+    let console = session.active_buffer().unwrap().id;
+    let query = session.open_query("srv", "alice");
+    session.select_buffer_id(query);
+    submit(&mut session, &connections, "/whois bob");
+    assert_eq!(
+        messages.try_recv(),
+        Ok(OutgoingMessage::Raw {
+            server: "srv".into(),
+            line: "WHOIS bob".into(),
+        })
+    );
+    session.handle_event(IrcEvent::Message(info_message(
+        "srv",
+        BufferKind::Server,
+        311,
+        "bob ~b host * :real",
+    )));
+    assert_eq!(session.messages_for(query).len(), 1);
+    assert!(session.messages_for(console).is_empty());
+    // 318 ends the run: it still lands beside the replies...
+    session.handle_event(IrcEvent::Message(info_message(
+        "srv",
+        BufferKind::Server,
+        318,
+        "bob :End of /WHOIS list",
+    )));
+    assert_eq!(session.messages_for(query).len(), 2);
+    // ...so a later stray whois numeric returns to the console.
+    session.handle_event(IrcEvent::Message(info_message(
+        "srv",
+        BufferKind::Server,
+        312,
+        "bob mock :server info",
+    )));
+    assert_eq!(session.messages_for(console).len(), 1);
+
+    // A second /whois supersedes the origin with the new issuing buffer.
+    let channel = session.open_channel("srv", "#Room");
+    session.select_buffer_id(channel);
+    submit(&mut session, &connections, "/whois carol");
+    assert_eq!(
+        messages.try_recv(),
+        Ok(OutgoingMessage::Raw {
+            server: "srv".into(),
+            line: "WHOIS carol".into(),
+        })
+    );
+    session.handle_event(IrcEvent::Message(info_message(
+        "srv",
+        BufferKind::Server,
+        311,
+        "carol ~c host * :real",
+    )));
+    assert_eq!(session.messages_for(channel).len(), 1);
+    assert_eq!(session.messages_for(query).len(), 2);
+    assert!(commands.try_recv().is_err());
+}
+
+#[test]
+fn whois_error_numerics_follow_the_pending_origin() {
+    let (mut session, connections, mut messages, _commands) = connected_session(8);
+    let console = session.active_buffer().unwrap().id;
+    let channel = session.open_channel("srv", "#Room");
+    session.select_buffer_id(channel);
+    submit(&mut session, &connections, "/whois nobody");
+    assert!(messages.try_recv().is_ok());
+    session.handle_event(IrcEvent::Message(RoutedMessage {
+        server: ServerId::new("srv"),
+        target: BufferKind::Server,
+        content: MessageContent {
+            kind: MessageKind::Error {
+                code: 401,
+                target: Some("nobody".into()),
+                reason: "No such nick/channel".into(),
+            },
+            ..MessageContent::console("")
+        },
+    }));
+    // The error lands beside the pending whois's issuing buffer and ends it.
+    assert_eq!(session.messages_for(channel).len(), 1);
+    assert!(session.messages_for(console).is_empty());
+    session.handle_event(IrcEvent::Message(info_message(
+        "srv",
+        BufferKind::Server,
+        318,
+        "nobody :End of /WHOIS list",
+    )));
+    assert_eq!(session.messages_for(console).len(), 1);
+}
+
+#[test]
+fn names_replies_update_the_member_cache_until_membership_is_lost() {
+    let (mut session, _connections, _messages, _commands) = connected_session(8);
+    let channel = session.open_channel("srv", "#Room");
+    session.handle_event(IrcEvent::Message(info_message(
+        "srv",
+        BufferKind::Channel("#room".into()),
+        353,
+        "@op +voice alice",
+    )));
+    session.handle_event(IrcEvent::Message(info_message(
+        "srv",
+        BufferKind::Channel("#Room".into()),
+        353,
+        "ALICE bob",
+    )));
+    // Sigils are stripped and ASCII-case duplicates collapse; arrival order
+    // is preserved.
+    assert_eq!(
+        session.channel_members(channel),
+        [
+            "op".to_string(),
+            "voice".to_string(),
+            "alice".to_string(),
+            "bob".to_string()
+        ]
+    );
+    // PART or KICK of ourselves invalidates the cache.
+    channel_event(&mut session, "#Room", ChannelState::NotJoined, false);
+    assert!(session.channel_members(channel).is_empty());
+}

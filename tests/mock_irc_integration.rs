@@ -207,13 +207,17 @@ fn forwards_privmsg_as_chat_message() {
         tx,
     );
 
-    // Assert: skipping the status event and the console-bound greeting
-    // numerics, the PRIVMSG arrives as a typed channel message.
+    // Assert: skipping the status event, the console-bound greeting
+    // numerics, and the NAMES reply that now routes to the channel, the
+    // PRIVMSG arrives as a typed channel message.
     let deadline = std::time::Instant::now() + RECV_TIMEOUT;
     let mut chat = None;
     while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
         match rx.recv_timeout(remaining) {
-            Ok(IrcEvent::Message(message)) if matches!(message.target, BufferKind::Channel(_)) => {
+            Ok(IrcEvent::Message(message))
+                if matches!(message.target, BufferKind::Channel(_))
+                    && message.content.kind == MessageKind::Chat =>
+            {
                 chat = Some(message);
                 break;
             }

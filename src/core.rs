@@ -88,6 +88,12 @@ pub enum MessageKind {
     Chat,
     Action,
     Console,
+    /// A server numeric reply shown as a console-style line (topic, names,
+    /// mode, whois). Carries the numeric code so the application layer can
+    /// redirect or mine the reply without re-parsing display text.
+    Info {
+        code: u16,
+    },
     /// A locally generated connection notice; laid out like a console line
     /// (no nick column) but never selectable.
     System,
