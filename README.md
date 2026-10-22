@@ -266,8 +266,7 @@ ranges survive layout-text cache eviction; the 50,000-row cache budget does not
 limit history. Rendering constructs text only for visible rows. The composer
 uses the same display-width geometry for wrapping, sizing and mouse regions.
 
-Persistent history, SASL and IRCv3 capability negotiation
-are not implemented in this refactor.
+Persistent history is not implemented; conversations live in memory only.
 
 Run local validation with cached dependencies:
 
@@ -280,8 +279,7 @@ cargo run --release --locked --offline --example layout_benchmark
 ```
 
 Network tests use mock servers bound to `127.0.0.1`; the benchmark reads no
-user configuration and opens no connections. See the
-[refactor record](docs/refactor-2026-09-17.md) for regression coverage and measurements.
+user configuration and opens no connections.
 
 ## Troubleshooting
 
