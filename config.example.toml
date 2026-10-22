@@ -13,6 +13,17 @@ port = 6697
 channels = ["#example"]
 queries = ["alice", "bob"]
 
+# SOCKS5 proxy for this server (optional). Only "socks5" is supported; DNS
+# resolves through the proxy too. For Tor, run a local node and use:
+#   type = "socks5", host = "127.0.0.1", port = 9050
+# username/password are optional proxy credentials.
+# [servers.example.proxy]
+# type = "socks5"
+# host = "127.0.0.1"
+# port = 9050
+# # username = "proxyuser"
+# # password = "proxypass"
+
 # Persistent chat history (optional). Off by default; when enabled, chat and
 # action lines for channels and queries are stored in a local SQLite file at
 # ~/.local/share/termirc/history.sqlite and replayed when a buffer is opened.

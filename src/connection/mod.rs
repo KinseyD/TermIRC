@@ -13,6 +13,7 @@ mod session;
 use std::sync::mpsc;
 use std::thread;
 
+use irc::client::data::ProxyType as IrcProxyType;
 use irc::client::prelude::Config as IrcClientConfig;
 
 use crate::config::ServerConfig;
@@ -84,6 +85,19 @@ pub fn build_client_config(server: &ServerConfig) -> IrcClientConfig {
         password: Some(server.password.clone()),
         use_tls: Some(server.use_tls),
         channels: Vec::new(),
+        // SOCKS5 via tokio-socks; the irc crate resolves the IRC host through
+        // the proxy too, so DNS never leaves the tunnel (Tor-friendly).
+        proxy_type: server.proxy.as_ref().map(|_| IrcProxyType::Socks5),
+        proxy_server: server.proxy.as_ref().map(|proxy| proxy.host.clone()),
+        proxy_port: server.proxy.as_ref().map(|proxy| proxy.port),
+        proxy_username: server
+            .proxy
+            .as_ref()
+            .and_then(|proxy| proxy.username.clone()),
+        proxy_password: server
+            .proxy
+            .as_ref()
+            .and_then(|proxy| proxy.password.clone()),
         ..Default::default()
     }
 }
@@ -142,6 +156,7 @@ mod tests {
             queries: vec![],
             sasl_username: None,
             sasl_password: None,
+            proxy: None,
         }
     }
 
@@ -183,5 +198,41 @@ mod tests {
 
         // Assert
         assert_eq!(client_config.realname.as_deref(), Some("alice_"));
+    }
+
+    #[test]
+    fn maps_proxy_fields_onto_irc_config_when_configured() {
+        // Arrange
+        let mut server = server_config();
+        server.proxy = Some(crate::config::ProxyConfig {
+            r#type: "socks5".into(),
+            host: "127.0.0.1".into(),
+            port: 9050,
+            username: Some("tor".into()),
+            password: Some("sesame".into()),
+        });
+
+        // Act
+        let client_config = build_client_config(&server);
+
+        // Assert
+        assert_eq!(client_config.proxy_type, Some(IrcProxyType::Socks5));
+        assert_eq!(client_config.proxy_server.as_deref(), Some("127.0.0.1"));
+        assert_eq!(client_config.proxy_port, Some(9050));
+        assert_eq!(client_config.proxy_username.as_deref(), Some("tor"));
+        assert_eq!(client_config.proxy_password.as_deref(), Some("sesame"));
+    }
+
+    #[test]
+    fn leaves_proxy_unset_when_unconfigured() {
+        // Arrange: no proxy table in the config.
+
+        // Act
+        let client_config = build_client_config(&server_config());
+
+        // Assert
+        assert_eq!(client_config.proxy_type, None);
+        assert_eq!(client_config.proxy_server, None);
+        assert_eq!(client_config.proxy_port, None);
     }
 }

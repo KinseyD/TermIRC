@@ -32,6 +32,7 @@ fn server_config(port: u16, password: &str, sasl: Option<(&str, &str)>) -> Serve
         queries: vec![],
         sasl_username: sasl.map(|(username, _)| username.into()),
         sasl_password: sasl.map(|(_, password)| password.into()),
+        proxy: None,
     }
 }
 
