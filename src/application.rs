@@ -173,19 +173,38 @@ impl Session {
     ///
     /// Restored messages go straight through `HistoryStore::append`: message
     /// IDs are reminted, `unread` stays untouched, capacity trims apply, and
-    /// nothing is written back to the archive.
+    /// nothing is written back to the archive. When at least one record was
+    /// restored, a single system note (like the connection notices in
+    /// `update_connection_state`) reports how much history the replay reaches;
+    /// system lines are session-scoped, so the note is never re-archived.
     fn drain_persisted(&mut self, server: &ServerId, kind: &BufferKind, id: BufferId) {
         let Some(sink) = self.persist.as_ref() else {
             return;
         };
         let records = sink.load(server);
+        let mut restored = 0usize;
+        let mut cutoff = None;
         for (recorded, messages) in records {
             if !recorded.matches(kind) {
                 continue;
             }
             for content in messages {
+                if cutoff.is_none_or(|time| content.received_at > time) {
+                    cutoff = Some(content.received_at);
+                }
                 let _ = self.history.append(id, content);
+                restored += 1;
             }
+        }
+        if let Some(cutoff) = cutoff {
+            let noun = if restored == 1 { "message" } else { "messages" };
+            let _ = self.history.append(
+                id,
+                MessageContent::system(format!(
+                    "Restored {restored} {noun} through {}",
+                    crate::persist::format_cutoff(cutoff)
+                )),
+            );
         }
     }
 

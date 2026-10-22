@@ -406,6 +406,14 @@ fn format_rfc3339(time: SystemTime) -> String {
     )
 }
 
+/// The archive's RFC 3339 shape trimmed to whole seconds, for user-facing
+/// cutoff notes (`YYYY-MM-DDTHH:MM:SSZ`).
+pub(crate) fn format_cutoff(time: SystemTime) -> String {
+    let full = format_rfc3339(time);
+    // `format_rfc3339` is fixed-width; seconds occupy the first 19 bytes.
+    format!("{}Z", &full[..19])
+}
+
 /// Convert days since the Unix epoch to a proleptic Gregorian date
 /// (Howard Hinnant's `civil_from_days`).
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
