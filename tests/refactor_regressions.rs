@@ -127,7 +127,7 @@ fn chinese_input_renders_every_character_and_tiny_windows_do_not_panic() {
     for w in 0..35 {
         for h in 0..8 {
             let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
-            let g = render::geometry(w, h, app.input(), app.input_cursor(), true);
+            let g = render::geometry(w, h, app.input(), app.input_cursor(), true, app.hint_rows());
             app.resize(g.messages.width, g.messages.height);
             terminal
                 .draw(|f| render::draw(f, &app, &Chrome { status: "" }))
@@ -149,7 +149,14 @@ fn clipped_composer_keeps_cursor_row_visible_and_mouse_geometry_matches() {
     app.focus_composer();
     app.restore_input("一二三四五六七八九十".into());
     for height in 1..9 {
-        let g = render::geometry(44, height, app.input(), app.input_cursor(), true);
+        let g = render::geometry(
+            44,
+            height,
+            app.input(),
+            app.input_cursor(),
+            true,
+            app.hint_rows(),
+        );
         assert!(g.input.height > 0, "no input row at height {height}");
         let cursor_x = g.input.x + g.input_layout.cursor_column as u16;
         let cursor_y = g.input.y + (g.input_layout.cursor_row - g.first_input_line) as u16;
@@ -180,7 +187,14 @@ fn system_message_renders_inline_like_console_rows() {
         target: BufferKind::Channel("#a".into()),
         content: MessageContent::system("Connected to srv"),
     });
-    let g = render::geometry(80, 24, app.input(), app.input_cursor(), true);
+    let g = render::geometry(
+        80,
+        24,
+        app.input(),
+        app.input_cursor(),
+        true,
+        app.hint_rows(),
+    );
     app.resize(g.messages.width, g.messages.height);
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     terminal

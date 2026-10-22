@@ -1619,3 +1619,149 @@ fn evicted_selection_falls_back_past_system_messages() {
     app.sync_view();
     assert_eq!(app.selected(), None);
 }
+
+/// A viewed channel with the composer focused, drafting `draft`.
+fn hint_app(draft: &str) -> App {
+    let mut app = App::new(40, 10);
+    app.open_channel("srv", "#a");
+    app.select_buffer(0);
+    app.focus_composer();
+    app.restore_input(draft.into());
+    app
+}
+
+/// The command names of the hint bar's current items.
+fn hint_names(app: &App) -> Vec<&str> {
+    app.command_hints()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect()
+}
+
+#[test]
+fn slash_hints_activate_only_for_strict_prefixes_while_composing() {
+    // Arrange: a viewed channel with the composer focused.
+    let mut app = hint_app("/jo");
+    assert_eq!(hint_names(&app), ["join"]);
+
+    // Act/Assert: hidden shapes.
+    for draft in ["/", "/join", "/join #osu", "hello", "  "] {
+        app.restore_input(draft.into());
+        assert!(hint_names(&app).is_empty(), "{draft:?} must hide the bar");
+    }
+
+    // Leading whitespace and case are tolerated before matching.
+    app.restore_input("  /Q".into());
+    assert_eq!(hint_names(&app), ["query", "quit"]);
+
+    // The bar hides whenever the composer lacks focus.
+    app.restore_input("/jo".into());
+    app.tab(); // Composer -> Sidebar
+    assert!(hint_names(&app).is_empty());
+    app.focus_composer();
+    assert_eq!(hint_names(&app), ["join"]);
+
+    // No composer is rendered before a buffer is opened.
+    let mut welcome = App::new(40, 10);
+    welcome.focus_composer();
+    welcome.restore_input("/jo".into());
+    assert!(hint_names(&welcome).is_empty());
+
+    // Hint items pair each name with its table description.
+    let (_, description) = hint_app("/jo").command_hints()[0];
+    assert_eq!(
+        description,
+        crate::command::COMMANDS
+            .iter()
+            .find(|(name, _)| *name == "join")
+            .unwrap()
+            .1
+    );
+}
+
+#[test]
+fn slash_hints_filter_in_table_order_and_cap_at_five_rows() {
+    // Arrange/Assert: matches keep the description table's order.
+    let app = hint_app("/c");
+    assert_eq!(hint_names(&app), ["close", "connect"]);
+
+    // Act/Assert: a list longer than the bar's capacity is truncated after
+    // the first matches in table order.
+    let fabricated = [
+        ("aa0", ""),
+        ("aa1", ""),
+        ("aa2", ""),
+        ("aa3", ""),
+        ("aa4", ""),
+        ("aa5", ""),
+        ("aa6", ""),
+        ("aa7", ""),
+    ];
+    let capped = prefix_matches(&fabricated, "aa", MAX_HINT_ROWS);
+    assert_eq!(
+        capped.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+        ["aa0", "aa1", "aa2", "aa3", "aa4"]
+    );
+}
+
+#[test]
+fn hint_highlight_clamps_without_wrapping_and_resets_when_items_change() {
+    // Arrange: two matching commands.
+    let mut app = hint_app("/c");
+    assert_eq!(app.hint_selected(), 0);
+
+    // Act/Assert: movement clamps at both ends instead of wrapping.
+    app.hint_down();
+    app.hint_down();
+    assert_eq!(app.hint_selected(), 1, "Down must stop at the last row");
+    app.hint_up();
+    assert_eq!(app.hint_selected(), 0);
+    app.hint_up();
+    assert_eq!(app.hint_selected(), 0, "Up must stop at the first row");
+
+    // Any change to the item list resets the highlight to the first row.
+    app.hint_down();
+    assert_eq!(app.hint_selected(), 1);
+    app.restore_input("/con".into());
+    assert_eq!(hint_names(&app), ["connect"]);
+    assert_eq!(
+        app.hint_selected(),
+        0,
+        "a new item list resets the highlight"
+    );
+    app.restore_input("/c".into());
+    assert_eq!(hint_names(&app), ["close", "connect"]);
+    assert_eq!(app.hint_selected(), 0, "widening the list also resets");
+}
+
+#[test]
+fn completing_a_hint_rewrites_the_leading_word_and_cursor() {
+    // Complete the highlighted row (the second one) of `/q`.
+    let mut app = hint_app("/q");
+    app.hint_down();
+    assert_eq!(app.hint_selected(), 1);
+    app.complete_hint();
+    assert_eq!(app.input(), "/quit ");
+    assert_eq!(app.input_cursor(), 6);
+    assert!(
+        !app.is_hint_active(),
+        "the exact name plus a space must hide the bar"
+    );
+
+    // A leading word mid-draft keeps the trailing text and single space.
+    let mut app = hint_app("/jo #osu");
+    app.complete_hint();
+    assert_eq!(app.input(), "/join #osu");
+    assert_eq!(app.input_cursor(), 6);
+
+    // Whitespace before the slash survives untouched.
+    let mut app = hint_app("  /ni");
+    app.complete_hint();
+    assert_eq!(app.input(), "  /nick ");
+    assert_eq!(app.input_cursor(), 8);
+
+    // Completing while hidden is a no-op.
+    let mut app = hint_app("/join ");
+    app.complete_hint();
+    assert_eq!(app.input(), "/join ");
+}

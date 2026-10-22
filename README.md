@@ -114,6 +114,12 @@ channel (sidebar) or sends your line (composer), `PgUp`/`PgDn` scroll the
 messages, and `Esc` quits — the composer's bottom row always repeats the
 essentials. The rest is there to explore.
 
+While you type a `/` command in the composer, matching commands with
+one-line descriptions appear in a hint area above the input; the message
+pane compresses upward while it is visible and restores when it hides.
+`Up`/`Down` move the highlight through the hints and `Tab` completes the
+highlighted command into the input.
+
 The mouse works too: the wheel scrolls the messages, resting the pointer
 on a message pre-highlights it, and a click focuses a pane — clicking a
 channel in the sidebar opens it. While TermIRC runs, hold `Shift` for the

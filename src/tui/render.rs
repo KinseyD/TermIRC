@@ -5,15 +5,18 @@
 //!  sidebar (fixed)  │  main column
 //!  osu_irc           │  (blank separator)          <- framing separator rows
 //!    ▶ #osu         │  alice: hello ...            <- messages (scroll)
-//!      #chinese     │
-//!                    │  ┃                          <- input (4 rows, bg-shaded,
-//!                    │  ┃   (empty input)               accent ┃ on the left)
-//!                    │  ┃  connected · q quit …    <- tips row
+//!      #chinese     │  ────────────────            <- hint bar (only while a
+//!                    │  /join — Join or focus ...      `/` command is drafted;
+//!                    │  ┃                             highlighted row reversed)
+//!                    │  ┃   /join #osu             <- input (4 rows, bg-shaded,
+//!                    │  ┃  connected · q quit …    <- tips row  accent ┃ left)
 //! ```
 //! Before any channel is opened the main column shows only the centered logo -
 //! no composer. Lines are pre-wrapped by `layout`, so the messages `Paragraph`
 //! is rendered without `Wrap`: continuation rows already carry their own
-//! indentation, keeping the message body clear of the nick column.
+//! indentation, keeping the message body clear of the nick column. The hint
+//! bar's rows are reserved by `geometry` out of the message pane, so showing
+//! it compresses the messages upward instead of overlaying them.
 
 use ratatui::{
     Frame,
@@ -106,6 +109,9 @@ pub struct ScreenGeometry {
     pub sidebar: Rect,
     pub separator: Rect,
     pub messages: Rect,
+    /// The inline slash-command hint bar: directly above the composer, its
+    /// rows taken from the message pane (height 0 while hidden).
+    pub hints: Rect,
     pub composer: Rect,
     pub gap: Rect,
     pub input: Rect,
@@ -118,6 +124,7 @@ pub fn geometry(
     input: &str,
     cursor: usize,
     active: bool,
+    hint_rows: u16,
 ) -> ScreenGeometry {
     let sidebar = Rect::new(0, 0, width.min(SIDEBAR_WIDTH), height);
     let separator = Rect::new(
@@ -144,16 +151,24 @@ pub fn geometry(
     } else {
         0
     };
+    let chrome_height = composer_height + gap_height;
+    // The hint bar eats into the message pane, never into the composer, and
+    // keeps at least one message row when the terminal can afford both; a
+    // terminal too short for that hides the bar rather than the messages.
+    let hint_height = hint_rows.min(available_rows(height, chrome_height));
     let messages = inset(
         Rect::new(
             main.x,
             0,
             main.width,
-            height.saturating_sub(composer_height + gap_height),
+            height
+                .saturating_sub(chrome_height)
+                .saturating_sub(hint_height),
         ),
         HORIZONTAL_PAD,
     );
-    let composer = Rect::new(main.x, messages.height, main.width, composer_height);
+    let hints = Rect::new(main.x, messages.bottom(), main.width, hint_height);
+    let composer = Rect::new(main.x, hints.bottom(), main.width, composer_height);
     let gap = Rect::new(main.x, composer.bottom(), main.width, gap_height);
     // Remove decorative rows before sacrificing the cursor's input row.
     let input_padding = u16::from(composer_height > INPUT_FIXED_ROWS);
@@ -179,12 +194,20 @@ pub fn geometry(
         sidebar,
         separator,
         messages,
+        hints,
         composer,
         gap,
         input,
         first_input_line,
         input_layout,
     }
+}
+
+/// Rows the hint bar may take from a message pane that shares `height` with
+/// `chrome_height` rows of composer and gap: all of them minus one kept for
+/// the messages, or none when no message row would survive.
+fn available_rows(height: u16, chrome_height: u16) -> u16 {
+    height.saturating_sub(chrome_height).saturating_sub(1)
 }
 
 /// Render the whole screen: sidebar on the left, main column (messages /
@@ -203,6 +226,7 @@ pub fn draw(frame: &mut Frame, app: &App, chrome: &Chrome<'_>) {
         app.input(),
         app.input_cursor(),
         app.active_buffer().is_some(),
+        app.hint_rows(),
     );
     render_sidebar(frame, g.sidebar, app);
     render_separator(frame, g.separator);
@@ -213,6 +237,7 @@ pub fn draw(frame: &mut Frame, app: &App, chrome: &Chrome<'_>) {
     frame.render_widget(Paragraph::new(build_text(app)), g.messages);
     render_pre_selection(frame, g.messages, app);
     render_selection(frame, g.messages, app);
+    render_hints(frame, g.hints, app);
     let input_lines = build_wrapped_input_lines(
         &g.input_layout,
         app.input_cursor(),
@@ -229,6 +254,47 @@ pub fn draw(frame: &mut Frame, app: &App, chrome: &Chrome<'_>) {
     render_gap(frame, g.gap, frame.area().width, app);
 }
 
+/// Render the inline slash-command hint bar between the message pane and the
+/// composer: a thin rule in the sidebar divider color, then one row per
+/// matching command (`/name — description`) with the highlighted row in bold
+/// reverse video and the others dimming their descriptions. The rows come
+/// from `geometry`, which reserves them out of the message pane.
+fn render_hints(frame: &mut Frame, area: Rect, app: &App) {
+    if area.is_empty() {
+        return;
+    }
+    let rule: String = "─".repeat(usize::from(area.width));
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(rule, Style::new().fg(SEPARATOR)))),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    let selected = app.hint_selected();
+    let rows: Vec<Line<'static>> = app
+        .command_hints()
+        .into_iter()
+        .enumerate()
+        .map(|(index, (name, description))| {
+            if index == selected {
+                Line::from(Span::styled(
+                    format!("/{name} — {description}"),
+                    Style::new().add_modifier(Modifier::BOLD | Modifier::REVERSED),
+                ))
+            } else {
+                Line::from(vec![
+                    Span::raw(format!("/{name}")),
+                    Span::styled(format!(" — {description}"), DIM_STYLE),
+                ])
+            }
+        })
+        .collect();
+    frame.render_widget(
+        Paragraph::new(Text::from(rows)),
+        inset(
+            Rect::new(area.x, area.y + 1, area.width, area.height - 1),
+            HORIZONTAL_PAD,
+        ),
+    );
+}
 /// Render the thin gray vertical line that separates the sidebar from the main
 /// column, spanning the full height (left edge of the separator-gap segment).
 fn render_separator(frame: &mut Frame, area: Rect) {
@@ -1744,5 +1810,158 @@ mod tests {
         app.set_hover_sidebar(Some(1));
         let buffer = render_sized(&app, "", 50, 10);
         assert_eq!(buffer.cell((10, 1)).unwrap().bg, SIDEBAR_ACTIVE_BG);
+    }
+
+    /// Screen row of the first line containing `needle`, if any.
+    fn row_containing(buffer: &Buffer, needle: &str) -> Option<u16> {
+        (0..buffer.area.height).find(|&y| buffer_line(buffer, y).contains(needle))
+    }
+
+    /// Fit the app like the event loop does (viewport sized to the current
+    /// geometry, including hint rows), then render.
+    fn render_fitted(app: &mut App, w: u16, h: u16) -> Buffer {
+        let g = geometry(
+            w,
+            h,
+            app.input(),
+            app.input_cursor(),
+            app.active_buffer().is_some(),
+            app.hint_rows(),
+        );
+        app.set_sidebar_height(g.sidebar.height);
+        if app.size() != (g.messages.width, g.messages.height) {
+            app.resize(g.messages.width, g.messages.height);
+        }
+        render_sized(app, "", w, h)
+    }
+
+    /// A viewed #osu channel with the composer focused, sitting at the
+    /// bottom of a 12-message history.
+    fn hint_scroll_app() -> App {
+        let mut app = App::new(40, 8);
+        app.open_channel("osu_irc", "#osu");
+        app.select_buffer(0);
+        app.focus_composer();
+        for index in 0..12 {
+            app.push_message(msg("alice", &format!("line{index}")));
+        }
+        app
+    }
+
+    #[test]
+    fn hint_rows_come_out_of_the_message_pane_and_shift_content_up() {
+        // Arrange: a long, bottom-anchored history with no draft.
+        let mut app = hint_scroll_app();
+        app.restore_input(String::new());
+        let plain = render_fitted(&mut app, 60, 14);
+        let plain_row = row_containing(&plain, "line9").unwrap();
+
+        // Act: drafting `/j` shows one hint row under its separator rule.
+        app.restore_input("/j".into());
+        let hinted = render_fitted(&mut app, 60, 14);
+
+        // Assert: the pane shrinks by exactly the hint block's two rows,
+        // the block sits directly above the composer, and the bottom-
+        // anchored content moves up by the same two rows.
+        let plain_g = geometry(60, 14, "", 0, true, 0);
+        let hinted_g = geometry(60, 14, "/j", 2, true, 2);
+        assert_eq!(hinted_g.hints.height, 2);
+        assert_eq!(
+            plain_g.messages.height - hinted_g.messages.height,
+            hinted_g.hints.height
+        );
+        assert_eq!(hinted_g.hints.bottom(), hinted_g.composer.y);
+        assert_eq!(
+            row_containing(&hinted, "line9").unwrap(),
+            plain_row - hinted_g.hints.height
+        );
+
+        // The rule and the described command render inside the block.
+        let rule_row = hinted_g.hints.y;
+        assert!(buffer_line(&hinted, rule_row).contains('─'));
+        let hint_row = row_containing(&hinted, "/join").unwrap();
+        assert_eq!(hint_row, rule_row + 1);
+        assert!(buffer_line(&hinted, hint_row).contains("Join or focus"));
+    }
+
+    #[test]
+    fn hiding_the_hint_bar_restores_the_message_pane() {
+        // Arrange: the hint bar is visible and the pane is compressed.
+        let mut app = hint_scroll_app();
+        app.restore_input("/j".into());
+        let hinted = render_fitted(&mut app, 60, 14);
+        assert!(row_containing(&hinted, "/join").is_some());
+
+        // Act: clearing the draft hides the bar.
+        app.restore_input(String::new());
+        let plain = render_fitted(&mut app, 60, 14);
+
+        // Assert: no hint text remains and the pane grew back.
+        assert!(row_containing(&plain, "/join").is_none());
+        let plain_g = geometry(60, 14, "", 0, true, 0);
+        assert_eq!(plain_g.messages.height, 8);
+        assert_eq!(plain_g.hints.height, 0);
+        assert!(app.is_at_bottom());
+    }
+
+    #[test]
+    fn highlighted_hint_row_renders_bold_reversed_with_descriptions() {
+        // Arrange: two hints with the second row highlighted.
+        let mut app = hint_scroll_app();
+        app.restore_input("/c".into());
+        app.hint_down();
+        let buffer = render_fitted(&mut app, 60, 14);
+        let close_row = row_containing(&buffer, "/close").unwrap();
+        let connect_row = row_containing(&buffer, "/connect").unwrap();
+
+        // Assert: both rows show their descriptions; only the highlighted
+        // row carries the bold reverse-video highlight.
+        assert!(buffer_line(&buffer, close_row).contains("Hide the current"));
+        assert!(
+            buffer_line(&buffer, connect_row).contains("Connect a stopped"),
+            "connect description missing"
+        );
+        let close_cell = buffer.cell((MAIN_COL_X, close_row)).unwrap();
+        assert!(
+            !close_cell
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED),
+            "unhighlighted row must stay plain"
+        );
+        let connect_cell = buffer.cell((MAIN_COL_X, connect_row)).unwrap();
+        assert!(
+            connect_cell
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+        assert!(
+            connect_cell
+                .modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn tiny_terminals_clamp_the_hint_bar_without_panicking() {
+        // Arrange: a draft whose hint block wants three rows.
+        let mut app = hint_scroll_app();
+        app.restore_input("/c".into());
+        for h in 0..12u16 {
+            for w in [24u16, 50] {
+                // Act: fit and draw (panics surface here).
+                let g = geometry(w, h, app.input(), app.input_cursor(), true, app.hint_rows());
+                app.set_sidebar_height(g.sidebar.height);
+                app.resize(g.messages.width, g.messages.height);
+                render_sized(&app, "", w, h);
+
+                // Assert: composer plus gap plus hints plus messages never
+                // exceed the terminal, and one message row survives while
+                // any hint row does.
+                assert!(g.messages.bottom() <= h);
+                if g.hints.height > 0 {
+                    assert!(g.messages.height >= 1, "h={h} w={w}");
+                }
+            }
+        }
     }
 }
