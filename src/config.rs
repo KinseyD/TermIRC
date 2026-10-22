@@ -8,6 +8,7 @@ use indexmap::IndexMap;
 use serde::Deserialize;
 
 use crate::core::{ServerId, valid_channel_name, valid_query_nickname};
+use crate::theme::ThemeTable;
 
 /// Per-server connection settings, as written in the `[servers.<name>]` tables.
 #[derive(Clone, Deserialize)]
@@ -137,12 +138,18 @@ pub struct Config {
     pub servers: IndexMap<String, ServerConfig>,
     #[serde(default)]
     pub history: HistoryConfig,
+    /// Optional color-theme overrides: role names mapped to colors.
+    #[serde(default)]
+    pub theme: ThemeTable,
 }
 
 impl Config {
     /// Parse configuration from a TOML string.
     pub fn parse(content: &str) -> anyhow::Result<Config> {
         let config: Config = toml::from_str(content)?;
+        // Reject bad theme roles/colors here, at load time, so the errors are
+        // machine-readable configuration errors rather than runtime surprises.
+        config.theme.build()?;
         let mut names = HashMap::new();
         for name in config.servers.keys() {
             if let Some(previous) = names.insert(ServerId::new(name), name) {
@@ -477,11 +484,74 @@ channels = []
     }
 
     #[test]
+    fn theme_table_is_absent_by_default() {
+        // Arrange
+        let content = server_toml("");
+
+        // Act
+        let config = Config::parse(&content).unwrap();
+
+        // Assert
+        assert!(config.theme.roles.is_empty());
+        assert_eq!(
+            config.theme.build().unwrap(),
+            crate::theme::Theme::default()
+        );
+    }
+
+    #[test]
+    fn theme_table_parses_ansi_256_and_rgb_colors() {
+        // Arrange
+        let content =
+            server_toml("\n[theme]\nnick = 'bright-cyan'\nstatus_ok = 40\nglobal_bg = '#0a0a0a'\n");
+
+        // Act
+        let config = Config::parse(&content).unwrap();
+        let theme = config.theme.build().unwrap();
+
+        // Assert: configured roles take the configured colors...
+        use ratatui::style::Color;
+        assert_eq!(theme.nick, Color::LightCyan);
+        assert_eq!(theme.status_ok, Color::Indexed(40));
+        assert_eq!(theme.global_bg, Color::Rgb(0x0a, 0x0a, 0x0a));
+        // ...and unconfigured roles keep the default preset.
+        assert_eq!(theme.hover_bg, crate::theme::Theme::default().hover_bg);
+    }
+
+    #[test]
+    fn theme_table_rejects_unknown_roles_with_machine_readable_reason() {
+        // Arrange
+        let content = server_toml("\n[theme]\nsidebar_read = 'red'\n");
+
+        // Act
+        let error = Config::parse(&content).unwrap_err().to_string();
+
+        // Assert
+        assert!(
+            error.contains("unknown_theme_role: sidebar_read"),
+            "reason: {error}"
+        );
+    }
+
+    #[test]
+    fn theme_table_rejects_invalid_colors_with_machine_readable_reason() {
+        // Arrange
+        let content = server_toml("\n[theme]\naccent = 'not-a-color'\n");
+
+        // Act
+        let error = Config::parse(&content).unwrap_err().to_string();
+
+        // Assert
+        assert!(
+            error.contains("invalid_theme_color: accent"),
+            "reason: {error}"
+        );
+    }
+
+    #[test]
     fn parse_errors_on_invalid_toml() {
         // Arrange
         let content = "this is [ not toml";
-
-        // Act
         let result = Config::parse(content);
 
         // Assert

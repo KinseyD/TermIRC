@@ -158,6 +158,7 @@ fn connected_app(transport: &mut MockSession) -> (App, Wired) {
             config: Config {
                 servers: Default::default(),
                 history: Default::default(),
+                theme: Default::default(),
             },
             console,
             channel,

@@ -23,11 +23,15 @@ pub fn run(
     fit_app(&mut app, term_size);
     let mut status = String::new();
     let started = std::time::Instant::now();
+    let theme = config.theme.build()?;
 
     while app.is_running() {
         fit_app(&mut app, term_size);
         app.tick(started.elapsed());
-        let chrome = ui::Chrome { status: &status };
+        let chrome = ui::Chrome {
+            status: &status,
+            theme: &theme,
+        };
         terminal.draw(|frame| ui::draw(frame, &app, &chrome))?;
 
         if event::poll(POLL_INTERVAL)? {
@@ -346,6 +350,7 @@ mod tests {
         let config = crate::config::Config {
             servers: Default::default(),
             history: Default::default(),
+            theme: Default::default(),
         };
         let outgoing = std::collections::HashMap::new();
         handle_key_press(app, code, false, &config, &outgoing, &mut String::new())

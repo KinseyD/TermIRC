@@ -299,6 +299,7 @@ fn query_ui_commands_and_worker_preserve_conversation_across_reconnect() {
     let config = Config {
         servers: Default::default(),
         history: Default::default(),
+        theme: Default::default(),
     };
     let handle = transport.handle.as_ref().unwrap();
     let handles = std::collections::HashMap::from([(

@@ -96,6 +96,28 @@ are rejected when loading the config. Channel keys/passwords and multi-target
 entries are unsupported. Runtime JOIN/PART changes stay in memory, never rewrite
 the config, and disappear when the application exits.
 
+An optional `[theme]` table recolors the interface. Each key is a color role
+and each value is a named ANSI-16 color (`"red"`, `"bright-black"`, ...), a
+256-color index (`0-255`), or an `"#rrggbb"` hex string. Unlisted roles keep
+their defaults, so an empty `[theme]` table renders exactly like the built-in
+dark theme; unknown role names and malformed colors are rejected at startup.
+The most useful roles:
+
+| Role                | Default     | Colors                          |
+|---------------------|-------------|---------------------------------|
+| `global_bg`         | `#0a0a0a`   | screen background               |
+| `input_bg`          | `#1e1e1e`   | composer panel background       |
+| `accent`            | `#9ad99a`   | composer/selection `┃` accent   |
+| `separator`         | `#555555`   | sidebar/main `│` divider        |
+| `sidebar_active_bg` | `#2e2e2e`   | active channel row background   |
+| `message_select_bg` | `#242424`   | selected message highlight      |
+| `nick`              | `cyan`      | message author prefix           |
+| `status_ok`         | `green`     | connected server dot            |
+
+The remaining roles (`dim`, `accent_dim`, `hover_bg`, `sidebar_cursor_bg`,
+`input_cursor_fg`, `input_cursor_bg`, `status_err`, `status_pending`) follow
+the same rules; see the commented example in `config.example.toml`.
+
 Security notes:
 
 - The file holds a credential — on Unix, `chmod 600` it.

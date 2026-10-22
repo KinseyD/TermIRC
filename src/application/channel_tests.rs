@@ -39,6 +39,7 @@ fn submit(
         &Config {
             servers: Default::default(),
             history: Default::default(),
+            theme: Default::default(),
         },
         connections,
         &mut String::new(),

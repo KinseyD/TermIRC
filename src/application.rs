@@ -1245,6 +1245,7 @@ mod tests {
                     &Config {
                         servers: Default::default(),
                         history: Default::default(),
+                        theme: Default::default(),
                     },
                     &connections,
                     &mut status,
@@ -1285,6 +1286,7 @@ mod tests {
                 &Config {
                     servers: Default::default(),
                     history: Default::default(),
+                    theme: Default::default(),
                 },
                 &Default::default(),
                 &mut status,
@@ -1326,6 +1328,7 @@ mod tests {
             &Config {
                 servers: Default::default(),
                 history: Default::default(),
+                theme: Default::default(),
             },
             &connections,
             &mut String::new(),
@@ -1368,6 +1371,7 @@ mod tests {
                 &Config {
                     servers: Default::default(),
                     history: Default::default(),
+                    theme: Default::default(),
                 },
                 &connections,
                 &mut String::new(),
@@ -1409,6 +1413,7 @@ mod tests {
             let config = Config {
                 servers: Default::default(),
                 history: Default::default(),
+                theme: Default::default(),
             };
             app.restore_input(input.into());
             submit_composer(&mut app, &config, &connections, &mut String::new());
@@ -1505,6 +1510,7 @@ mod tests {
                 let config = Config {
                     servers: Default::default(),
                     history: Default::default(),
+                    theme: Default::default(),
                 };
                 let (tx, mut rx) = tokio::sync::mpsc::channel(8);
                 let outgoing = std::collections::HashMap::from([(
@@ -1591,6 +1597,7 @@ mod tests {
                 let config = Config {
                     servers: Default::default(),
                     history: Default::default(),
+                    theme: Default::default(),
                 };
                 let (tx, mut rx) = tokio::sync::mpsc::channel(8);
                 let mut outgoing = std::collections::HashMap::new();
@@ -1674,6 +1681,7 @@ mod tests {
         Config {
             servers: Default::default(),
             history: Default::default(),
+            theme: Default::default(),
         }
     }
 

@@ -26,9 +26,8 @@ use ratatui::{
     widgets::Paragraph,
 };
 
+use crate::theme::Theme;
 use crate::tui::{App, Focus};
-
-const NICK_STYLE: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
 
 /// Fixed width of the left server/channel sidebar, in columns.
 pub const SIDEBAR_WIDTH: u16 = 22;
@@ -54,44 +53,27 @@ pub const INPUT_RIGHT_GAP: u16 = 3;
 /// (INPUT_LEFT_PAD + INPUT_RIGHT_PAD, given how the panel is positioned).
 pub const INPUT_TEXT_INSET: u16 = INPUT_LEFT_PAD + INPUT_RIGHT_PAD;
 
-/// Global background color for the whole screen.
-const GLOBAL_BG: Color = Color::Rgb(0x0a, 0x0a, 0x0a);
-/// Background color distinguishing the composer region.
-const INPUT_BG: Color = Color::Rgb(0x1e, 0x1e, 0x1e);
-/// Color of the thin vertical line separating the sidebar from the main column.
-const SEPARATOR: Color = Color::Rgb(0x55, 0x55, 0x55);
-/// Color of the composer's left accent `┃` (pale green), drawn on the global
-/// background (no composer-panel background behind it).
-const INPUT_LINE: Color = Color::Rgb(0x9a, 0xd9, 0x9a);
-/// The composer accent when the composer does not have focus (dimmed).
-const INPUT_LINE_DIM: Color = Color::Rgb(0x4a, 0x6a, 0x4a);
-/// Background of the sidebar row under the cursor.
-const SIDEBAR_CURSOR_BG: Color = Color::Rgb(0x20, 0x20, 0x20);
-/// Background of the sidebar's active channel row.
-const SIDEBAR_ACTIVE_BG: Color = Color::Rgb(0x2e, 0x2e, 0x2e);
-/// Background highlight of the selected message in the message pane.
-const MESSAGE_SELECT_BG: Color = Color::Rgb(0x24, 0x24, 0x24);
-/// Background of the hovered (pre-selected) message or sidebar row: dimmer
-/// than every formal style (`MESSAGE_SELECT_BG`, `SIDEBAR_CURSOR_BG`).
-const HOVER_BG: Color = Color::Rgb(0x1a, 0x1a, 0x1a);
-const DIM_STYLE: Style = Style::new().fg(Color::Rgb(0x70, 0x70, 0x70));
-
 /// Render-only chrome state: everything the renderer needs beyond the App.
 pub struct Chrome<'a> {
     pub status: &'a str,
+    /// The color palette for this render pass.
+    pub theme: &'a crate::theme::Theme,
 }
 
 /// Convert the app's laid-out rows into ratatui `Text`.
 ///
 /// Owns only the visible rows, so per-frame text allocations depend on the
 /// viewport size rather than the amount of scrollback.
-pub fn build_text(app: &App) -> Text<'static> {
+pub fn build_text(app: &App, theme: &Theme) -> Text<'static> {
     Text::from(
         app.visible_lines()
             .into_iter()
             .map(|row| match row.nick {
                 Some(nick) => Line::from(vec![
-                    Span::styled(format!("{nick}: "), NICK_STYLE),
+                    Span::styled(
+                        format!("{nick}: "),
+                        Style::new().fg(theme.nick).add_modifier(Modifier::BOLD),
+                    ),
                     Span::raw(row.body),
                 ]),
                 None if row.body.is_empty() => Line::from(""),
@@ -214,9 +196,10 @@ fn available_rows(height: u16, chrome_height: u16) -> u16 {
 /// composer) on the right. There is no title row - the message stream frames
 /// itself with separator rows above the first and below the last message.
 pub fn draw(frame: &mut Frame, app: &App, chrome: &Chrome<'_>) {
+    let theme = chrome.theme;
     // Fill the screen with the global background.
     frame.render_widget(
-        Paragraph::new("").style(Style::new().bg(GLOBAL_BG)),
+        Paragraph::new("").style(Style::new().bg(theme.global_bg)),
         frame.area(),
     );
 
@@ -228,20 +211,21 @@ pub fn draw(frame: &mut Frame, app: &App, chrome: &Chrome<'_>) {
         app.active_buffer().is_some(),
         app.hint_rows(),
     );
-    render_sidebar(frame, g.sidebar, app);
-    render_separator(frame, g.separator);
+    render_sidebar(frame, g.sidebar, app, theme);
+    render_separator(frame, g.separator, theme);
     if app.active_buffer().is_none() {
-        render_welcome(frame, g.messages);
+        render_welcome(frame, g.messages, theme);
         return;
     }
-    frame.render_widget(Paragraph::new(build_text(app)), g.messages);
-    render_pre_selection(frame, g.messages, app);
-    render_selection(frame, g.messages, app);
-    render_hints(frame, g.hints, app);
+    frame.render_widget(Paragraph::new(build_text(app, theme)), g.messages);
+    render_pre_selection(frame, g.messages, app, theme);
+    render_selection(frame, g.messages, app, theme);
+    render_hints(frame, g.hints, app, theme);
     let input_lines = build_wrapped_input_lines(
         &g.input_layout,
         app.input_cursor(),
         app.focus() == Focus::Composer,
+        theme,
     );
     render_composer(
         frame,
@@ -250,8 +234,9 @@ pub fn draw(frame: &mut Frame, app: &App, chrome: &Chrome<'_>) {
         input_lines,
         chrome.status,
         app,
+        theme,
     );
-    render_gap(frame, g.gap, frame.area().width, app);
+    render_gap(frame, g.gap, frame.area().width, app, theme);
 }
 
 /// Render the inline slash-command hint bar between the message pane and the
@@ -259,13 +244,16 @@ pub fn draw(frame: &mut Frame, app: &App, chrome: &Chrome<'_>) {
 /// matching command (`/name — description`) with the highlighted row in bold
 /// reverse video and the others dimming their descriptions. The rows come
 /// from `geometry`, which reserves them out of the message pane.
-fn render_hints(frame: &mut Frame, area: Rect, app: &App) {
+fn render_hints(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     if area.is_empty() {
         return;
     }
     let rule: String = "─".repeat(usize::from(area.width));
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(rule, Style::new().fg(SEPARATOR)))),
+        Paragraph::new(Line::from(Span::styled(
+            rule,
+            Style::new().fg(theme.separator),
+        ))),
         Rect::new(area.x, area.y, area.width, 1),
     );
     let selected = app.hint_selected();
@@ -282,7 +270,7 @@ fn render_hints(frame: &mut Frame, area: Rect, app: &App) {
             } else {
                 Line::from(vec![
                     Span::raw(format!("/{name}")),
-                    Span::styled(format!(" — {description}"), DIM_STYLE),
+                    Span::styled(format!(" — {description}"), Style::new().fg(theme.dim)),
                 ])
             }
         })
@@ -297,9 +285,9 @@ fn render_hints(frame: &mut Frame, area: Rect, app: &App) {
 }
 /// Render the thin gray vertical line that separates the sidebar from the main
 /// column, spanning the full height (left edge of the separator-gap segment).
-fn render_separator(frame: &mut Frame, area: Rect) {
+fn render_separator(frame: &mut Frame, area: Rect, theme: &Theme) {
     let col = Rect::new(area.x, area.y, area.width.min(1), area.height);
-    let line = Line::from(Span::styled("│", Style::new().fg(SEPARATOR)));
+    let line = Line::from(Span::styled("│", Style::new().fg(theme.separator)));
     let lines = vec![line; usize::from(area.height)];
     frame.render_widget(Paragraph::new(Text::from(lines)), col);
 }
@@ -309,7 +297,7 @@ fn render_separator(frame: &mut Frame, area: Rect) {
 /// viewed channel, or the server header while its console is viewed) with
 /// a brighter background, and (while the sidebar has focus) a cursor row
 /// with a slightly brighter background plus a block cursor at its start.
-fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
+fn render_sidebar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let inner = inset(area, 1);
     if inner.width == 0 || inner.height == 0 {
         return;
@@ -339,11 +327,11 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
         // is slightly brighter than the plain background; a hovered row is
         // dimmer than both.
         let bg = if is_active {
-            SIDEBAR_ACTIVE_BG
+            theme.sidebar_active_bg
         } else if is_cursor {
-            SIDEBAR_CURSOR_BG
+            theme.sidebar_cursor_bg
         } else if is_hovered {
-            HOVER_BG
+            theme.hover_bg
         } else {
             Color::Reset
         };
@@ -355,15 +343,15 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
         // Row text: a leading space reserves room for the block cursor.
         let state = app.connection_state(&row.server, row.kind.channel());
         let (symbol, color) = match state {
-            crate::connection::ConnectionState::Connected => ("● ", Color::Green),
-            crate::connection::ConnectionState::Stopped => ("● ", Color::Red),
+            crate::connection::ConnectionState::Connected => ("● ", theme.status_ok),
+            crate::connection::ConnectionState::Stopped => ("● ", theme.status_err),
             crate::connection::ConnectionState::Connecting => (
                 if app.connecting_dot_visible() {
                     "● "
                 } else {
                     "  "
                 },
-                Color::Gray,
+                theme.status_pending,
             ),
         };
         let dot = Span::styled(symbol, Style::new().fg(color));
@@ -380,7 +368,7 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
                 Span::raw(" "),
                 Span::raw("  "),
                 dot,
-                Span::styled(channel.as_str(), DIM_STYLE),
+                Span::styled(channel.as_str(), Style::new().fg(theme.dim)),
             ]),
             crate::core::BufferKind::Query(nickname) => {
                 let unread = row
@@ -391,7 +379,7 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
                     Span::raw("   "),
                     Span::styled(
                         format!("@{nickname}{}", if unread { "*" } else { "" }),
-                        DIM_STYLE,
+                        Style::new().fg(theme.dim),
                     ),
                 ])
             }
@@ -400,9 +388,11 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
 
         // Block cursor at the start of the focused row.
         if is_cursor {
-            frame.buffer_mut()[(inner.x, y)]
-                .set_symbol(" ")
-                .set_style(Style::new().fg(INPUT_BG).bg(Color::White));
+            frame.buffer_mut()[(inner.x, y)].set_symbol(" ").set_style(
+                Style::new()
+                    .fg(theme.input_cursor_fg)
+                    .bg(theme.input_cursor_bg),
+            );
         }
     }
 }
@@ -436,6 +426,7 @@ fn build_wrapped_input_lines(
     layout: &super::input::InputLayout,
     cursor: usize,
     show_cursor: bool,
+    theme: &Theme,
 ) -> Vec<Line<'static>> {
     layout
         .lines
@@ -455,14 +446,19 @@ fn build_wrapped_input_lines(
             let after: String = chars.iter().skip(local + 1).collect();
             Line::from(vec![
                 Span::raw(before),
-                Span::styled(at, Style::new().fg(INPUT_BG).bg(Color::White)),
+                Span::styled(
+                    at,
+                    Style::new()
+                        .fg(theme.input_cursor_fg)
+                        .bg(theme.input_cursor_bg),
+                ),
                 Span::raw(after),
             ])
         })
         .collect()
 }
 
-/// Render the composer: an INPUT_BG panel with a pale-green `┃` accent on its
+/// Render the composer: an `input_bg` panel with a pale-green `┃` accent on its
 /// left (standing on the global background), the wrapped input lines with a
 /// reverse-video cursor, and a tips row. Rows: blank / text×N / blank / tips.
 /// When the composer is not focused the accent dims and no cursor is shown.
@@ -473,6 +469,7 @@ fn render_composer(
     input_lines: Vec<Line<'static>>,
     status: &str,
     app: &App,
+    theme: &Theme,
 ) {
     let area = g.composer;
     if area.is_empty() {
@@ -485,15 +482,15 @@ fn render_composer(
     // Panel background (starts right of the ┃, so the ┃ sits on the global bg).
     frame.buffer_mut().set_style(
         Rect::new(panel_left, area.y, panel_w, area.height),
-        Style::new().bg(INPUT_BG),
+        Style::new().bg(theme.input_bg),
     );
 
     // ┃ accent at the composer's left edge, spanning all its rows. Dimmed
     // while another region holds the focus.
     let accent_color = if app.focus() == Focus::Composer {
-        INPUT_LINE
+        theme.accent
     } else {
-        INPUT_LINE_DIM
+        theme.accent_dim
     };
     let accent = Span::styled("┃", Style::new().fg(accent_color));
     let accent_lines: Vec<Line<'static>> = (0..area.height)
@@ -531,13 +528,13 @@ fn render_composer(
 /// separator row: the formal selection's color, the hover's, or the
 /// global background. Order-independent: derived from app state, not
 /// from which renderer painted last.
-fn message_block_color(app: &App, idx: usize) -> Color {
+fn message_block_color(app: &App, idx: usize, theme: &Theme) -> Color {
     if app.focus() == Focus::Messages && app.selected() == Some(idx) {
-        MESSAGE_SELECT_BG
+        theme.message_select_bg
     } else if app.hovered() == Some(idx) {
-        HOVER_BG
+        theme.hover_bg
     } else {
-        GLOBAL_BG
+        theme.global_bg
     }
 }
 
@@ -547,7 +544,7 @@ fn message_block_color(app: &App, idx: usize) -> Color {
 /// an upper-half cap (`▀`) on the one below, all in the dimmer hover
 /// color. Rendered before `render_selection`, so the formal styling wins
 /// wherever both point at the same message.
-fn render_pre_selection(frame: &mut Frame, msg_rect: Rect, app: &App) {
+fn render_pre_selection(frame: &mut Frame, msg_rect: Rect, app: &App, theme: &Theme) {
     if msg_rect.is_empty() {
         return;
     }
@@ -582,7 +579,7 @@ fn render_pre_selection(frame: &mut Frame, msg_rect: Rect, app: &App) {
             block_w,
             (bottom - top + 1) as u16,
         ),
-        Style::new().bg(HOVER_BG),
+        Style::new().bg(theme.hover_bg),
     );
 
     // 2. Half-block caps on the separator rows (▄ above, ▀ below): the
@@ -592,26 +589,26 @@ fn render_pre_selection(frame: &mut Frame, msg_rect: Rect, app: &App) {
     if first > 0 {
         let above = idx
             .checked_sub(1)
-            .map_or(GLOBAL_BG, |a| message_block_color(app, a));
+            .map_or(theme.global_bg, |a| message_block_color(app, a, theme));
         fill_half_block_row(
             buf,
             block_x,
             msg_rect.y + (first - 1) as u16,
             block_w,
             "▄",
-            HOVER_BG,
+            theme.hover_bg,
             above,
         );
     }
     if last + 1 < vh {
-        let below = message_block_color(app, idx + 1);
+        let below = message_block_color(app, idx + 1, theme);
         fill_half_block_row(
             buf,
             block_x,
             msg_rect.y + (last + 1) as u16,
             block_w,
             "▀",
-            HOVER_BG,
+            theme.hover_bg,
             below,
         );
     }
@@ -629,7 +626,7 @@ fn render_pre_selection(frame: &mut Frame, msg_rect: Rect, app: &App) {
 /// with a lower-half stroke (`╻`) and ending with an upper-half stroke (`╹`).
 /// The highlight starts flush against the accent so no global-bg gap shows;
 /// rows scrolled out of the pane are simply clipped.
-fn render_selection(frame: &mut Frame, msg_rect: Rect, app: &App) {
+fn render_selection(frame: &mut Frame, msg_rect: Rect, app: &App, theme: &Theme) {
     if msg_rect.is_empty() {
         return;
     }
@@ -665,7 +662,7 @@ fn render_selection(frame: &mut Frame, msg_rect: Rect, app: &App) {
             block_w,
             (bottom - top + 1) as u16,
         ),
-        Style::new().bg(MESSAGE_SELECT_BG),
+        Style::new().bg(theme.message_select_bg),
     );
 
     // 2. Half-block separator rows (clipped to the pane): ▄ above, ▀
@@ -676,26 +673,26 @@ fn render_selection(frame: &mut Frame, msg_rect: Rect, app: &App) {
     if first > 0 {
         let above = idx
             .checked_sub(1)
-            .map_or(GLOBAL_BG, |a| message_block_color(app, a));
+            .map_or(theme.global_bg, |a| message_block_color(app, a, theme));
         fill_half_block_row(
             buf,
             block_x,
             msg_rect.y + (first - 1) as u16,
             block_w,
             "▄",
-            MESSAGE_SELECT_BG,
+            theme.message_select_bg,
             above,
         );
     }
     if last + 1 < vh {
-        let below = message_block_color(app, idx + 1);
+        let below = message_block_color(app, idx + 1, theme);
         fill_half_block_row(
             buf,
             block_x,
             msg_rect.y + (last + 1) as u16,
             block_w,
             "▀",
-            MESSAGE_SELECT_BG,
+            theme.message_select_bg,
             below,
         );
     }
@@ -718,7 +715,7 @@ fn render_selection(frame: &mut Frame, msg_rect: Rect, app: &App) {
         };
         buf[(COMPOSER_ACCENT_X, msg_rect.y + row as u16)]
             .set_symbol(symbol)
-            .set_style(Style::new().fg(INPUT_LINE));
+            .set_style(Style::new().fg(theme.accent));
     }
 }
 
@@ -736,7 +733,7 @@ const WELCOME_LOGO: [&str; 6] = [
 /// Render the welcome page shown before any channel is opened: the logo
 /// centered in the pane, in the composer-accent color. The composer is not
 /// shown on this page - the logo gets the whole main column.
-fn render_welcome(frame: &mut Frame, area: Rect) {
+fn render_welcome(frame: &mut Frame, area: Rect, theme: &Theme) {
     let logo_w = WELCOME_LOGO
         .iter()
         .map(|row| row.chars().count())
@@ -745,7 +742,7 @@ fn render_welcome(frame: &mut Frame, area: Rect) {
     let logo_h = WELCOME_LOGO.len() as u16;
     let top = area.y + area.height.saturating_sub(logo_h) / 2;
     let left = area.x + area.width.saturating_sub(logo_w) / 2;
-    let style = Style::new().fg(INPUT_LINE).add_modifier(Modifier::BOLD);
+    let style = Style::new().fg(theme.accent).add_modifier(Modifier::BOLD);
     let art: Vec<Line<'_>> = WELCOME_LOGO
         .iter()
         .map(|row| Line::from(Span::styled(*row, style)))
@@ -776,7 +773,7 @@ fn fill_half_block_row(
 
 /// Render the gap below the composer: the `┃` accent tapers into a `╹` and the
 /// composer panel fades out via `▀` across its width.
-fn render_gap(frame: &mut Frame, area: Rect, screen_w: u16, app: &App) {
+fn render_gap(frame: &mut Frame, area: Rect, screen_w: u16, app: &App, theme: &Theme) {
     if area.is_empty() {
         return;
     }
@@ -785,15 +782,18 @@ fn render_gap(frame: &mut Frame, area: Rect, screen_w: u16, app: &App) {
         .saturating_sub(INPUT_RIGHT_GAP)
         .saturating_sub(panel_left);
     let taper_color = if app.focus() == Focus::Composer {
-        INPUT_LINE
+        theme.accent
     } else {
-        INPUT_LINE_DIM
+        theme.accent_dim
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled("╹", Style::new().fg(taper_color)))),
         Rect::new(COMPOSER_ACCENT_X, area.y, 1, 1),
     );
-    let fade = Span::styled("▀".repeat(panel_w as usize), Style::new().fg(INPUT_BG));
+    let fade = Span::styled(
+        "▀".repeat(panel_w as usize),
+        Style::new().fg(theme.input_bg),
+    );
     frame.render_widget(
         Paragraph::new(Line::from(fade)),
         Rect::new(panel_left, area.y, panel_w, 1),
@@ -814,6 +814,11 @@ fn inset(area: Rect, pad: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::Theme;
+
+    fn theme() -> Theme {
+        Theme::default()
+    }
 
     #[test]
     fn queries_render_nick_without_connection_dot_or_header_highlight() {
@@ -825,8 +830,8 @@ mod tests {
         let buffer = render_sized(&app, "", 70, 16);
         assert!(buffer_line(&buffer, 1).contains("@alice"));
         assert!(!buffer_line(&buffer, 1).contains('●'));
-        assert_eq!(buffer.cell((10, 1)).unwrap().bg, SIDEBAR_ACTIVE_BG);
-        assert_ne!(buffer.cell((10, 0)).unwrap().bg, SIDEBAR_ACTIVE_BG);
+        assert_eq!(buffer.cell((10, 1)).unwrap().bg, theme().sidebar_active_bg);
+        assert_ne!(buffer.cell((10, 0)).unwrap().bg, theme().sidebar_active_bg);
     }
 
     #[test]
@@ -899,7 +904,12 @@ mod tests {
     /// what `main.rs` would compute: main column width minus 2*HORIZONTAL_PAD,
     /// height minus the fixed chrome rows.
     fn render_sized(app: &App, status: &str, w: u16, h: u16) -> Buffer {
-        let chrome = Chrome { status };
+        render_with_theme(app, status, w, h, &theme())
+    }
+
+    /// The same, with an explicit theme: for tests that override roles.
+    fn render_with_theme(app: &App, status: &str, w: u16, h: u16, theme: &Theme) -> Buffer {
+        let chrome = Chrome { status, theme };
         let backend = TestBackend::new(w, h);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, app, &chrome)).unwrap();
@@ -1059,7 +1069,7 @@ mod tests {
         let logo_cell = buffer
             .cell((top_row.find('█').unwrap() as u16, 12))
             .unwrap();
-        assert_eq!(logo_cell.fg, INPUT_LINE);
+        assert_eq!(logo_cell.fg, theme().accent);
         assert!(buffer_line(&buffer, 17).contains("╚═════╝"));
         // ...the old welcome text and key hints are gone...
         for y in 0..30 {
@@ -1075,7 +1085,7 @@ mod tests {
             for x in INPUT_X..100 {
                 assert_ne!(
                     buffer.cell((x, y)).unwrap().bg,
-                    INPUT_BG,
+                    theme().input_bg,
                     "panel bg at ({x},{y})"
                 );
             }
@@ -1121,8 +1131,8 @@ mod tests {
         app.apply_connection_event(&E::Connection("osu_irc".into(), S::Connecting));
         let pending = render_sized(&app, "", 50, 10);
         assert_eq!(pending[(2, 0)].symbol(), "●");
-        assert_eq!(pending[(2, 0)].fg, Color::Gray);
-        assert_eq!(pending[(4, 1)].fg, Color::Gray);
+        assert_eq!(pending[(2, 0)].fg, theme().status_pending);
+        assert_eq!(pending[(4, 1)].fg, theme().status_pending);
         app.tick(std::time::Duration::from_millis(500));
         let off = render_sized(&app, "", 50, 10);
         assert_eq!(off[(2, 0)].symbol(), " ");
@@ -1149,14 +1159,14 @@ mod tests {
         ));
         let connected = render_sized(&app, "", 50, 10);
         assert_eq!(connected[(2, 0)].symbol(), "●");
-        assert_eq!(connected[(2, 0)].fg, Color::Green);
-        assert_eq!(connected[(4, 1)].fg, Color::Green);
-        assert_eq!(connected[(4, 2)].fg, Color::Red);
+        assert_eq!(connected[(2, 0)].fg, theme().status_ok);
+        assert_eq!(connected[(4, 1)].fg, theme().status_ok);
+        assert_eq!(connected[(4, 2)].fg, theme().status_err);
         app.apply_connection_event(&E::Connection("osu_irc".into(), S::Stopped));
         let stopped = render_sized(&app, "", 50, 10);
         for pos in [(2, 0), (4, 1), (4, 2)] {
             assert_eq!(stopped[pos].symbol(), "●");
-            assert_eq!(stopped[pos].fg, Color::Red);
+            assert_eq!(stopped[pos].fg, theme().status_err);
         }
     }
 
@@ -1165,11 +1175,11 @@ mod tests {
         use crate::connection::{ConnectionState, IrcEvent};
         use crate::core::{ChannelState, ChannelStatus};
         for (state, color, blinking) in [
-            (ChannelState::Joined, Color::Green, false),
-            (ChannelState::Joining, Color::Gray, true),
-            (ChannelState::Parting, Color::Gray, true),
-            (ChannelState::NotJoined, Color::Red, false),
-            (ChannelState::Uncertain, Color::Red, false),
+            (ChannelState::Joined, theme().status_ok, false),
+            (ChannelState::Joining, theme().status_pending, true),
+            (ChannelState::Parting, theme().status_pending, true),
+            (ChannelState::NotJoined, theme().status_err, false),
+            (ChannelState::Uncertain, theme().status_err, false),
         ] {
             let mut app = App::new(22, 3);
             app.open_server("srv");
@@ -1208,7 +1218,7 @@ mod tests {
             },
         ));
         let offline = render_sized(&app, "", 50, 10);
-        assert_eq!(offline[(4, 1)].fg, Color::Red);
+        assert_eq!(offline[(4, 1)].fg, theme().status_err);
     }
 
     #[test]
@@ -1228,7 +1238,7 @@ mod tests {
             app.tick(std::time::Duration::from_millis(elapsed));
             let rendered = render_sized(&app, "", 50, 10);
             assert_eq!(rendered[(4, 1)].symbol(), "●");
-            assert_eq!(rendered[(4, 1)].fg, Color::Red);
+            assert_eq!(rendered[(4, 1)].fg, theme().status_err);
         }
     }
 
@@ -1245,8 +1255,8 @@ mod tests {
         // the sidebar's inner area.
         let active_bg = buffer.cell((10, 1)).unwrap().bg;
         let inactive_bg = buffer.cell((10, 2)).unwrap().bg;
-        assert_eq!(active_bg, SIDEBAR_ACTIVE_BG);
-        assert_ne!(inactive_bg, SIDEBAR_ACTIVE_BG);
+        assert_eq!(active_bg, theme().sidebar_active_bg);
+        assert_ne!(inactive_bg, theme().sidebar_active_bg);
     }
 
     #[test]
@@ -1265,11 +1275,11 @@ mod tests {
         // Assert: row 1 shows the reverse-video block cursor; its background
         // is the (brighter) active-channel one, which takes precedence.
         let cursor_cell = buffer.cell((1, 1)).unwrap();
-        assert_eq!(cursor_cell.bg, Color::White);
+        assert_eq!(cursor_cell.bg, theme().input_cursor_bg);
         let inner_cell = buffer.cell((10, 1)).unwrap();
-        assert_eq!(inner_cell.bg, SIDEBAR_ACTIVE_BG);
+        assert_eq!(inner_cell.bg, theme().sidebar_active_bg);
         // Row 0 (server row, not under the cursor) keeps the plain bg.
-        assert_ne!(buffer.cell((10, 0)).unwrap().bg, SIDEBAR_ACTIVE_BG);
+        assert_ne!(buffer.cell((10, 0)).unwrap().bg, theme().sidebar_active_bg);
     }
 
     #[test]
@@ -1310,8 +1320,8 @@ mod tests {
         // Assert: the server row (row 0) gets the active background, the
         // channel row (row 1) does not. Column 10 is inside the sidebar's
         // inner area.
-        assert_eq!(buffer.cell((10, 0)).unwrap().bg, SIDEBAR_ACTIVE_BG);
-        assert_ne!(buffer.cell((10, 1)).unwrap().bg, SIDEBAR_ACTIVE_BG);
+        assert_eq!(buffer.cell((10, 0)).unwrap().bg, theme().sidebar_active_bg);
+        assert_ne!(buffer.cell((10, 1)).unwrap().bg, theme().sidebar_active_bg);
     }
 
     #[test]
@@ -1327,8 +1337,11 @@ mod tests {
 
         // Assert: the ┃ accent is dimmed and the input row has no cursor block.
         let accent = buffer.cell((INPUT_X, 5)).unwrap();
-        assert_eq!(accent.fg, INPUT_LINE_DIM);
-        assert_ne!(buffer.cell((MAIN_COL_X, 5)).unwrap().bg, Color::White);
+        assert_eq!(accent.fg, theme().accent_dim);
+        assert_ne!(
+            buffer.cell((MAIN_COL_X, 5)).unwrap().bg,
+            theme().input_cursor_bg
+        );
     }
 
     #[test]
@@ -1349,19 +1362,22 @@ mod tests {
         let buffer = render_sized(&app, "", 50, 12);
 
         // Assert: the selected message row is highlighted...
-        assert_eq!(buffer.cell((MAIN_COL_X, 2)).unwrap().bg, MESSAGE_SELECT_BG);
+        assert_eq!(
+            buffer.cell((MAIN_COL_X, 2)).unwrap().bg,
+            theme().message_select_bg
+        );
         // ...the separator above renders ▄ and the one below ▀ in that color...
         let above = buffer.cell((MAIN_COL_X, 1)).unwrap();
         assert_eq!(above.symbol(), "▄");
-        assert_eq!(above.fg, MESSAGE_SELECT_BG);
+        assert_eq!(above.fg, theme().message_select_bg);
         let below = buffer.cell((MAIN_COL_X, 3)).unwrap();
         assert_eq!(below.symbol(), "▀");
-        assert_eq!(below.fg, MESSAGE_SELECT_BG);
+        assert_eq!(below.fg, theme().message_select_bg);
         // ...and a pale-green accent runs down the front of the block,
         // tapering at both ends (╻ … ┃ … ╹ — details in the taper test).
         for y in 1..=3 {
             let accent = buffer.cell((INPUT_X, y)).unwrap();
-            assert_eq!(accent.fg, INPUT_LINE, "accent missing on row {y}");
+            assert_eq!(accent.fg, theme().accent, "accent missing on row {y}");
         }
     }
 
@@ -1381,14 +1397,23 @@ mod tests {
 
         // Assert: the column right after the ┃ accent is part of the highlight
         // (no global-bg gap between accent and highlight)...
-        assert_eq!(buffer.cell((INPUT_X + 1, 2)).unwrap().bg, MESSAGE_SELECT_BG);
+        assert_eq!(
+            buffer.cell((INPUT_X + 1, 2)).unwrap().bg,
+            theme().message_select_bg
+        );
         // ...and the half-block separators reach into it as well.
         assert_eq!(buffer.cell((INPUT_X + 1, 1)).unwrap().symbol(), "▄");
-        assert_eq!(buffer.cell((INPUT_X + 1, 1)).unwrap().fg, MESSAGE_SELECT_BG);
+        assert_eq!(
+            buffer.cell((INPUT_X + 1, 1)).unwrap().fg,
+            theme().message_select_bg
+        );
         assert_eq!(buffer.cell((INPUT_X + 1, 3)).unwrap().symbol(), "▀");
-        assert_eq!(buffer.cell((INPUT_X + 1, 3)).unwrap().fg, MESSAGE_SELECT_BG);
+        assert_eq!(
+            buffer.cell((INPUT_X + 1, 3)).unwrap().fg,
+            theme().message_select_bg
+        );
         // The accent itself keeps standing on the global background.
-        assert_eq!(buffer.cell((INPUT_X, 2)).unwrap().bg, GLOBAL_BG);
+        assert_eq!(buffer.cell((INPUT_X, 2)).unwrap().bg, theme().global_bg);
     }
 
     #[test]
@@ -1408,13 +1433,13 @@ mod tests {
         // through the middle, and ends with an upper-half stroke.
         let top = buffer.cell((INPUT_X, 1)).unwrap();
         assert_eq!(top.symbol(), "╻");
-        assert_eq!(top.fg, INPUT_LINE);
+        assert_eq!(top.fg, theme().accent);
         let middle = buffer.cell((INPUT_X, 2)).unwrap();
         assert_eq!(middle.symbol(), "┃");
-        assert_eq!(middle.fg, INPUT_LINE);
+        assert_eq!(middle.fg, theme().accent);
         let bottom = buffer.cell((INPUT_X, 3)).unwrap();
         assert_eq!(bottom.symbol(), "╹");
-        assert_eq!(bottom.fg, INPUT_LINE);
+        assert_eq!(bottom.fg, theme().accent);
     }
 
     #[test]
@@ -1445,7 +1470,10 @@ mod tests {
         assert_eq!(buffer.cell((MAIN_COL_X, 0)).unwrap().symbol(), "▄");
         assert_eq!(buffer.cell((INPUT_X, 0)).unwrap().symbol(), "╻");
         assert_eq!(buffer.cell((INPUT_X, 1)).unwrap().symbol(), "┃");
-        assert_eq!(buffer.cell((MAIN_COL_X, 1)).unwrap().bg, MESSAGE_SELECT_BG);
+        assert_eq!(
+            buffer.cell((MAIN_COL_X, 1)).unwrap().bg,
+            theme().message_select_bg
+        );
     }
 
     #[test]
@@ -1461,7 +1489,10 @@ mod tests {
 
         // Assert: no highlight, half-blocks, or accent anywhere in the pane.
         for y in 0..=4 {
-            assert_ne!(buffer.cell((MAIN_COL_X, y)).unwrap().bg, MESSAGE_SELECT_BG);
+            assert_ne!(
+                buffer.cell((MAIN_COL_X, y)).unwrap().bg,
+                theme().message_select_bg
+            );
             assert!(!["┃", "╻", "╹"].contains(&buffer.cell((INPUT_X, y)).unwrap().symbol()));
         }
     }
@@ -1480,13 +1511,14 @@ mod tests {
         for y in 4..=7 {
             let cell = buffer.cell((INPUT_X, y)).unwrap();
             assert_eq!(cell.symbol(), "┃", "accent missing on row {y}");
-            assert_eq!(cell.fg, INPUT_LINE, "accent color wrong on row {y}");
+            assert_eq!(cell.fg, theme().accent, "accent color wrong on row {y}");
             assert_eq!(
-                cell.bg, GLOBAL_BG,
+                cell.bg,
+                theme().global_bg,
                 "accent should sit on global bg on row {y}"
             );
         }
-        assert_eq!(buffer.cell((INPUT_X + 1, 5)).unwrap().bg, INPUT_BG); // panel starts here
+        assert_eq!(buffer.cell((INPUT_X + 1, 5)).unwrap().bg, theme().input_bg); // panel starts here
     }
 
     #[test]
@@ -1520,8 +1552,11 @@ mod tests {
         // Assert: the input line (row 5) shows the text and a reverse-video cursor.
         let row = buffer_line(&buffer, 5);
         assert!(row.contains("hi"), "row was: {row:?}");
-        // The cursor sits just past "hi" (at end) - a White-bg block at col 28.
-        assert_eq!(buffer.cell((MAIN_COL_X + 2, 5)).unwrap().bg, Color::White);
+        // The cursor sits just past "hi" (at end) - a block cursor at col 28.
+        assert_eq!(
+            buffer.cell((MAIN_COL_X + 2, 5)).unwrap().bg,
+            theme().input_cursor_bg
+        );
     }
 
     #[test]
@@ -1540,7 +1575,10 @@ mod tests {
                 "│",
                 "separator missing on row {y}"
             );
-            assert_eq!(buffer.cell((SIDEBAR_WIDTH, y)).unwrap().fg, SEPARATOR);
+            assert_eq!(
+                buffer.cell((SIDEBAR_WIDTH, y)).unwrap().fg,
+                theme().separator
+            );
         }
         // The `┃` lives only on the composer rows, at col INPUT_X.
         for y in 4..=7 {
@@ -1561,11 +1599,11 @@ mod tests {
         // (pale green, on the global bg); the rest of the row is the `▀` fade.
         let taper = buffer.cell((INPUT_X, 8)).unwrap();
         assert_eq!(taper.symbol(), "╹");
-        assert_eq!(taper.fg, INPUT_LINE);
-        assert_eq!(taper.bg, GLOBAL_BG);
+        assert_eq!(taper.fg, theme().accent);
+        assert_eq!(taper.bg, theme().global_bg);
         let fade = buffer.cell((INPUT_X + 1, 8)).unwrap();
         assert_eq!(fade.symbol(), "▀");
-        assert_eq!(fade.fg, INPUT_BG);
+        assert_eq!(fade.fg, theme().input_bg);
     }
 
     #[test]
@@ -1579,13 +1617,86 @@ mod tests {
         // Assert: a thin gray `│` separates sidebar and main on the message rows;
         // col SIDEBAR_WIDTH+1 is the 1-char blank gap (global bg).
         assert_eq!(buffer.cell((SIDEBAR_WIDTH, 1)).unwrap().symbol(), "│");
-        assert_eq!(buffer.cell((SIDEBAR_WIDTH, 1)).unwrap().fg, SEPARATOR);
+        assert_eq!(
+            buffer.cell((SIDEBAR_WIDTH, 1)).unwrap().fg,
+            theme().separator
+        );
         assert_eq!(buffer.cell((SIDEBAR_WIDTH + 1, 1)).unwrap().symbol(), " ");
-        assert_eq!(buffer.cell((SIDEBAR_WIDTH + 1, 1)).unwrap().bg, GLOBAL_BG);
+        assert_eq!(
+            buffer.cell((SIDEBAR_WIDTH + 1, 1)).unwrap().bg,
+            theme().global_bg
+        );
         // The global background fills every non-composer region.
-        assert_eq!(buffer.cell((0, 5)).unwrap().bg, GLOBAL_BG); // sidebar blank
-        assert_eq!(buffer.cell((INPUT_X + 5, 9)).unwrap().bg, GLOBAL_BG); // gap blank
-        assert_eq!(buffer.cell((INPUT_X + 4, 5)).unwrap().bg, INPUT_BG); // composer
+        assert_eq!(buffer.cell((0, 5)).unwrap().bg, theme().global_bg); // sidebar blank
+        assert_eq!(buffer.cell((INPUT_X + 5, 9)).unwrap().bg, theme().global_bg); // gap blank
+        assert_eq!(buffer.cell((INPUT_X + 4, 5)).unwrap().bg, theme().input_bg); // composer
+    }
+
+    /// Golden: with the default theme the render uses exactly the palette
+    /// that was hardcoded before theming existed, byte for byte.
+    #[test]
+    fn default_theme_matches_the_pre_change_golden_palette() {
+        // Arrange
+        let mut app = viewing_app(22, 3);
+        app.push_message(msg("alice", "hi"));
+
+        // Act
+        let buffer = render_sized(&app, "", 50, 10);
+
+        // Assert: one pinned cell per pre-change hardcoded constant.
+        assert_eq!(
+            buffer.cell((0, 5)).unwrap().bg,
+            Color::Rgb(0x0a, 0x0a, 0x0a) // GLOBAL_BG
+        );
+        assert_eq!(
+            buffer.cell((SIDEBAR_WIDTH, 1)).unwrap().fg,
+            Color::Rgb(0x55, 0x55, 0x55) // SEPARATOR
+        );
+        assert_eq!(
+            buffer.cell((INPUT_X + 1, 5)).unwrap().bg,
+            Color::Rgb(0x1e, 0x1e, 0x1e) // INPUT_BG panel
+        );
+        assert_eq!(
+            buffer.cell((INPUT_X, 5)).unwrap().fg,
+            Color::Rgb(0x4a, 0x6a, 0x4a) // INPUT_LINE_DIM (unfocused accent)
+        );
+        assert_eq!(
+            buffer.cell((10, 1)).unwrap().bg,
+            Color::Rgb(0x2e, 0x2e, 0x2e) // SIDEBAR_ACTIVE_BG
+        );
+        assert_eq!(buffer.cell((4, 1)).unwrap().fg, Color::Red); // status dot (not joined)
+    }
+
+    #[test]
+    fn overriding_a_theme_role_changes_only_that_roles_pixels() {
+        // Arrange
+        let mut app = viewing_app(22, 3);
+        app.push_message(msg("alice", "hi"));
+        let theme = Theme {
+            separator: Color::Rgb(0x33, 0x66, 0xff),
+            ..Theme::default()
+        };
+
+        // Act: the same scene under the default and the overridden theme.
+        let base = render_sized(&app, "", 50, 10);
+        let themed = render_with_theme(&app, "", 50, 10, &theme);
+
+        // Assert: the separator column carries the override...
+        assert_eq!(base[(SIDEBAR_WIDTH, 1)].fg, Theme::default().separator);
+        assert_eq!(themed[(SIDEBAR_WIDTH, 1)].fg, theme.separator);
+        // ...and every other cell is untouched.
+        for y in 0..10 {
+            for x in 0..50 {
+                if x == SIDEBAR_WIDTH {
+                    continue;
+                }
+                assert_eq!(
+                    base[(x, y)],
+                    themed[(x, y)],
+                    "cell ({x},{y}) changed by the separator override"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1601,9 +1712,13 @@ mod tests {
         let row = 5; // the input text row
 
         // Assert: panel right edge is 3 columns from the screen edge.
-        assert_eq!(buffer.cell((46, row)).unwrap().bg, INPUT_BG); // panel rightmost
+        assert_eq!(buffer.cell((46, row)).unwrap().bg, theme().input_bg); // panel rightmost
         for x in 47..=49 {
-            assert_eq!(buffer.cell((x, row)).unwrap().bg, GLOBAL_BG, "col {x}");
+            assert_eq!(
+                buffer.cell((x, row)).unwrap().bg,
+                theme().global_bg,
+                "col {x}"
+            );
         }
         // Assert: no text reaches the last 2 panel columns (the text margin).
         assert_eq!(buffer.cell((45, row)).unwrap().symbol(), " ");
@@ -1627,7 +1742,11 @@ mod tests {
         // across the main column, and the composer ┃ starts on the row below.
         for x in INPUT_X..50 {
             assert_eq!(buffer.cell((x, 4)).unwrap().symbol(), " ", "col {x}");
-            assert_eq!(buffer.cell((x, 4)).unwrap().bg, GLOBAL_BG, "col {x}");
+            assert_eq!(
+                buffer.cell((x, 4)).unwrap().bg,
+                theme().global_bg,
+                "col {x}"
+            );
         }
         assert_eq!(buffer.cell((INPUT_X, 5)).unwrap().symbol(), "┃");
     }
@@ -1691,16 +1810,16 @@ mod tests {
 
         // Assert: m1's row carries the hover background, flush against the
         // accent column (same x-range as the formal selection block)...
-        assert_eq!(buffer.cell((MAIN_COL_X, 0)).unwrap().bg, HOVER_BG);
-        assert_eq!(buffer.cell((INPUT_X + 1, 0)).unwrap().bg, HOVER_BG);
+        assert_eq!(buffer.cell((MAIN_COL_X, 0)).unwrap().bg, theme().hover_bg);
+        assert_eq!(buffer.cell((INPUT_X + 1, 0)).unwrap().bg, theme().hover_bg);
         // ...the separator row below m1 carries the block's bottom cap, an
         // upper-half block in the hover color (fg only, exactly like the
         // formal selection's caps); m1's above-separator is scrolled
         // off-screen, so no top cap is visible.
         let cap = buffer.cell((MAIN_COL_X, 1)).unwrap();
         assert_eq!(cap.symbol(), "▀");
-        assert_eq!(cap.fg, HOVER_BG);
-        assert_eq!(cap.bg, GLOBAL_BG);
+        assert_eq!(cap.fg, theme().hover_bg);
+        assert_eq!(cap.bg, theme().global_bg);
         // ...no accent column chars anywhere...
         for y in 0..=4 {
             assert!(
@@ -1714,7 +1833,7 @@ mod tests {
             assert!(symbol != "▄" && symbol != "▀", "half block at row {y}");
         }
         // The un-hovered m2 row carries no highlight.
-        assert_ne!(buffer.cell((MAIN_COL_X, 2)).unwrap().bg, HOVER_BG);
+        assert_ne!(buffer.cell((MAIN_COL_X, 2)).unwrap().bg, theme().hover_bg);
     }
 
     #[test]
@@ -1734,8 +1853,11 @@ mod tests {
 
         // Assert: exactly the formal selection background on m2's row -
         // no dim layer underneath can be distinguished.
-        assert_eq!(buffer.cell((MAIN_COL_X, 2)).unwrap().bg, MESSAGE_SELECT_BG);
-        assert_ne!(buffer.cell((MAIN_COL_X, 2)).unwrap().bg, HOVER_BG);
+        assert_eq!(
+            buffer.cell((MAIN_COL_X, 2)).unwrap().bg,
+            theme().message_select_bg
+        );
+        assert_ne!(buffer.cell((MAIN_COL_X, 2)).unwrap().bg, theme().hover_bg);
     }
 
     #[test]
@@ -1753,15 +1875,21 @@ mod tests {
         let buffer = render_sized(&app, "", 50, 12);
 
         // Assert: row 0 (m1) hover, row 2 (m2) formal selection.
-        assert_eq!(buffer.cell((MAIN_COL_X, 0)).unwrap().bg, HOVER_BG);
-        assert_eq!(buffer.cell((MAIN_COL_X, 2)).unwrap().bg, MESSAGE_SELECT_BG);
+        assert_eq!(buffer.cell((MAIN_COL_X, 0)).unwrap().bg, theme().hover_bg);
+        assert_eq!(
+            buffer.cell((MAIN_COL_X, 2)).unwrap().bg,
+            theme().message_select_bg
+        );
         // The shared separator row (screen row 1) blends the two adjacent
         // blocks: the lower half follows the message below (selected m2 ->
         // "▄" with fg = select color) and the upper half follows the message
         // above (hovered m1 -> bg = hover color).
         assert_eq!(buffer.cell((MAIN_COL_X, 1)).unwrap().symbol(), "▄");
-        assert_eq!(buffer.cell((MAIN_COL_X, 1)).unwrap().fg, MESSAGE_SELECT_BG);
-        assert_eq!(buffer.cell((MAIN_COL_X, 1)).unwrap().bg, HOVER_BG);
+        assert_eq!(
+            buffer.cell((MAIN_COL_X, 1)).unwrap().fg,
+            theme().message_select_bg
+        );
+        assert_eq!(buffer.cell((MAIN_COL_X, 1)).unwrap().bg, theme().hover_bg);
     }
 
     #[test]
@@ -1787,12 +1915,15 @@ mod tests {
         // Assert: upper half of the shared separator follows the message
         // above (selected m1 -> ▀ with fg = select color), lower half
         // follows the message below (hovered m2 -> bg = hover color).
-        assert_eq!(buffer.cell((MAIN_COL_X, 1)).unwrap().bg, MESSAGE_SELECT_BG);
-        assert_eq!(buffer.cell((MAIN_COL_X, 3)).unwrap().bg, HOVER_BG);
+        assert_eq!(
+            buffer.cell((MAIN_COL_X, 1)).unwrap().bg,
+            theme().message_select_bg
+        );
+        assert_eq!(buffer.cell((MAIN_COL_X, 3)).unwrap().bg, theme().hover_bg);
         let shared = buffer.cell((MAIN_COL_X, 2)).unwrap();
         assert_eq!(shared.symbol(), "▀");
-        assert_eq!(shared.fg, MESSAGE_SELECT_BG);
-        assert_eq!(shared.bg, HOVER_BG);
+        assert_eq!(shared.fg, theme().message_select_bg);
+        assert_eq!(shared.bg, theme().hover_bg);
     }
 
     #[test]
@@ -1806,10 +1937,10 @@ mod tests {
 
         // Assert: plain hovered row gets the hover background; hovering
         // the active channel row keeps its brighter active background.
-        assert_eq!(buffer.cell((10, 2)).unwrap().bg, HOVER_BG);
+        assert_eq!(buffer.cell((10, 2)).unwrap().bg, theme().hover_bg);
         app.set_hover_sidebar(Some(1));
         let buffer = render_sized(&app, "", 50, 10);
-        assert_eq!(buffer.cell((10, 1)).unwrap().bg, SIDEBAR_ACTIVE_BG);
+        assert_eq!(buffer.cell((10, 1)).unwrap().bg, theme().sidebar_active_bg);
     }
 
     /// Screen row of the first line containing `needle`, if any.

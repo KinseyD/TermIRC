@@ -67,6 +67,7 @@ fn join_command_focuses_channel_and_reuses_saved_view_and_destination_draft() {
     let config = crate::config::Config {
         servers: Default::default(),
         history: Default::default(),
+        theme: Default::default(),
     };
     app.restore_input("/join #New".into());
     let effect = submit_composer(&mut app.session, &config, &connections, &mut String::new());
@@ -279,6 +280,7 @@ fn query_command_effect_preserves_destination_draft_and_close_view() {
     let config = crate::config::Config {
         servers: Default::default(),
         history: Default::default(),
+        theme: Default::default(),
     };
     let effect = crate::application::submit_composer(
         &mut app.session,
