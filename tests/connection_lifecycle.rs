@@ -21,6 +21,7 @@ fn config(port: u16) -> ServerConfig {
         queries: vec![],
         sasl_username: None,
         sasl_password: None,
+        proxy: None,
     }
 }
 

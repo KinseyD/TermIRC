@@ -26,6 +26,39 @@ pub struct ServerConfig {
     pub sasl_password: Option<String>,
     #[serde(default)]
     pub queries: Vec<String>,
+    /// Optional SOCKS5 proxy (e.g. a local Tor node); absent means direct.
+    #[serde(default)]
+    pub proxy: Option<ProxyConfig>,
+}
+
+/// Optional per-server SOCKS5 proxy settings, from `[servers.<name>.proxy]`.
+#[derive(Clone, Deserialize)]
+pub struct ProxyConfig {
+    /// Only `"socks5"` is supported (covers Tor via `socks5://127.0.0.1:9050`).
+    #[serde(default)]
+    pub r#type: String,
+    #[serde(default)]
+    pub host: String,
+    /// `0` means "not configured"; validated to 1-65535 in `Config::parse`.
+    #[serde(default)]
+    pub port: u16,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+}
+
+impl std::fmt::Debug for ProxyConfig {
+    /// The proxy password is a credential — never include it in debug output.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyConfig")
+            .field("type", &self.r#type)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
 }
 
 impl std::fmt::Debug for ServerConfig {
@@ -42,6 +75,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("sasl_username", &self.sasl_username)
             .field("sasl_password", &"<redacted>")
             .field("queries", &self.queries)
+            .field("proxy", &self.proxy)
             .finish()
     }
 }
@@ -132,6 +166,21 @@ impl Config {
                     .all(|nickname| valid_query_nickname(nickname)),
                 "queries must contain individual nicknames, not channels or multiple targets"
             );
+            if let Some(proxy) = &server.proxy {
+                anyhow::ensure!(
+                    proxy.r#type == "socks5",
+                    "unsupported_proxy_type: only \"socks5\" is supported, got {:?}",
+                    proxy.r#type
+                );
+                anyhow::ensure!(
+                    !proxy.host.trim().is_empty(),
+                    "proxy_host_required: proxy.host must be a non-empty hostname"
+                );
+                anyhow::ensure!(
+                    (1..=65535).contains(&proxy.port),
+                    "proxy_port_out_of_range: proxy.port must be between 1 and 65535"
+                );
+            }
             let sasl = match (&server.sasl_username, &server.sasl_password) {
                 (Some(username), Some(password)) => Some((username, password)),
                 (None, None) => None,
@@ -506,5 +555,104 @@ channels = ["#chat"]
         assert!(diagnostic.contains("network"));
         assert!(!diagnostic.contains("do-not-print-this-token"));
         assert!(!diagnostic.contains("second-private-token"));
+    }
+
+    #[test]
+    fn parses_valid_socks5_proxy_per_server() {
+        // Arrange
+        let content = server_toml(
+            "\n[servers.test.proxy]\ntype = \"socks5\"\nhost = \"127.0.0.1\"\nport = 9050\n",
+        );
+
+        // Act
+        let config = Config::parse(&content).unwrap();
+
+        // Assert
+        let proxy = config.servers["test"].proxy.as_ref().unwrap();
+        assert_eq!(proxy.r#type, "socks5");
+        assert_eq!(proxy.host, "127.0.0.1");
+        assert_eq!(proxy.port, 9050);
+        assert_eq!(proxy.username, None);
+        assert_eq!(proxy.password, None);
+    }
+
+    #[test]
+    fn server_without_proxy_table_parses_to_none() {
+        // Arrange
+        let content = server_toml("");
+
+        // Act
+        let config = Config::parse(&content).unwrap();
+
+        // Assert
+        assert!(config.servers["test"].proxy.is_none());
+    }
+
+    #[test]
+    fn proxy_rejects_missing_host_unsupported_type_and_out_of_range_port() {
+        // Arrange
+        for extra in [
+            "\n[servers.test.proxy]\ntype = \"socks5\"\nport = 9050\n",
+            "\n[servers.test.proxy]\ntype = \"http\"\nhost = \"127.0.0.1\"\nport = 8080\n",
+            "\n[servers.test.proxy]\ntype = \"socks5\"\nhost = \"127.0.0.1\"\nport = 0\n",
+        ] {
+            let content = server_toml(extra);
+
+            // Act
+            let result = Config::parse(&content);
+
+            // Assert
+            let error = result.expect_err("invalid proxy must be rejected");
+            let reason = format!("{error:#}");
+            assert!(
+                reason.contains("unsupported_proxy_type")
+                    || reason.contains("proxy_host_required")
+                    || reason.contains("proxy_port_out_of_range"),
+                "missing machine-readable reason: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_host_and_port_are_validated_with_exact_reasons() {
+        // Arrange
+        let missing_host =
+            server_toml("\n[servers.test.proxy]\ntype = \"socks5\"\nhost = \"\"\nport = 9050\n");
+        let bad_port = server_toml(
+            "\n[servers.test.proxy]\ntype = \"socks5\"\nhost = \"127.0.0.1\"\nport = 65536\n",
+        );
+        let bad_type = server_toml(
+            "\n[servers.test.proxy]\ntype = \"socks4\"\nhost = \"127.0.0.1\"\nport = 1080\n",
+        );
+
+        // Act & Assert
+        let error = Config::parse(&missing_host).expect_err("empty proxy host");
+        assert!(
+            format!("{error:#}").contains("proxy_host_required"),
+            "missing proxy_host_required"
+        );
+        // Ports beyond u16 fail TOML deserialization itself.
+        assert!(Config::parse(&bad_port).is_err());
+        let error = Config::parse(&bad_type).expect_err("socks4 proxy");
+        assert!(
+            format!("{error:#}").contains("unsupported_proxy_type"),
+            "missing unsupported_proxy_type"
+        );
+    }
+
+    #[test]
+    fn debug_output_redacts_proxy_password() {
+        // Arrange
+        let content = server_toml(
+            "\n[servers.test.proxy]\ntype = \"socks5\"\nhost = \"127.0.0.1\"\nport = 9050\nusername = \"tor\"\npassword = \"proxy-secret-token\"\n",
+        );
+        let config = Config::parse(&content).unwrap();
+
+        // Act
+        let debug = format!("{:?}", config.servers["test"].proxy.as_ref().unwrap());
+
+        // Assert
+        assert!(!debug.contains("proxy-secret-token"), "leaked: {debug}");
+        assert!(debug.contains("<redacted>"));
     }
 }

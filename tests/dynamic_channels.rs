@@ -48,6 +48,7 @@ impl MockSession {
             queries: vec![],
             sasl_username: None,
             sasl_password: None,
+            proxy: None,
         };
         let config = Config {
             servers: [("srv".into(), server.clone())].into_iter().collect(),

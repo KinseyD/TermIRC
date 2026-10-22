@@ -61,6 +61,20 @@ once at startup — restart to pick up changes.
 | `sasl_password` | no | —    | SASL PLAIN password; see authentication notes below |
 | `channels` | yes      | —       | startup channel intent, in order; runtime changes are not persisted |
 
+An optional `[servers.<name>.proxy]` table routes that server's connection
+through a SOCKS5 proxy (only `type = "socks5"` is supported); DNS also
+resolves through the proxy. For Tor, a local node at `socks5://127.0.0.1:9050`
+is just `type = "socks5"`, `host = "127.0.0.1"`, `port = 9050` (see
+`config.example.toml`).
+
+| Proxy key  | Required | Default | Meaning                              |
+|------------|----------|---------|--------------------------------------|
+| `type`     | yes      | —       | only `socks5` is accepted            |
+| `host`     | yes      | —       | proxy hostname or IP                 |
+| `port`     | yes      | —       | proxy port (1-65535; Tor: 9050)      |
+| `username` | no       | —       | proxy username                       |
+| `password` | no       | —       | proxy password                       |
+
 `queries` contains individual nicknames, not channels or comma-separated targets.
 Repeated names are deduplicated within each server using ASCII case-insensitive
 matching; the same nickname on different servers is a separate conversation.
