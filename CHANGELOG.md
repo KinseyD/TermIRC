@@ -9,12 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Focus-aware status bar on the bottom row: `server <name> │ channel <name> │
-  type in`, with the segment matching the current focus (composer, message
-  pane, or sidebar server/buffer navigation) highlighted; clicking a segment
-  focuses that zone. New `statusbar.*` i18n keys and `status_bar_highlight`
-  theme role.
-
+- Focus-aware status bar on the bottom row: `server <name> ▶ channel <name> ▶
+  type in` blocks nested arrow-to-tail (powerline style), with the block matching
+  the current focus (composer, message pane, or sidebar server/buffer navigation)
+  highlighted; clicking a block focuses that zone, and blocks without a value
+  (nothing connected, server console) hide entirely. New `statusbar.*` i18n keys
+  and `status_bar_highlight` theme role.
 
 ### Added
 

@@ -358,7 +358,7 @@ mod tests {
     #[test]
     fn status_bar_segment_clicks_focus_their_zones() {
         // Arrange: viewing #a on srv at 70x10; the bar reads
-        // ` server srv │ channel #a │ type in ` on row 9.
+        // ` server srv ▶ channel #a ▶ type in ▶` on row 9.
         let mut app = App::new(70, 10);
         app.open_channel("srv", "#a");
         app.select_buffer(0);
@@ -370,23 +370,27 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
 
-        // Act / Assert: the input segment keeps the composer focused.
+        // Act / Assert: the input block (arrow included) keeps the
+        // composer focused.
         handle_mouse(&mut app, bar_click(30), (70, 10));
         assert_eq!(app.focus(), Focus::Composer);
 
-        // The server segment focuses the sidebar on the server header row.
+        // The server block focuses the sidebar on the server header row;
+        // its trailing arrow column belongs to it too.
         handle_mouse(&mut app, bar_click(1), (70, 10));
         assert_eq!(app.focus(), Focus::Sidebar);
         assert_eq!(app.sidebar_cursor(), Some(0));
         assert_eq!(app.status_zone(), StatusZone::Server);
+        handle_mouse(&mut app, bar_click(12), (70, 10));
+        assert_eq!(app.status_zone(), StatusZone::Server); // the `▶`
 
-        // The channel segment moves the cursor to the buffer row.
+        // The channel block moves the cursor to the buffer row.
         handle_mouse(&mut app, bar_click(15), (70, 10));
         assert_eq!(app.sidebar_cursor(), Some(1));
         assert_eq!(app.status_zone(), StatusZone::Channel);
 
-        // A separator column is dead space: nothing changes.
-        handle_mouse(&mut app, bar_click(13), (70, 10));
+        // Columns past the last block are dead space: nothing changes.
+        handle_mouse(&mut app, bar_click(45), (70, 10));
         assert_eq!(app.sidebar_cursor(), Some(1));
         assert_eq!(app.status_zone(), StatusZone::Channel);
     }

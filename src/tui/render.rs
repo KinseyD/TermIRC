@@ -10,7 +10,7 @@
 //!                    │  ┃                             highlighted row reversed)
 //!                    │  ┃   /join #osu             <- input (4 rows, bg-shaded,
 //!                    │  ┃  connected · q quit …    <- tips row  accent ┃ left)
-//!  server osu_irc   │  channel #osu │ type in     <- status bar (bottom row;
+//!  server osu_irc ▶ channel #osu ▶ type in    <- status bar (bottom row;
 //!                                                   the focused zone is
 //!                                                   highlighted, and clicking
 //!                                                   a segment focuses it)
@@ -103,7 +103,7 @@ pub struct ScreenGeometry {
     pub composer: Rect,
     pub gap: Rect,
     /// The one-row status bar across the very bottom of the screen:
-    /// ` server … │ channel … │ type in `, the focused zone highlighted.
+    /// ` server … ▶ channel … ▶ type in `, the focused zone highlighted.
     /// Height 0 on a terminal too short to keep a content row above it.
     pub status_bar: Rect,
     pub input: Rect,
@@ -823,31 +823,37 @@ fn render_gap(frame: &mut Frame, area: Rect, screen_w: u16, app: &App, theme: &T
     );
 }
 
-/// The status bar's segment texts, in zone order: `label value` for the
-/// server and channel zones (the value from the active buffer, the
-/// `statusbar.none` placeholder before anything is connected, and the
-/// `statusbar.console` label while a server console is viewed), and the
-/// input zone's standing label. Names are data, labels are localized.
-fn status_bar_texts(app: &App) -> [String; 3] {
-    let buffer = app.active_buffer();
-    let server = i18n::format(
-        i18n::t("statusbar.server"),
-        &[(
-            "name",
-            buffer.map_or(i18n::t("statusbar.none"), |b| b.server_label.as_str()),
-        )],
-    );
-    let channel_name = match buffer.map(|b| &b.kind) {
-        Some(crate::core::BufferKind::Channel(name)) => name.clone(),
-        Some(crate::core::BufferKind::Query(nick)) => format!("@{nick}"),
-        Some(crate::core::BufferKind::Server) => i18n::t("statusbar.console").to_string(),
-        None => i18n::t("statusbar.none").to_string(),
-    };
-    let channel = i18n::format(
-        i18n::t("statusbar.channel"),
-        &[("name", channel_name.as_str())],
-    );
-    [server, channel, i18n::t("statusbar.input").to_string()]
+/// The status bar's visible blocks: `label value` for the server and
+/// channel zones, and the input zone's standing label. A block with no
+/// applicable value hides entirely — the server/channel blocks need an
+/// active buffer, and the channel block also hides while a server console
+/// is viewed (the server block already names it); the input block always
+/// shows, so the bar never renders empty. Names are data, labels are
+/// localized.
+fn status_bar_texts(app: &App) -> Vec<(StatusZone, String)> {
+    let mut segments = Vec::with_capacity(3);
+    if let Some(buffer) = app.active_buffer() {
+        segments.push((
+            StatusZone::Server,
+            i18n::format(
+                i18n::t("statusbar.server"),
+                &[("name", buffer.server_label.as_str())],
+            ),
+        ));
+        let channel_name = match &buffer.kind {
+            crate::core::BufferKind::Channel(name) => Some(name.clone()),
+            crate::core::BufferKind::Query(nick) => Some(format!("@{nick}")),
+            crate::core::BufferKind::Server => None,
+        };
+        if let Some(name) = channel_name {
+            segments.push((
+                StatusZone::Channel,
+                i18n::format(i18n::t("statusbar.channel"), &[("name", name.as_str())]),
+            ));
+        }
+    }
+    segments.push((StatusZone::Input, i18n::t("statusbar.input").to_string()));
+    segments
 }
 
 /// `text` clipped to at most `width` display columns, ending in `…` when
@@ -874,51 +880,54 @@ fn clip_columns(text: &str, width: usize) -> String {
     out
 }
 
-/// Fit the status bar's three segments into `width` columns. Each segment
-/// renders as ` text ` (the padding carries its highlight) and neighbors
-/// are separated by a `│` outside both ranges. When the texts overflow,
-/// the two value segments shrink — the wider one yielding columns to the
-/// narrower first — and are then ellipsized; the fixed input label keeps
-/// its width and the terminal clips the line as a last resort.
-fn fit_status_bar(app: &App, width: u16) -> [(StatusZone, u16, u16, String); 3] {
+/// Fit the status bar's visible blocks into `width` columns. Each block
+/// renders as ` text ` plus the `▶` arrow on its right edge (the arrow is
+/// part of the block, hit range included), so consecutive blocks nest
+/// arrow-to-tail powerline-style. When the texts overflow, the value
+/// blocks shrink — the wider one yielding columns to the narrower first —
+/// and are then ellipsized; the fixed input label keeps its width and the
+/// terminal clips the line as a last resort.
+fn fit_status_bar(app: &App, width: u16) -> Vec<(StatusZone, u16, u16, String)> {
     let texts = status_bar_texts(app);
-    let mut widths = [texts[0].width(), texts[1].width(), texts[2].width()];
-    // Chrome: one space of padding on each side of all three segments
-    // plus the two separators.
-    let budget = usize::from(width).saturating_sub(8);
+    let n = texts.len();
+    // Chrome: one space of padding on each side of every block plus its
+    // right-edge arrow.
+    let budget = usize::from(width).saturating_sub(3 * n);
+    let mut widths: Vec<usize> = texts.iter().map(|(_, text)| text.width()).collect();
     if widths.iter().sum::<usize>() > budget {
-        // The input label is fixed; the values share what is left.
-        let target = budget.saturating_sub(widths[2]);
-        let (wide, narrow) = if widths[0] >= widths[1] {
-            (0, 1)
-        } else {
-            (1, 0)
-        };
-        widths[narrow] = widths[narrow].min(target);
-        widths[wide] = target - widths[narrow];
-    }
-    let zones = [StatusZone::Server, StatusZone::Channel, StatusZone::Input];
-    let mut segments = [
-        (StatusZone::Server, 0, 0, String::new()),
-        (StatusZone::Channel, 0, 0, String::new()),
-        (StatusZone::Input, 0, 0, String::new()),
-    ];
-    let mut x = 0u16;
-    for (i, zone) in zones.into_iter().enumerate() {
-        if i > 0 {
-            x = x.saturating_add(1); // the `│` separator, in no segment's range
+        // The trailing input label is fixed; the value blocks share what
+        // is left, the wider one yielding columns to the narrower first.
+        let target = budget.saturating_sub(widths[n - 1]);
+        match n - 1 {
+            0 => {}
+            1 => widths[0] = widths[0].min(target),
+            _ => {
+                let (wide, narrow) = if widths[0] >= widths[1] {
+                    (0, 1)
+                } else {
+                    (1, 0)
+                };
+                widths[narrow] = widths[narrow].min(target);
+                widths[wide] = target - widths[narrow];
+            }
         }
-        let text = format!(" {} ", clip_columns(&texts[i], widths[i]));
-        let w = u16::try_from(text.width()).unwrap_or(u16::MAX);
-        segments[i] = (zone, x, x.saturating_add(w), text);
-        x = x.saturating_add(w);
+    }
+    let mut segments = Vec::with_capacity(n);
+    let mut x = 0u16;
+    for (i, (zone, text)) in texts.iter().enumerate() {
+        let block = format!(" {} ", clip_columns(text, widths[i]));
+        let body = u16::try_from(block.width()).unwrap_or(u16::MAX);
+        // The range includes the block's trailing `▶` column.
+        segments.push((*zone, x, x.saturating_add(body + 1), block));
+        x = x.saturating_add(body + 1);
     }
     segments
 }
 
 /// The status-bar zone containing screen column `x`: shared by drawing
-/// and mouse routing, so clicks land on exactly the segment that was
-/// painted. Separators (and columns past the last segment) map to none.
+/// and mouse routing, so clicks land on exactly the block that was
+/// painted (its trailing arrow included). Hidden blocks have no range;
+/// columns past the last block map to none.
 pub fn status_bar_zone_at(app: &App, width: u16, x: u16) -> Option<StatusZone> {
     fit_status_bar(app, width)
         .iter()
@@ -926,28 +935,51 @@ pub fn status_bar_zone_at(app: &App, width: u16, x: u16) -> Option<StatusZone> {
         .map(|&(zone, _, _, _)| zone)
 }
 
-/// Render the bottom status bar: three dim segments with the zone the
-/// effective focus is in highlighted (bold, on the status-bar highlight
-/// background). Rendered on every page, including the welcome logo.
+/// Render the bottom status bar: one block per zone with a value, each
+/// ending in a `▶` whose color is the block's own fill on the background
+/// of whatever follows — so consecutive blocks interlock arrow-to-tail
+/// (powerline style) and a highlighted block's arrow reads as part of it.
+/// All colors come from existing roles: the arrow needs no separate one.
+/// Rendered on every page, including the welcome logo.
 fn render_status_bar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     if area.is_empty() {
         return;
     }
     let highlighted = app.status_zone();
-    let mut spans = Vec::with_capacity(5);
-    for (i, &(zone, _, _, ref text)) in fit_status_bar(app, area.width).iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled("│", Style::new().fg(theme.separator)));
-        }
-        let style = if zone == highlighted {
+    let segments = fit_status_bar(app, area.width);
+    let mut spans = Vec::with_capacity(2 * segments.len());
+    for (i, &(zone, _, _, ref body)) in segments.iter().enumerate() {
+        let highlighted_here = zone == highlighted;
+        let style = if highlighted_here {
             Style::new()
                 .fg(theme.global_bg)
                 .bg(theme.status_bar_highlight)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::new().fg(theme.dim)
+            Style::new().fg(theme.dim).bg(theme.global_bg)
         };
-        spans.push(Span::styled(text.clone(), style));
+        spans.push(Span::styled(body.clone(), style));
+        // The right-edge arrow: the block's fill color in the foreground,
+        // the following block's background (or the screen's) behind it.
+        let arrow_bg = segments
+            .get(i + 1)
+            .map_or(theme.global_bg, |&(next, _, _, _)| {
+                if next == highlighted {
+                    theme.status_bar_highlight
+                } else {
+                    theme.global_bg
+                }
+            });
+        spans.push(Span::styled(
+            "▶",
+            Style::new()
+                .fg(if highlighted_here {
+                    theme.status_bar_highlight
+                } else {
+                    theme.dim
+                })
+                .bg(arrow_bg),
+        ));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -2254,13 +2286,14 @@ mod tests {
         }
     }
 
-    /// Column ranges of the bar's three segments at width 50 with the
-    /// osu_irc/#osu buffer: ` server osu_irc │ channel #osu │ type in `.
+    /// Column ranges (arrow column included) of the bar's three blocks at
+    /// width 50 with the osu_irc/#osu buffer:
+    /// ` server osu_irc ▶ channel #osu ▶ type in ▶`.
     fn bar_segments() -> [(StatusZone, u16, u16); 3] {
         [
-            (StatusZone::Server, 0, 16),
-            (StatusZone::Channel, 17, 31),
-            (StatusZone::Input, 32, 41),
+            (StatusZone::Server, 0, 17),
+            (StatusZone::Channel, 17, 32),
+            (StatusZone::Input, 32, 42),
         ]
     }
 
@@ -2294,14 +2327,16 @@ mod tests {
         // Act
         let buffer = render_sized(&app, "", 50, 10);
 
-        // Assert: every cell of the input segment (padding included) is
-        // bold on the highlight background; the other segments stay dim on
-        // the global background.
+        // Assert: every body cell of the input block (padding included) is
+        // bold on the highlight background; its trailing arrow is the
+        // highlight color pointing onto the global background, reading as
+        // part of the block; the other blocks stay dim throughout.
         for &(zone, start, end) in bar_segments().iter() {
             for x in start..end {
                 let cell = buffer.cell((x, 9)).unwrap();
-                match zone {
-                    StatusZone::Input => {
+                let arrow = x + 1 == end; // the block's trailing `▶`
+                match (zone, arrow) {
+                    (StatusZone::Input, false) => {
                         assert_eq!(cell.bg, theme().status_bar_highlight, "col {x}");
                         assert_eq!(cell.fg, theme().global_bg, "col {x}");
                         assert!(
@@ -2309,18 +2344,38 @@ mod tests {
                             "col {x}"
                         );
                     }
-                    _ => {
+                    (StatusZone::Input, true) => {
+                        assert_eq!(cell.symbol(), "▶", "col {x}");
+                        assert_eq!(cell.fg, theme().status_bar_highlight, "col {x}");
                         assert_eq!(cell.bg, theme().global_bg, "col {x}");
+                    }
+                    _ => {
                         assert_eq!(cell.fg, theme().dim, "col {x}");
+                        if arrow {
+                            // The arrow points onto the following block's
+                            // background: the channel block's arrow sits on
+                            // the highlighted input block, the server
+                            // block's on the plain channel block.
+                            assert_eq!(cell.symbol(), "▶", "col {x}");
+                            let next_highlighted = zone == StatusZone::Channel;
+                            assert_eq!(
+                                cell.bg,
+                                if next_highlighted {
+                                    theme().status_bar_highlight
+                                } else {
+                                    theme().global_bg
+                                },
+                                "col {x}"
+                            );
+                        } else {
+                            assert_eq!(cell.bg, theme().global_bg, "col {x}");
+                        }
                     }
                 }
             }
         }
-        // The `│` separators sit outside every segment's range.
-        for x in [16u16, 31] {
-            assert_eq!(buffer.cell((x, 9)).unwrap().symbol(), "│");
-            assert_eq!(buffer.cell((x, 9)).unwrap().fg, theme().separator);
-        }
+        // Nothing is painted past the last block's arrow.
+        assert_eq!(buffer.cell((42, 9)).unwrap().symbol(), " ");
     }
 
     #[test]
@@ -2354,42 +2409,60 @@ mod tests {
     }
 
     #[test]
-    fn status_bar_zone_hit_testing_matches_the_painted_segments() {
+    fn status_bar_zone_hit_testing_matches_the_painted_blocks() {
         // Arrange: viewing #osu on osu_irc at width 50.
         let app = viewing_app(22, 3);
 
-        // Act / Assert: each painted segment maps to its zone; separators
-        // and columns past the bar map to nothing.
+        // Act / Assert: each painted block maps to its zone — body and
+        // trailing arrow alike — and columns past the last block map to
+        // nothing.
         for &(zone, start, end) in bar_segments().iter() {
             assert_eq!(status_bar_zone_at(&app, 50, start + 1), Some(zone));
-            assert_eq!(status_bar_zone_at(&app, 50, end - 1), Some(zone));
+            assert_eq!(status_bar_zone_at(&app, 50, end - 1), Some(zone)); // the `▶`
         }
-        assert_eq!(status_bar_zone_at(&app, 50, 16), None); // `│`
-        assert_eq!(status_bar_zone_at(&app, 50, 31), None); // `│`
-        assert_eq!(status_bar_zone_at(&app, 50, 49), None); // past the bar
+        assert_eq!(status_bar_zone_at(&app, 50, 42), None); // past the bar
+        assert_eq!(status_bar_zone_at(&app, 50, 49), None);
     }
 
     #[test]
-    fn status_bar_shows_placeholders_before_anything_is_connected() {
+    fn status_bar_hides_blocks_without_a_value_instead_of_placeholders() {
         // Arrange: a fresh app with no buffers (the welcome page).
         let app = App::new(50, 10);
 
         // Act
         let buffer = render_sized(&app, "", 80, 24);
 
-        // Assert: both value segments carry the localized placeholder and
-        // the standing input label; nothing panics and no name shows.
+        // Assert: only the standing input block remains — no server or
+        // channel label, no placeholder, one trailing arrow.
         let bottom = buffer_line(&buffer, 23);
-        assert!(
-            bottom.contains("server not connected"),
-            "bottom: {bottom:?}"
-        );
-        assert!(
-            bottom.contains("channel not connected"),
-            "bottom: {bottom:?}"
-        );
         assert!(bottom.contains("type in"), "bottom: {bottom:?}");
-        assert!(!bottom.contains("osu"), "bottom: {bottom:?}");
+        assert!(bottom.contains('▶'), "bottom: {bottom:?}");
+        assert!(!bottom.contains("server"), "bottom: {bottom:?}");
+        assert!(!bottom.contains("channel"), "bottom: {bottom:?}");
+        assert!(!bottom.contains("not connected"), "bottom: {bottom:?}");
+        // Only the input block's columns are clickable; a server-column
+        // click (where the block would start) is dead space.
+        assert_eq!(status_bar_zone_at(&app, 80, 1), Some(StatusZone::Input));
+        assert_eq!(status_bar_zone_at(&app, 80, 40), None);
+    }
+
+    #[test]
+    fn server_console_view_hides_the_channel_block() {
+        // Arrange: a server console buffer viewed with the composer focused.
+        let mut app = App::new(50, 10);
+        let console = app.open_server("osu_irc");
+        app.activate_buffer(console);
+        app.focus_composer();
+
+        // Act
+        let buffer = render_sized(&app, "", 80, 24);
+
+        // Assert: the server block names the console and the channel block
+        // hides (the server block already identifies it).
+        let bottom = buffer_line(&buffer, 23);
+        assert!(bottom.contains("server osu_irc"), "bottom: {bottom:?}");
+        assert!(bottom.contains("type in"), "bottom: {bottom:?}");
+        assert!(!bottom.contains("channel"), "bottom: {bottom:?}");
     }
 
     #[test]

@@ -113,15 +113,12 @@ const REGISTRY: &[(&str, &str)] = &[
         "query target changed; use /query to select a nickname",
     ),
     // statusbar.* — the bottom status bar's zone labels. The server and
-    // channel segments carry the current buffer's names as {name}; the
-    // input segment is the composer zone's standing label.
+    // channel blocks carry the current buffer's names as {name} and hide
+    // entirely while they have no applicable value; the input block is
+    // the composer zone's standing label.
     ("statusbar.server", "server {name}"),
     ("statusbar.channel", "channel {name}"),
     ("statusbar.input", "type in"),
-    // The channel segment's value while a server console is viewed, and
-    // both value segments' placeholder before anything is connected.
-    ("statusbar.console", "console"),
-    ("statusbar.none", "not connected"),
     // err.send_* — SendError variants, surfaced via status.send_failed.
     (
         "err.send_invalid_characters",
@@ -522,8 +519,6 @@ mod tests {
             ("statusbar.server", "server {name}"),
             ("statusbar.channel", "channel {name}"),
             ("statusbar.input", "type in"),
-            ("statusbar.console", "console"),
-            ("statusbar.none", "not connected"),
             (
                 "err.send_invalid_characters",
                 "message contains an invalid control character",

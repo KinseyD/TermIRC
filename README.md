@@ -181,12 +181,13 @@ on a message pre-highlights it, and a click focuses a pane — clicking a
 channel in the sidebar opens it. While TermIRC runs, hold `Shift` for the
 terminal's own text selection.
 
-A one-line status bar sits at the very bottom: `server <name> │ channel
-<name> │ type in`. The segment matching where your focus is — typing in
-the composer, or navigating server headers vs. channel rows in the
-sidebar — is highlighted, and clicking a segment moves focus to that
-zone. Before anything is connected both value segments show a
-placeholder.
+A one-line status bar sits at the very bottom: `server <name> ▶ channel
+<name> ▶ type in`, the blocks nested arrow-to-tail. The block matching
+where your focus is — typing in the composer, or navigating server
+headers vs. channel rows in the sidebar — is highlighted, and clicking a
+block moves focus to that zone. Blocks without a value hide entirely:
+nothing connected shows only `type in`, and a server console view drops
+the `channel` block.
 
 Inputs beginning with `/` after trimming surrounding whitespace are parsed
 as slash commands in both channels and the server console. Supported
