@@ -3,12 +3,16 @@
 //!
 //! The default language (English) is embedded in [`REGISTRY`] so the catalog
 //! works with no files on disk and the default rendering is byte-identical to
-//! the pre-i18n literals, which the test suite pins. A `[ui] language` other
-//! than `"en"` loads `locales/<language>.toml` (searched beside the binary,
-//! in the working directory, and in the config directory); any missing,
-//! malformed, or partial overlay falls back to the embedded defaults with one
-//! warning per problem, logged when the catalog is initialized — lookups on
-//! the render path never warn and never panic.
+//! the pre-i18n literals, which the test suite pins. Shipped translations are
+//! likewise embedded via [`BUILTIN_LOCALES`] (`include_str!`), so a released
+//! binary needs no locale files at all. A `[ui] language` other than `"en"`
+//! loads the embedded locale when one matches; a `locales/<language>.toml`
+//! file found on the disk search paths (beside the binary, in the working
+//! directory, and in the config directory) OVERRIDES the embedded copy, so
+//! power users can customize a translation without rebuilding. Any unknown,
+//! missing, malformed, or partial overlay falls back to the embedded
+//! defaults with one warning per problem, logged when the catalog is
+//! initialized — lookups on the render path never warn and never panic.
 //!
 //! Templates use named brace parameters (`{server}`), substituted by
 //! [`format`]. An overlay entry is only accepted when its parameter set
@@ -166,6 +170,12 @@ const REGISTRY: &[(&str, &str)] = &[
     ("err.startup_no_servers", "config has no servers"),
     ("err.startup_mouse", "failed to enable mouse capture"),
 ];
+
+/// Shipped translations embedded in the binary with `include_str!`, so a
+/// released binary needs no locale files on disk. Each entry's key set must
+/// exactly equal [`REGISTRY`]'s, which the test suite pins. A locale file
+/// found on the disk search paths overrides the embedded copy.
+const BUILTIN_LOCALES: &[(&str, &str)] = &[("zh-CN", include_str!("../locales/zh-CN.toml"))];
 static CATALOG: OnceLock<Catalog> = OnceLock::new();
 
 /// A validated locale overlay: accepted entries only. Entries are keyed and
@@ -184,6 +194,12 @@ impl Catalog {
     /// error, partial coverage) yields an empty-or-partial catalog plus one
     /// warning per problem for [`init`] to log.
     pub fn load(language: &str) -> (Catalog, Vec<String>) {
+        Self::load_with_roots(language, locale_paths(language))
+    }
+
+    /// [`Self::load`] against explicit roots; the seam tests use to isolate
+    /// the catalog from the real disk search paths.
+    fn load_with_roots(language: &str, paths: Vec<PathBuf>) -> (Catalog, Vec<String>) {
         if language == DEFAULT_LANGUAGE {
             return (Catalog::default(), Vec::new());
         }
@@ -201,8 +217,10 @@ impl Catalog {
                 )],
             );
         }
-        for path in locale_paths(language) {
+        for path in paths {
             match std::fs::read_to_string(&path) {
+                // A file on disk overrides the embedded copy: power users
+                // can customize a shipped translation without rebuilding.
                 Ok(content) => {
                     let (catalog, warnings) = Self::parse(language, &content);
                     return (catalog, warnings);
@@ -218,6 +236,11 @@ impl Catalog {
                     );
                 }
             }
+        }
+        // No file on disk: fall back to the embedded translation when the
+        // language ships with the binary.
+        if let Some((_, content)) = BUILTIN_LOCALES.iter().find(|(tag, _)| *tag == language) {
+            return Self::parse(language, content);
         }
         (
             Catalog::default(),
@@ -735,26 +758,83 @@ missing_key_here = \"x\"
     /// The shipped zh-CN translation must cover the whole registry with no
     /// warnings: every key present, no unknown keys, and every entry's
     /// parameter set matching its default. This is the completeness
-    /// contract that keeps the file from drifting behind the registry.
+    /// contract that keeps the file from drifting behind the registry, and
+    /// it now applies to every [`BUILTIN_LOCALES`] entry the binary embeds.
     #[test]
     fn zh_cn_locale_covers_the_whole_registry_without_warnings() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("locales/zh-CN.toml");
-        let content = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        let (catalog, warnings) = Catalog::parse("zh-CN", &content);
-        assert!(warnings.is_empty(), "zh-CN load warnings: {warnings:?}");
-        for (key, _) in REGISTRY {
-            assert!(catalog.get(key).is_some(), "zh-CN is missing {key}");
+        assert!(!BUILTIN_LOCALES.is_empty(), "at least one builtin locale");
+        for (language, content) in BUILTIN_LOCALES {
+            let (catalog, warnings) = Catalog::parse(language, content);
             assert!(
-                !catalog.get(key).is_some_and(str::is_empty),
-                "zh-CN has empty text for {key}"
+                warnings.is_empty(),
+                "{language} load warnings: {warnings:?}"
             );
+            for (key, _) in REGISTRY {
+                assert!(catalog.get(key).is_some(), "{language} is missing {key}");
+                assert!(
+                    !catalog.get(key).is_some_and(str::is_empty),
+                    "{language} has empty text for {key}"
+                );
+            }
         }
         // The loader must also find the file through its real search path
         // (cargo runs tests from the package root, where locales/ lives).
         let (loaded, load_warnings) = Catalog::load("zh-CN");
         assert!(load_warnings.is_empty(), "load warnings: {load_warnings:?}");
         assert!(loaded.get("sys.connected").is_some());
+    }
+
+    /// A released binary ships without locale files: the embedded zh-CN
+    /// must activate even when every disk search root is empty, with no
+    /// warning at all.
+    #[test]
+    fn embedded_locale_activates_without_any_disk_file() {
+        let empty = std::env::temp_dir().join(format!("termirc-i18n-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&empty); // deliberately nonexistent
+        let (catalog, warnings) =
+            Catalog::load_with_roots("zh-CN", vec![empty.join("locales").join("zh-CN.toml")]);
+        assert!(warnings.is_empty(), "embedded load warnings: {warnings:?}");
+        assert_eq!(catalog.get("sys.connected"), Some("已连接到 {server}"));
+        assert_eq!(
+            catalog.get("cmd.join"),
+            Some("加入或聚焦当前服务器上的频道")
+        );
+    }
+
+    /// A locale file on a disk search path overrides the embedded copy for
+    /// the same language: on-disk files are per-install customization, not
+    /// a requirement.
+    #[test]
+    fn disk_locale_file_overrides_the_embedded_copy() {
+        let dir = std::env::temp_dir().join(format!("termirc-i18n-ovr-{}", std::process::id()));
+        let locales = dir.join("locales");
+        std::fs::create_dir_all(&locales).unwrap();
+        let customized = BUILTIN_LOCALES
+            .iter()
+            .find(|(tag, _)| *tag == "zh-CN")
+            .map(|(_, content)| {
+                content.replace(
+                    "connected = \"已连接到 {server}\"",
+                    "connected = \"已连接到服务器 {server}\"",
+                )
+            })
+            .unwrap();
+        std::fs::write(locales.join("zh-CN.toml"), customized).unwrap();
+
+        let (catalog, warnings) =
+            Catalog::load_with_roots("zh-CN", vec![locales.join("zh-CN.toml")]);
+        assert!(warnings.is_empty(), "override load warnings: {warnings:?}");
+        assert_eq!(
+            catalog.get("sys.connected"),
+            Some("已连接到服务器 {server}")
+        );
+        // Every other key still comes from the (customized copy of the)
+        // file, and unknown text cannot appear out of nowhere.
+        assert_eq!(
+            catalog.get("cmd.join"),
+            Some("加入或聚焦当前服务器上的频道")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Translated templates substitute parameters exactly like the defaults:

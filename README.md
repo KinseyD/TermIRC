@@ -100,12 +100,15 @@ An optional `[ui]` table selects the interface language:
 
 | Key        | Required | Default | Meaning                              |
 |------------|----------|---------|--------------------------------------|
-| `language` | no       | `"en"`  | UI language tag; loads `locales/<language>.toml` |
+| `language` | no       | `"en"`  | UI language tag; shipped translations are built in |
 
-`"en"` uses the built-in English strings and loads no file. Any other tag
-loads a translation overlay from `locales/<language>.toml`, searched beside
-the `termirc` binary, in the working directory, and in
-`~/.config/termirc/locales/`. A missing file, missing entries, or entries
+`"en"` uses the built-in English strings and loads no file. Shipped
+translations (currently zh-CN) are built into the binary and need no files
+either. A `locales/<language>.toml` file found on the search paths — beside
+the `termirc` binary, in the working directory, or in
+`~/.config/termirc/locales/` — overrides the built-in copy, so per-install
+customization is possible without rebuilding. A missing file, missing
+entries, or entries
 whose `{placeholders}` do not match the English originals fall back to the
 built-in text for just those entries, with one warning per problem in the
 log — a broken locale never keeps TermIRC from starting. Log output and the
