@@ -29,9 +29,9 @@ pub const DEFAULT_LANGUAGE: &str = "en";
 
 /// Every translatable string as `(key, default text)`, grouped by surface
 /// (`cmd.` hint descriptions, `hint.` chrome, `sys.` system notes, `status.`
-/// composer status, `err.` errors). The order is the canonical key order and
-/// must stay grouped and stable: missing-key warnings and the completeness
-/// test report keys in it.
+/// composer status, `statusbar.` the bottom status bar, `err.` errors).
+/// The order is the canonical key order and must stay grouped and stable:
+/// missing-key warnings and the completeness test report keys in it.
 const REGISTRY: &[(&str, &str)] = &[
     // cmd.* — the slash-command hint bar descriptions, one per command name.
     ("cmd.join", "Join or focus a channel on the current server"),
@@ -112,6 +112,16 @@ const REGISTRY: &[(&str, &str)] = &[
         "status.query_target_changed",
         "query target changed; use /query to select a nickname",
     ),
+    // statusbar.* — the bottom status bar's zone labels. The server and
+    // channel segments carry the current buffer's names as {name}; the
+    // input segment is the composer zone's standing label.
+    ("statusbar.server", "server {name}"),
+    ("statusbar.channel", "channel {name}"),
+    ("statusbar.input", "type in"),
+    // The channel segment's value while a server console is viewed, and
+    // both value segments' placeholder before anything is connected.
+    ("statusbar.console", "console"),
+    ("statusbar.none", "not connected"),
     // err.send_* — SendError variants, surfaced via status.send_failed.
     (
         "err.send_invalid_characters",
@@ -509,6 +519,11 @@ mod tests {
                 "status.query_target_changed",
                 "query target changed; use /query to select a nickname",
             ),
+            ("statusbar.server", "server {name}"),
+            ("statusbar.channel", "channel {name}"),
+            ("statusbar.input", "type in"),
+            ("statusbar.console", "console"),
+            ("statusbar.none", "not connected"),
             (
                 "err.send_invalid_characters",
                 "message contains an invalid control character",

@@ -1,5 +1,5 @@
 //! Terminal event dispatch; application submission has no terminal dependencies.
-use super::{App, Focus, mouse, render as ui};
+use super::{App, Focus, StatusZone, mouse, render as ui};
 use crate::{
     application::submit_composer,
     config::Config,
@@ -250,6 +250,16 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, term_size: (u16, u16)) {
             },
             mouse::MouseTarget::MessageBlank => app.focus_messages(),
             mouse::MouseTarget::Composer => app.focus_composer(),
+            mouse::MouseTarget::StatusBar => {
+                // Clicking a segment focuses its zone: the sidebar on the
+                // matching row for server/channel, the composer for input.
+                match ui::status_bar_zone_at(app, term_size.0, mouse.column) {
+                    Some(StatusZone::Server) => app.focus_sidebar_server(),
+                    Some(StatusZone::Channel) => app.focus_sidebar_channel(),
+                    Some(StatusZone::Input) => app.focus_composer(),
+                    None => {}
+                }
+            }
             mouse::MouseTarget::None => {}
         },
         _ => {}
@@ -286,17 +296,17 @@ mod tests {
 
     #[test]
     fn sidebar_wheel_hover_and_click_use_visible_offset() {
-        let mut app = App::new(40, 3);
+        let mut app = App::new(40, 5);
         app.open_server("srv");
         let mut queries = Vec::new();
         for index in 0..8 {
             queries.push(app.open_query("srv", &format!("nick{index}")));
         }
-        fit_app(&mut app, (70, 3));
+        fit_app(&mut app, (70, 5));
         handle_mouse(
             &mut app,
             sidebar_mouse(MouseEventKind::ScrollDown, 1),
-            (70, 3),
+            (70, 5),
         );
         assert_eq!(app.sidebar_scroll_offset(), 3);
         assert_eq!(app.sidebar_hovered(), Some(4));
@@ -305,24 +315,24 @@ mod tests {
         handle_mouse(
             &mut app,
             sidebar_mouse(MouseEventKind::Down(MouseButton::Left), 1),
-            (70, 3),
+            (70, 5),
         );
         assert_eq!(app.active_buffer().unwrap().id, queries[3]);
         assert_eq!(app.focus(), Focus::Composer);
         handle_mouse(
             &mut app,
             sidebar_mouse(MouseEventKind::ScrollDown, 2),
-            (70, 3),
+            (70, 5),
         );
-        assert_eq!(app.sidebar_scroll_offset(), 6);
-        assert_eq!(app.sidebar_hovered(), Some(8));
+        assert_eq!(app.sidebar_scroll_offset(), 5);
+        assert_eq!(app.sidebar_hovered(), Some(7));
         handle_mouse(
             &mut app,
             sidebar_mouse(MouseEventKind::ScrollUp, 0),
-            (70, 3),
+            (70, 5),
         );
-        assert_eq!(app.sidebar_scroll_offset(), 3);
-        assert_eq!(app.sidebar_hovered(), Some(3));
+        assert_eq!(app.sidebar_scroll_offset(), 2);
+        assert_eq!(app.sidebar_hovered(), Some(2));
     }
 
     #[test]
@@ -343,6 +353,42 @@ mod tests {
         fit_app(&mut app, (70, 10));
         assert!(app.is_at_bottom());
         assert!(!app.buffer(query).unwrap().unread);
+    }
+
+    #[test]
+    fn status_bar_segment_clicks_focus_their_zones() {
+        // Arrange: viewing #a on srv at 70x10; the bar reads
+        // ` server srv │ channel #a │ type in ` on row 9.
+        let mut app = App::new(70, 10);
+        app.open_channel("srv", "#a");
+        app.select_buffer(0);
+        app.focus_composer();
+        let bar_click = |column: u16| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row: 9,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        // Act / Assert: the input segment keeps the composer focused.
+        handle_mouse(&mut app, bar_click(30), (70, 10));
+        assert_eq!(app.focus(), Focus::Composer);
+
+        // The server segment focuses the sidebar on the server header row.
+        handle_mouse(&mut app, bar_click(1), (70, 10));
+        assert_eq!(app.focus(), Focus::Sidebar);
+        assert_eq!(app.sidebar_cursor(), Some(0));
+        assert_eq!(app.status_zone(), StatusZone::Server);
+
+        // The channel segment moves the cursor to the buffer row.
+        handle_mouse(&mut app, bar_click(15), (70, 10));
+        assert_eq!(app.sidebar_cursor(), Some(1));
+        assert_eq!(app.status_zone(), StatusZone::Channel);
+
+        // A separator column is dead space: nothing changes.
+        handle_mouse(&mut app, bar_click(13), (70, 10));
+        assert_eq!(app.sidebar_cursor(), Some(1));
+        assert_eq!(app.status_zone(), StatusZone::Channel);
     }
 
     /// Press one key with no modifiers; returns the relayout flag.

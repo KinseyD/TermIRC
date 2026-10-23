@@ -7,7 +7,8 @@
 A terminal IRC client written in Rust. TermIRC reads your servers from a
 TOML config file, opens one connection per server — joining every
 configured channel — and gives you a scrollable chat pane, a
-server/channel sidebar, and a composer to talk with. `Enter` sends.
+server/channel sidebar, a composer to talk with, and a focus-aware
+status bar along the bottom. `Enter` sends.
 
 ## Requirements
 
@@ -133,8 +134,9 @@ The most useful roles:
 | `status_ok`         | `green`     | connected server dot            |
 
 The remaining roles (`dim`, `accent_dim`, `hover_bg`, `sidebar_cursor_bg`,
-`input_cursor_fg`, `input_cursor_bg`, `status_err`, `status_pending`) follow
-the same rules; see the commented example in `config.example.toml`.
+`input_cursor_fg`, `input_cursor_bg`, `status_err`, `status_pending`,
+`status_bar_highlight`) follow the same rules; see the commented example in
+`config.example.toml`.
 
 Security notes:
 
@@ -178,6 +180,13 @@ The mouse works too: the wheel scrolls the messages, resting the pointer
 on a message pre-highlights it, and a click focuses a pane — clicking a
 channel in the sidebar opens it. While TermIRC runs, hold `Shift` for the
 terminal's own text selection.
+
+A one-line status bar sits at the very bottom: `server <name> │ channel
+<name> │ type in`. The segment matching where your focus is — typing in
+the composer, or navigating server headers vs. channel rows in the
+sidebar — is highlighted, and clicking a segment moves focus to that
+zone. Before anything is connected both value segments show a
+placeholder.
 
 Inputs beginning with `/` after trimming surrounding whitespace are parsed
 as slash commands in both channels and the server console. Supported

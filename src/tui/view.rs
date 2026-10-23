@@ -53,6 +53,18 @@ pub enum Focus {
     Messages,
     Composer,
 }
+
+/// One zone of the bottom status bar. The three zones mirror where focus
+/// can effectively be: navigating servers (the sidebar's server headers),
+/// navigating channels/queries (the sidebar's buffer rows and the message
+/// pane they feed), and typing in the composer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusZone {
+    Server,
+    Channel,
+    Input,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarRow {
     pub server: String,
@@ -423,6 +435,54 @@ impl App {
     pub fn focus_composer(&mut self) {
         self.focus = Focus::Composer;
     }
+
+    /// The status-bar zone the current focus highlights: the composer maps
+    /// to the input zone, the message pane to the channel zone (it shows
+    /// the active buffer's stream), and the sidebar to whichever row its
+    /// cursor is on — a server header highlights the server zone, any
+    /// buffer row the channel zone. An empty sidebar defaults to server.
+    pub fn status_zone(&self) -> StatusZone {
+        match self.focus {
+            Focus::Composer => StatusZone::Input,
+            Focus::Messages => StatusZone::Channel,
+            Focus::Sidebar => {
+                let rows = self.sidebar_rows();
+                match self.sidebar_cursor.and_then(|index| rows.get(index)) {
+                    Some(row) if row.kind == BufferKind::Server => StatusZone::Server,
+                    Some(_) => StatusZone::Channel,
+                    None => StatusZone::Server,
+                }
+            }
+        }
+    }
+
+    /// Focus the sidebar with its cursor on the active server's header row
+    /// (the status bar's server-zone click). A no-op with no active buffer.
+    pub fn focus_sidebar_server(&mut self) {
+        let Some(buffer) = self.active_buffer() else {
+            return;
+        };
+        let rows = self.sidebar_rows();
+        let Some(index) = rows
+            .iter()
+            .position(|row| row.kind == BufferKind::Server && row.server == buffer.server_label)
+        else {
+            return;
+        };
+        self.set_sidebar_cursor(index);
+        self.focus = Focus::Sidebar;
+    }
+
+    /// Focus the sidebar with its cursor on the active buffer's row (the
+    /// status bar's channel-zone click). A no-op with an empty sidebar.
+    pub fn focus_sidebar_channel(&mut self) {
+        if self.sidebar_rows().is_empty() {
+            return;
+        }
+        self.set_sidebar_cursor(self.active_sidebar_row());
+        self.focus = Focus::Sidebar;
+    }
+
     pub fn tab(&mut self) {
         self.focus = match self.focus {
             Focus::Composer => {
