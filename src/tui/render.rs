@@ -943,12 +943,13 @@ pub fn status_bar_zone_at(app: &App, width: u16, x: u16) -> Option<StatusZone> {
 }
 
 /// Render the bottom status bar: one block per zone with a value, each
-/// ending in the full-height powerline arrow whose foreground is the
-/// block's own fill and whose background is the block to its right (the
-/// screen's background when there is none) — so consecutive blocks
-/// interlock arrow-to-tail and a highlighted block's arrow reads as part
-/// of it. All colors come from existing roles: the arrow needs no
-/// separate one. Rendered on every page, including the welcome logo.
+/// ending in the full-height powerline arrow drawn in the CURRENT block's
+/// background color, on the background of the block to its right (the
+/// screen's background when there is none) — powerline semantics, so the
+/// divider only shows where a colored block follows and a highlighted
+/// block's arrow reads as part of it. All colors come from existing
+/// roles: the arrow needs no separate one. Rendered on every page,
+/// including the welcome logo.
 fn render_status_bar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     if area.is_empty() {
         return;
@@ -967,8 +968,11 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             Style::new().fg(theme.dim).bg(theme.global_bg)
         };
         spans.push(Span::styled(body.clone(), style));
-        // The right-edge arrow: the block's fill color in the foreground,
-        // the following block's background (or the screen's) behind it.
+        // The right-edge arrow: the current block's own background in the
+        // foreground, the following block's background (or the screen's)
+        // behind it. Powerline semantics: a divider only shows where a
+        // colored block follows, and a plain-on-plain arrow blends into
+        // the global background.
         let arrow_bg = segments
             .get(i + 1)
             .map_or(theme.global_bg, |&(next, _, _, _)| {
@@ -978,15 +982,14 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                     theme.global_bg
                 }
             });
+        let block_bg = if highlighted_here {
+            theme.status_bar_highlight
+        } else {
+            theme.global_bg
+        };
         spans.push(Span::styled(
             STATUS_BAR_ARROW,
-            Style::new()
-                .fg(if highlighted_here {
-                    theme.status_bar_highlight
-                } else {
-                    theme.dim
-                })
-                .bg(arrow_bg),
+            Style::new().fg(block_bg).bg(arrow_bg),
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -2336,9 +2339,11 @@ mod tests {
         let buffer = render_sized(&app, "", 50, 10);
 
         // Assert: every body cell of the input block (padding included) is
-        // bold on the highlight background; its trailing arrow is the
-        // highlight color pointing onto the global background, reading as
-        // part of the block; the other blocks stay dim throughout.
+        // bold on the highlight background; its trailing arrow is drawn in
+        // that same background color pointing onto the global background,
+        // reading as part of the block; the plain blocks keep dim text and
+        // arrows in the global background color (invisible until a colored
+        // block follows them).
         for &(zone, start, end) in bar_segments().iter() {
             for x in start..end {
                 let cell = buffer.cell((x, 9)).unwrap();
@@ -2358,13 +2363,15 @@ mod tests {
                         assert_eq!(cell.bg, theme().global_bg, "col {x}");
                     }
                     _ => {
-                        assert_eq!(cell.fg, theme().dim, "col {x}");
                         if arrow {
-                            // The arrow points onto the following block's
-                            // background: the channel block's arrow sits on
-                            // the highlighted input block, the server
-                            // block's on the plain channel block.
+                            // The arrow's foreground is the current block's
+                            // background (global bg for plain blocks); its
+                            // background is the following block's: the
+                            // channel block's arrow sits on the highlighted
+                            // input block, the server block's on the plain
+                            // channel block.
                             assert_eq!(cell.symbol(), STATUS_BAR_ARROW, "col {x}");
+                            assert_eq!(cell.fg, theme().global_bg, "col {x}");
                             let next_highlighted = zone == StatusZone::Channel;
                             assert_eq!(
                                 cell.bg,
@@ -2376,6 +2383,7 @@ mod tests {
                                 "col {x}"
                             );
                         } else {
+                            assert_eq!(cell.fg, theme().dim, "col {x}");
                             assert_eq!(cell.bg, theme().global_bg, "col {x}");
                         }
                     }
