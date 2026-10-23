@@ -177,7 +177,14 @@ impl MockSession {
     }
 
     fn receive_until(&mut self, predicate: impl Fn(&IrcEvent) -> bool) -> Vec<IrcEvent> {
-        let deadline = Instant::now() + WAIT;
+        self.receive_until_deadline(Instant::now() + WAIT, predicate)
+    }
+
+    fn receive_until_deadline(
+        &mut self,
+        deadline: Instant,
+        predicate: impl Fn(&IrcEvent) -> bool,
+    ) -> Vec<IrcEvent> {
         let mut received = Vec::new();
         loop {
             let event = self
@@ -195,8 +202,14 @@ impl MockSession {
     }
 
     fn sync_events(&mut self) -> Vec<IrcEvent> {
+        self.sync_events_with_wait(WAIT)
+    }
+
+    fn sync_events_with_wait(&mut self, wait: Duration) -> Vec<IrcEvent> {
+        let deadline = Instant::now() + wait;
         self.send(":mock NOTICE * :event-barrier\r\n");
-        self.receive_until(
+        self.receive_until_deadline(
+            deadline,
             |event| matches!(event, IrcEvent::Message(message) if message.content.text == "event-barrier"),
         )
     }
@@ -373,11 +386,13 @@ fn join_failures_keep_intent_and_route_once_only_for_known_channels() {
     for code in codes {
         session.control(ConnectionCommand::Join("#runtime".into()));
         assert_eq!(session.wire(), ["JOIN #runtime"]);
-        session.sync_events();
+        // macOS runners are slow; deadline flaked in CI run 39726681637
+        session.sync_events_with_wait(Duration::from_secs(10));
         session.send(&format!(
             ":mock {code} test #RUNTIME :Join denied\r\n:mock {code} test #unknown :Unknown channel\r\n"
         ));
-        let events = session.sync_events();
+        // macOS runners are slow; deadline flaked in CI run 39726681637
+        let events = session.sync_events_with_wait(Duration::from_secs(10));
         assert_eq!(
             events
                 .iter()
