@@ -7,19 +7,32 @@ use termirc::tui::App;
 fn main() -> anyhow::Result<()> {
     install_panic_hook();
 
-    let home = dirs::home_dir().context("could not resolve the home directory")?;
+    let home = dirs::home_dir().context(termirc::i18n::t("err.startup_home"))?;
     let config_path = home.join(".config").join("termirc").join("config.toml");
     let logs_dir = home.join(".config").join("termirc").join("logs");
     // Logging failures are not fatal: run without logs rather than not run.
+    // Deliberately not localized: logging starts before the configuration
+    // exists, so the language preference is unknowable here.
     if let Err(e) = termirc::logging::init(&logs_dir) {
         eprintln!("logging disabled: {e:#}");
     }
+    // The locale initializes from the same file that is about to load, so
+    // config validation errors render in the configured language whenever
+    // the file can be read at all (and English otherwise — the catalog's
+    // built-in fallback). The catalog falls back to the embedded defaults
+    // for any language whose file is absent or incomplete, warning once per
+    // problem, so a broken locale can never keep the client from starting.
+    let ui = termirc::config::load_ui(&config_path);
+    termirc::i18n::init(&ui.language);
     let config = match Config::load(&config_path) {
         Ok(config) => config,
         Err(e) => {
-            let e = e.context(format!(
-                    "failed to load config from {} - copy your config file there (e.g. config.example.toml)",
-                config_path.display()
+            // Deliberately not localized either: a failure here means the
+            // config file could not be read or parsed, in which case the
+            // language selection inside it is unknowable.
+            let e = e.context(termirc::i18n::format(
+                termirc::i18n::t("err.startup_config_load"),
+                &[("path", &config_path.display().to_string())],
             ));
             // Log the top-level context only: the toml error chain embeds
             // the raw offending source line, which could persist a
@@ -28,15 +41,9 @@ fn main() -> anyhow::Result<()> {
             return Err(e);
         }
     };
-    let ui = termirc::config::load_ui(&config_path);
-    // Localize before anything user-visible can print or render. The
-    // catalog falls back to the embedded defaults for any language whose
-    // file is absent or incomplete, warning once per problem, so a broken
-    // locale can never keep the client from starting.
-    termirc::i18n::init(&ui.language);
     if config.first_server().is_none() {
         tracing::error!("config has no servers");
-        anyhow::bail!("config has no servers");
+        anyhow::bail!("{}", termirc::i18n::t("err.startup_no_servers"));
     }
     tracing::info!(
         "termirc v{} starting; config={}; servers={}",
@@ -54,7 +61,7 @@ fn main() -> anyhow::Result<()> {
     };
     if ratatui::crossterm::execute!(std::io::stdout(), EnableMouseCapture).is_err() {
         ratatui::restore();
-        anyhow::bail!("failed to enable mouse capture");
+        anyhow::bail!("{}", termirc::i18n::t("err.startup_mouse"));
     }
     let result = run(&mut terminal, &config);
     let _ = ratatui::crossterm::execute!(std::io::stdout(), DisableMouseCapture);

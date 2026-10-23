@@ -35,6 +35,13 @@ retention_days = 7
 # to every server, "server/name" to one server.
 exclude = ["#overflow", "libera/#huge"]
 
+# Interface language (optional). A tag other than "en" loads a translation
+# overlay from locales/<language>.toml (searched beside the binary, in the
+# working directory, and in ~/.config/termirc/locales/). Missing entries fall
+# back to the built-in English text, so an incomplete translation is safe.
+[ui]
+language = "en"
+
 # Color theme (optional). Each key below is one of the renderer's color roles;
 # values are named ANSI-16 colors ("black", "red", ..., "white",
 # "bright-black", ..., "bright-white"), 256-color indices (0-255), or

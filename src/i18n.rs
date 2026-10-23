@@ -164,16 +164,8 @@ const REGISTRY: &[(&str, &str)] = &[
         "failed to load config from {path} - copy your config file there (e.g. config.example.toml)",
     ),
     ("err.startup_no_servers", "config has no servers"),
-    (
-        "err.startup_terminal",
-        "failed to initialize terminal: {error}",
-    ),
     ("err.startup_mouse", "failed to enable mouse capture"),
 ];
-
-/// The process-wide overlay, set once by [`init`] before the TUI starts.
-/// Unit tests never initialize it, so `t` keeps returning the embedded
-/// defaults there — which is exactly the byte-identity the suite asserts.
 static CATALOG: OnceLock<Catalog> = OnceLock::new();
 
 /// A validated locale overlay: accepted entries only. Entries are keyed and
@@ -547,10 +539,6 @@ mod tests {
                 "failed to load config from {path} - copy your config file there (e.g. config.example.toml)",
             ),
             ("err.startup_no_servers", "config has no servers"),
-            (
-                "err.startup_terminal",
-                "failed to initialize terminal: {error}",
-            ),
             ("err.startup_mouse", "failed to enable mouse capture"),
         ];
         assert_eq!(REGISTRY.len(), pinned.len(), "registry and pin table sizes");

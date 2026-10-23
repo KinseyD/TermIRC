@@ -665,7 +665,10 @@ pub fn submit_composer(
     let Some(submission) = session.prepare_input() else {
         if session.active_buffer().is_some() && session.input().trim().is_empty() {
             if invalid_characters {
-                *status = format!("failed to send ({})", SendError::InvalidCharacters);
+                *status = i18n::format(
+                    i18n::t("status.send_failed"),
+                    &[("reason", &SendError::InvalidCharacters.to_string())],
+                );
             } else {
                 session.clear_input();
             }
@@ -717,7 +720,10 @@ pub fn submit_composer(
         encode_outgoing(&outgoing).map(|_| ())
     };
     if let Err(error) = validation {
-        *status = format!("failed to send ({error})");
+        *status = i18n::format(
+            i18n::t("status.send_failed"),
+            &[("reason", &error.to_string())],
+        );
         return SubmissionEffect::None;
     }
     if let OutgoingMessage::Raw { line, .. } = &outgoing {
@@ -750,7 +756,10 @@ pub fn submit_composer(
                 };
             }
             Err(error) => {
-                *status = format!("failed to send ({error})");
+                *status = i18n::format(
+                    i18n::t("status.send_failed"),
+                    &[("reason", &error.to_string())],
+                );
                 return SubmissionEffect::None;
             }
             Ok(None) => {}
@@ -775,7 +784,7 @@ pub fn submit_composer(
         .active_buffer()
         .is_some_and(|buffer| buffer.send_blocked)
     {
-        *status = "query target changed; use /query to select a nickname".into();
+        *status = i18n::t("status.query_target_changed").to_string();
         return SubmissionEffect::None;
     }
     let ready = session.connection_state(&server, None) == ConnectionState::Connected
@@ -815,7 +824,10 @@ pub fn submit_composer(
         session.clear_input();
     } else {
         tracing::warn!("send failed on {server}: disconnected or busy");
-        *status = format!("failed to send ({server} disconnected or busy)");
+        *status = i18n::format(
+            i18n::t("status.send_failed_disconnected"),
+            &[("server", server.as_str())],
+        );
     }
     SubmissionEffect::None
 }
@@ -1044,7 +1056,10 @@ impl Composer<'_> {
             line,
         };
         encode_outgoing(&outgoing).map_err(|error| {
-            *self.status = format!("failed to send ({error})");
+            *self.status = i18n::format(
+                i18n::t("status.send_failed"),
+                &[("reason", &error.to_string())],
+            );
             "message_rejected"
         })?;
         handle
@@ -1080,7 +1095,10 @@ impl Composer<'_> {
             text: wire_text,
         };
         encode_outgoing(&outgoing).map_err(|error| {
-            *self.status = format!("failed to send ({error})");
+            *self.status = i18n::format(
+                i18n::t("status.send_failed"),
+                &[("reason", &error.to_string())],
+            );
             "message_rejected"
         })?;
         let ready = self.session.connection_state(server, None) == ConnectionState::Connected
@@ -1093,7 +1111,10 @@ impl Composer<'_> {
             .find(|(name, _)| name.eq_ignore_ascii_case(server))
             .map(|(_, handle)| handle);
         if !ready || handle.is_none_or(|handle| handle.outgoing.try_send(outgoing).is_err()) {
-            *self.status = format!("failed to send ({server} disconnected or busy)");
+            *self.status = i18n::format(
+                i18n::t("status.send_failed_disconnected"),
+                &[("server", server)],
+            );
             tracing::warn!("send failed on {server}: disconnected or busy");
             return Err("disconnected_or_busy");
         }
