@@ -104,6 +104,13 @@ fn run(terminal: &mut ratatui::DefaultTerminal, config: &Config) -> anyhow::Resu
     }
     drop(tx);
 
+    let app = assemble_session(config);
+    termirc::tui::events::run(terminal, config, app, outgoing, rx)
+}
+
+/// Build the application session exactly as startup does, without spawning
+/// workers: `run()` assembles it so tests can pin the startup invariants.
+fn assemble_session(config: &Config) -> App {
     let mut app = App::new(1, 1);
     // Persistence is opt-in: assemble the sink from configuration the same
     // way logging is, and run without history rather than not run.
@@ -119,5 +126,58 @@ fn run(terminal: &mut ratatui::DefaultTerminal, config: &Config) -> anyhow::Resu
     // raw commands are composed. Registering after the optional
     // `Session::with_persist` swap keeps the buffers on the live session.
     app.session.register_config(config);
-    termirc::tui::events::run(terminal, config, app, outgoing, rx)
+    app
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn assembled_session_opens_a_console_buffer_for_every_configured_server() {
+        // Arrange: two servers, TOML-free via the same parse entry point the
+        // config tests use, so this pins `register_config` in startup itself.
+        let config = Config::parse(
+            r##"
+[servers.alpha]
+username="me"
+nickname="me"
+password=""
+server="localhost"
+port=6667
+channels=[]
+
+[servers.beta]
+username="me"
+nickname="me"
+password=""
+server="localhost"
+port=6667
+channels=[]
+"##,
+        )
+        .unwrap();
+
+        // Act
+        let mut app = assemble_session(&config);
+
+        // Assert: one `BufferKind::Server` console per configured server id,
+        // matching what `run()` used to set up inline before the first
+        // worker event arrives.
+        assert_eq!(
+            app.session.buffer_count(),
+            config.servers.len(),
+            "each configured server gets exactly one buffer"
+        );
+        for name in ["alpha", "beta"] {
+            let found = (0..app.session.buffer_count()).any(|index| {
+                app.session.select_buffer(index);
+                app.session.active_buffer().is_some_and(|buffer| {
+                    buffer.server == termirc::core::ServerId::new(name)
+                        && buffer.kind == termirc::core::BufferKind::Server
+                })
+            });
+            assert!(found, "no console buffer registered for {name}");
+        }
+    }
 }
