@@ -35,10 +35,12 @@ retention_days = 7
 # to every server, "server/name" to one server.
 exclude = ["#overflow", "libera/#huge"]
 
-# Interface language (optional). A tag other than "en" loads a translation
-# overlay from locales/<language>.toml (searched beside the binary, in the
-# working directory, and in ~/.config/termirc/locales/). Missing entries fall
-# back to the built-in English text, so an incomplete translation is safe.
+# Interface language (optional). "en" uses the built-in English strings.
+# Shipped translations (currently zh-CN) are built into the binary and need
+# no files. An optional locales/<language>.toml file (searched beside the
+# binary, in the working directory, and in ~/.config/termirc/locales/)
+# overrides the built-in copy for that language. Missing entries fall back
+# to the built-in English text, so an incomplete translation is safe.
 [ui]
 language = "en"
 
