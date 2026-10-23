@@ -13,6 +13,7 @@ use crate::core::{
     ServerId,
 };
 use crate::history::{HistoryChange, HistoryStore};
+use crate::i18n;
 use crate::protocol::{
     SendError, action_display, channel_control_from_raw, encode_outgoing, validate_control,
 };
@@ -205,12 +206,21 @@ impl Session {
             }
         }
         if let Some(cutoff) = cutoff {
-            let noun = if restored == 1 { "message" } else { "messages" };
+            // Two catalog keys stand in for a plural rule: the count picks
+            // the form and the default values render exactly the historical
+            // singular/plural wording.
+            let key = if restored == 1 {
+                "sys.restored_one"
+            } else {
+                "sys.restored_many"
+            };
+            let cutoff = crate::persist::format_cutoff(cutoff);
+            let count = restored.to_string();
             let _ = self.history.append(
                 id,
-                MessageContent::system(format!(
-                    "Restored {restored} {noun} through {}",
-                    crate::persist::format_cutoff(cutoff)
+                MessageContent::system(i18n::format(
+                    i18n::t(key),
+                    &[("n", count.as_str()), ("cutoff", cutoff.as_str())],
                 )),
             );
         }
@@ -499,15 +509,17 @@ impl Session {
             }
         }
         let note = match (previous, connection) {
-            (_, ConnectionState::Connected) if previous != ConnectionState::Connected => {
-                Some(format!("Connected to {label}"))
-            }
-            (ConnectionState::Connected, ConnectionState::Connecting) => {
-                Some(format!("Connection lost, reconnecting to {label}"))
-            }
-            (ConnectionState::Connected, ConnectionState::Stopped) => {
-                Some(format!("Disconnected from {label}"))
-            }
+            (_, ConnectionState::Connected) if previous != ConnectionState::Connected => Some(
+                i18n::format(i18n::t("sys.connected"), &[("server", label.as_str())]),
+            ),
+            (ConnectionState::Connected, ConnectionState::Connecting) => Some(i18n::format(
+                i18n::t("sys.connection_lost"),
+                &[("server", label.as_str())],
+            )),
+            (ConnectionState::Connected, ConnectionState::Stopped) => Some(i18n::format(
+                i18n::t("sys.disconnected"),
+                &[("server", label.as_str())],
+            )),
             _ => None,
         };
         if let Some(text) = note {

@@ -6,6 +6,7 @@ use crate::{
     config::ServerConfig,
     connection::{ConnectionState, IrcEvent, RetryPolicy, build_client_config},
     core::{ConnectionCommand, OutgoingMessage},
+    i18n,
     protocol::{channel_control_from_raw, decode_message, encode_outgoing, validate_control},
 };
 use futures_util::StreamExt;
@@ -357,7 +358,17 @@ async fn session(
                     Command::PART(channel, _) if own_message(&message, &server.nickname) => channels.left(channel, false),
                     Command::KICK(channel, nick, reason) if nick.eq_ignore_ascii_case(&server.nickname) => {
                         channels.left(channel, true);
-                        channels.notice(channel, format!("Kicked from {channel}: {}", reason.as_deref().unwrap_or("no reason given")));
+                        let note = match reason.as_deref() {
+                            Some(reason) => i18n::format(
+                                i18n::t("sys.kicked"),
+                                &[("channel", channel.as_str()), ("reason", reason)],
+                            ),
+                            None => i18n::format(
+                                i18n::t("sys.kicked_no_reason"),
+                                &[("channel", channel.as_str())],
+                            ),
+                        };
+                        channels.notice(channel, note);
                     },
                     Command::Response(response, args) => {
                         if let Some(channel) = args.get(1) { channels.error(*response as u16, channel); }
