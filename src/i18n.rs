@@ -731,4 +731,51 @@ missing_key_here = \"x\"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// The shipped zh-CN translation must cover the whole registry with no
+    /// warnings: every key present, no unknown keys, and every entry's
+    /// parameter set matching its default. This is the completeness
+    /// contract that keeps the file from drifting behind the registry.
+    #[test]
+    fn zh_cn_locale_covers_the_whole_registry_without_warnings() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("locales/zh-CN.toml");
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let (catalog, warnings) = Catalog::parse("zh-CN", &content);
+        assert!(warnings.is_empty(), "zh-CN load warnings: {warnings:?}");
+        for (key, _) in REGISTRY {
+            assert!(catalog.get(key).is_some(), "zh-CN is missing {key}");
+            assert!(
+                !catalog.get(key).is_some_and(str::is_empty),
+                "zh-CN has empty text for {key}"
+            );
+        }
+        // The loader must also find the file through its real search path
+        // (cargo runs tests from the package root, where locales/ lives).
+        let (loaded, load_warnings) = Catalog::load("zh-CN");
+        assert!(load_warnings.is_empty(), "load warnings: {load_warnings:?}");
+        assert!(loaded.get("sys.connected").is_some());
+    }
+
+    /// Translated templates substitute parameters exactly like the defaults:
+    /// the {server} slot takes the label and the surrounding CJK text stays
+    /// intact (width-aware rendering is the layout layer's concern).
+    #[test]
+    fn zh_cn_parameters_substitute_into_translated_templates() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("locales/zh-CN.toml");
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let (catalog, _warnings) = Catalog::parse("zh-CN", &content);
+        let connected = catalog.get("sys.connected").unwrap();
+        let rendered = format(connected, &[("server", "srv")]);
+        assert!(rendered.contains("srv"), "rendered: {rendered:?}");
+        assert!(rendered.contains('连'), "rendered: {rendered:?}");
+        assert!(!rendered.contains('{') && !rendered.contains('}'));
+
+        let kicked = catalog.get("sys.kicked").unwrap();
+        assert_eq!(
+            format(kicked, &[("channel", "#osu"), ("reason", "spam")]),
+            "被踢出 #osu：spam"
+        );
+    }
 }
