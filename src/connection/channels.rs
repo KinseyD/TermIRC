@@ -9,6 +9,7 @@ use crate::{
         BufferKind, ChannelState, ChannelStatus, ConnectionCommand, MessageContent, RoutedMessage,
         ServerId, valid_channel_name,
     },
+    i18n,
 };
 
 struct Channel {
@@ -213,16 +214,22 @@ impl Channels {
                 .deadline
                 .is_some_and(|deadline| deadline <= now)
             {
+                // JOIN/PART are wire tokens and stay verbatim as the {op}
+                // parameter of the localized sentence.
                 let operation = if self.entries[index].status.state == ChannelState::Joining {
                     "JOIN"
                 } else {
                     "PART"
                 };
                 self.transition(index, ChannelState::Uncertain);
-                self.notice(
-                    &self.entries[index].name,
-                    format!("{operation} timed out; channel membership is unconfirmed"),
+                let note = i18n::format(
+                    i18n::t("sys.channel_timeout"),
+                    &[
+                        ("op", operation),
+                        ("channel", self.entries[index].name.as_str()),
+                    ],
                 );
+                self.notice(&self.entries[index].name, note);
             }
         }
     }

@@ -96,6 +96,21 @@ are rejected when loading the config. Channel keys/passwords and multi-target
 entries are unsupported. Runtime JOIN/PART changes stay in memory, never rewrite
 the config, and disappear when the application exits.
 
+An optional `[ui]` table selects the interface language:
+
+| Key        | Required | Default | Meaning                              |
+|------------|----------|---------|--------------------------------------|
+| `language` | no       | `"en"`  | UI language tag; loads `locales/<language>.toml` |
+
+`"en"` uses the built-in English strings and loads no file. Any other tag
+loads a translation overlay from `locales/<language>.toml`, searched beside
+the `termirc` binary, in the working directory, and in
+`~/.config/termirc/locales/`. A missing file, missing entries, or entries
+whose `{placeholders}` do not match the English originals fall back to the
+built-in text for just those entries, with one warning per problem in the
+log — a broken locale never keeps TermIRC from starting. Log output and the
+IRC wire itself always stay English.
+
 An optional `[theme]` table recolors the interface. Each key is a color role
 and each value is a named ANSI-16 color (`"red"`, `"bright-black"`, ...), a
 256-color index (`0-255`), or an `"#rrggbb"` hex string. Unlisted roles keep

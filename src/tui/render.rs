@@ -26,6 +26,7 @@ use ratatui::{
     widgets::Paragraph,
 };
 
+use crate::i18n;
 use crate::theme::Theme;
 use crate::tui::{App, Focus};
 
@@ -261,7 +262,11 @@ fn render_hints(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         .command_hints()
         .into_iter()
         .enumerate()
-        .map(|(index, (name, description))| {
+        .map(|(index, (name, key))| {
+            // The table's second column is a catalog key; resolve it here so
+            // the view state stays raw identifiers and only this presentation
+            // layer localizes.
+            let description = i18n::t(key);
             if index == selected {
                 Line::from(Span::styled(
                     format!("/{name} — {description}"),
@@ -509,9 +514,9 @@ fn render_composer(
         .collect();
     frame.render_widget(Paragraph::new(Text::from(visible)), g.input);
     let tips = if status.is_empty() {
-        "Esc quit · Enter send · PgUp/PgDn scroll".to_string()
+        i18n::t("hint.tips").to_string()
     } else {
-        format!("{status}  ·  Esc quit · Enter send · PgUp/PgDn scroll")
+        format!("{}  ·  {}", status, i18n::t("hint.tips"))
     };
     frame.render_widget(
         Paragraph::new(tips),

@@ -13,6 +13,7 @@ use crate::core::{
     ServerId,
 };
 use crate::history::{HistoryChange, HistoryStore};
+use crate::i18n;
 use crate::protocol::{
     SendError, action_display, channel_control_from_raw, encode_outgoing, validate_control,
 };
@@ -205,12 +206,21 @@ impl Session {
             }
         }
         if let Some(cutoff) = cutoff {
-            let noun = if restored == 1 { "message" } else { "messages" };
+            // Two catalog keys stand in for a plural rule: the count picks
+            // the form and the default values render exactly the historical
+            // singular/plural wording.
+            let key = if restored == 1 {
+                "sys.restored_one"
+            } else {
+                "sys.restored_many"
+            };
+            let cutoff = crate::persist::format_cutoff(cutoff);
+            let count = restored.to_string();
             let _ = self.history.append(
                 id,
-                MessageContent::system(format!(
-                    "Restored {restored} {noun} through {}",
-                    crate::persist::format_cutoff(cutoff)
+                MessageContent::system(i18n::format(
+                    i18n::t(key),
+                    &[("n", count.as_str()), ("cutoff", cutoff.as_str())],
                 )),
             );
         }
@@ -499,15 +509,17 @@ impl Session {
             }
         }
         let note = match (previous, connection) {
-            (_, ConnectionState::Connected) if previous != ConnectionState::Connected => {
-                Some(format!("Connected to {label}"))
-            }
-            (ConnectionState::Connected, ConnectionState::Connecting) => {
-                Some(format!("Connection lost, reconnecting to {label}"))
-            }
-            (ConnectionState::Connected, ConnectionState::Stopped) => {
-                Some(format!("Disconnected from {label}"))
-            }
+            (_, ConnectionState::Connected) if previous != ConnectionState::Connected => Some(
+                i18n::format(i18n::t("sys.connected"), &[("server", label.as_str())]),
+            ),
+            (ConnectionState::Connected, ConnectionState::Connecting) => Some(i18n::format(
+                i18n::t("sys.connection_lost"),
+                &[("server", label.as_str())],
+            )),
+            (ConnectionState::Connected, ConnectionState::Stopped) => Some(i18n::format(
+                i18n::t("sys.disconnected"),
+                &[("server", label.as_str())],
+            )),
             _ => None,
         };
         if let Some(text) = note {
@@ -653,7 +665,10 @@ pub fn submit_composer(
     let Some(submission) = session.prepare_input() else {
         if session.active_buffer().is_some() && session.input().trim().is_empty() {
             if invalid_characters {
-                *status = format!("failed to send ({})", SendError::InvalidCharacters);
+                *status = i18n::format(
+                    i18n::t("status.send_failed"),
+                    &[("reason", &SendError::InvalidCharacters.to_string())],
+                );
             } else {
                 session.clear_input();
             }
@@ -705,7 +720,10 @@ pub fn submit_composer(
         encode_outgoing(&outgoing).map(|_| ())
     };
     if let Err(error) = validation {
-        *status = format!("failed to send ({error})");
+        *status = i18n::format(
+            i18n::t("status.send_failed"),
+            &[("reason", &error.to_string())],
+        );
         return SubmissionEffect::None;
     }
     if let OutgoingMessage::Raw { line, .. } = &outgoing {
@@ -738,7 +756,10 @@ pub fn submit_composer(
                 };
             }
             Err(error) => {
-                *status = format!("failed to send ({error})");
+                *status = i18n::format(
+                    i18n::t("status.send_failed"),
+                    &[("reason", &error.to_string())],
+                );
                 return SubmissionEffect::None;
             }
             Ok(None) => {}
@@ -763,7 +784,7 @@ pub fn submit_composer(
         .active_buffer()
         .is_some_and(|buffer| buffer.send_blocked)
     {
-        *status = "query target changed; use /query to select a nickname".into();
+        *status = i18n::t("status.query_target_changed").to_string();
         return SubmissionEffect::None;
     }
     let ready = session.connection_state(&server, None) == ConnectionState::Connected
@@ -803,7 +824,10 @@ pub fn submit_composer(
         session.clear_input();
     } else {
         tracing::warn!("send failed on {server}: disconnected or busy");
-        *status = format!("failed to send ({server} disconnected or busy)");
+        *status = i18n::format(
+            i18n::t("status.send_failed_disconnected"),
+            &[("server", server.as_str())],
+        );
     }
     SubmissionEffect::None
 }
@@ -1032,7 +1056,10 @@ impl Composer<'_> {
             line,
         };
         encode_outgoing(&outgoing).map_err(|error| {
-            *self.status = format!("failed to send ({error})");
+            *self.status = i18n::format(
+                i18n::t("status.send_failed"),
+                &[("reason", &error.to_string())],
+            );
             "message_rejected"
         })?;
         handle
@@ -1068,7 +1095,10 @@ impl Composer<'_> {
             text: wire_text,
         };
         encode_outgoing(&outgoing).map_err(|error| {
-            *self.status = format!("failed to send ({error})");
+            *self.status = i18n::format(
+                i18n::t("status.send_failed"),
+                &[("reason", &error.to_string())],
+            );
             "message_rejected"
         })?;
         let ready = self.session.connection_state(server, None) == ConnectionState::Connected
@@ -1081,7 +1111,10 @@ impl Composer<'_> {
             .find(|(name, _)| name.eq_ignore_ascii_case(server))
             .map(|(_, handle)| handle);
         if !ready || handle.is_none_or(|handle| handle.outgoing.try_send(outgoing).is_err()) {
-            *self.status = format!("failed to send ({server} disconnected or busy)");
+            *self.status = i18n::format(
+                i18n::t("status.send_failed_disconnected"),
+                &[("server", server)],
+            );
             tracing::warn!("send failed on {server}: disconnected or busy");
             return Err("disconnected_or_busy");
         }

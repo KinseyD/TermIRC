@@ -7,6 +7,7 @@
 pub mod command;
 pub mod config;
 pub mod connection;
+pub mod i18n;
 pub mod logging;
 
 pub mod application;

@@ -11,6 +11,7 @@ use crate::core::{
     BufferKind, ConnectionCommand, DeliveryState, Direction, MessageContent, MessageKind,
     OutgoingMessage, RoutedMessage, ServerId, valid_channel_name,
 };
+use crate::i18n;
 
 /// Baseline IRC line limit, including the terminating CRLF.
 pub const MAX_WIRE_BYTES: usize = 512;
@@ -25,10 +26,13 @@ pub enum SendError {
 
 impl fmt::Display for SendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Surfaced to the user inside the composer status line, so the text
+        // resolves through the catalog ("512" stays verbatim in every
+        // language: it is the wire limit, not prose).
         f.write_str(match self {
-            Self::InvalidCharacters => "message contains an invalid control character",
-            Self::InvalidCommand => "invalid IRC command",
-            Self::TooLong => "message exceeds the 512-byte IRC line limit",
+            Self::InvalidCharacters => i18n::t("err.send_invalid_characters"),
+            Self::InvalidCommand => i18n::t("err.send_invalid_command"),
+            Self::TooLong => i18n::t("err.send_too_long"),
         })
     }
 }

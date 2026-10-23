@@ -8,6 +8,7 @@ use indexmap::IndexMap;
 use serde::Deserialize;
 
 use crate::core::{ServerId, valid_channel_name, valid_query_nickname};
+use crate::i18n;
 use crate::theme::ThemeTable;
 
 /// Per-server connection settings, as written in the `[servers.<name>]` tables.
@@ -129,6 +130,50 @@ impl HistoryConfig {
     }
 }
 
+/// Interface settings from the optional `[ui]` table.
+///
+/// Parsed apart from [`Config`] and consumed exactly once, by `main`, to
+/// initialize the process-wide i18n catalog before anything renders: no
+/// consumer ever needs the language afterwards, so it does not travel with
+/// the connection model.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct UiConfig {
+    /// UI language tag selecting a `locales/<language>.toml` overlay;
+    /// `"en"` (the default) uses the embedded strings and loads no file.
+    pub language: String,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            language: crate::i18n::DEFAULT_LANGUAGE.to_string(),
+        }
+    }
+}
+
+/// Read the `[ui]` table of the configuration file at `path`.
+///
+/// A missing file, missing table, or malformed value yields the default
+/// language: locale problems degrade to English rather than fail startup
+/// (a file too broken to parse here has already failed `Config::load`).
+pub fn load_ui(path: &Path) -> UiConfig {
+    std::fs::read_to_string(path)
+        .map(|content| parse_ui(&content))
+        .unwrap_or_default()
+}
+
+fn parse_ui(content: &str) -> UiConfig {
+    #[derive(Deserialize)]
+    struct UiTables {
+        #[serde(default)]
+        ui: UiConfig,
+    }
+    toml::from_str::<UiTables>(content)
+        .map(|tables| tables.ui)
+        .unwrap_or_default()
+}
+
 /// Root configuration: a map of named servers.
 ///
 /// `IndexMap` (with toml's `preserve_order`) keeps the order in which servers
@@ -154,7 +199,14 @@ impl Config {
         for name in config.servers.keys() {
             if let Some(previous) = names.insert(ServerId::new(name), name) {
                 anyhow::bail!(
-                    "server names {previous:?} and {name:?} conflict (ASCII case-insensitive)"
+                    "{}",
+                    i18n::format(
+                        i18n::t("err.cfg_server_name_conflict"),
+                        &[
+                            ("previous", &format!("{previous:?}")),
+                            ("name", &format!("{name:?}")),
+                        ],
+                    )
                 );
             }
         }
@@ -164,49 +216,56 @@ impl Config {
                     .channels
                     .iter()
                     .all(|channel| valid_channel_name(channel)),
-                "channels must contain individual # or & channel names without passwords"
+                "{}",
+                i18n::t("err.cfg_channels")
             );
             anyhow::ensure!(
                 server
                     .queries
                     .iter()
                     .all(|nickname| valid_query_nickname(nickname)),
-                "queries must contain individual nicknames, not channels or multiple targets"
+                "{}",
+                i18n::t("err.cfg_queries")
             );
             if let Some(proxy) = &server.proxy {
                 anyhow::ensure!(
                     proxy.r#type == "socks5",
-                    "unsupported_proxy_type: only \"socks5\" is supported, got {:?}",
-                    proxy.r#type
+                    "{}",
+                    i18n::format(
+                        i18n::t("err.cfg_proxy_type"),
+                        &[("type", &format!("{:?}", proxy.r#type))],
+                    )
                 );
                 anyhow::ensure!(
                     !proxy.host.trim().is_empty(),
-                    "proxy_host_required: proxy.host must be a non-empty hostname"
+                    "{}",
+                    i18n::t("err.cfg_proxy_host")
                 );
                 anyhow::ensure!(
                     (1..=65535).contains(&proxy.port),
-                    "proxy_port_out_of_range: proxy.port must be between 1 and 65535"
+                    "{}",
+                    i18n::t("err.cfg_proxy_port")
                 );
             }
             let sasl = match (&server.sasl_username, &server.sasl_password) {
                 (Some(username), Some(password)) => Some((username, password)),
                 (None, None) => None,
-                _ => anyhow::bail!(
-                    "sasl_requires_username_and_password: set both sasl_username and sasl_password, or neither"
-                ),
+                _ => anyhow::bail!("{}", i18n::t("err.cfg_sasl_pair")),
             };
             if let Some((username, password)) = sasl {
                 anyhow::ensure!(
                     !username.contains(['\0', '\r', '\n'])
                         && !password.contains(['\0', '\r', '\n']),
-                    "sasl credentials must not contain NUL, CR, or LF characters"
+                    "{}",
+                    i18n::t("err.cfg_sasl_characters")
                 );
                 // AUTHENTICATE carries at most 400 base64 characters per
                 // line; refusing longer payloads keeps SASL PLAIN unchunked.
                 let payload = 2 + username.len() + password.len();
                 anyhow::ensure!(
                     4 * payload.div_ceil(3) <= 400,
-                    "sasl_credentials_too_long: encoded SASL PLAIN payload would exceed 400 bytes"
+                    "{}",
+                    i18n::t("err.cfg_sasl_too_long")
                 );
             }
         }
@@ -215,9 +274,23 @@ impl Config {
 
     /// Load and parse configuration from a file path.
     pub fn load(path: &Path) -> anyhow::Result<Config> {
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        Config::parse(&content).with_context(|| format!("failed to parse {}", path.display()))
+        // Deliberately not localized (nor routed through the catalog with a
+        // live override): the configured language lives inside this very
+        // file, so when it cannot be read the locale is unknowable and the
+        // embedded English default is the only honest rendering. The
+        // catalog key is kept so the message stays with its siblings.
+        let content = std::fs::read_to_string(path).with_context(|| {
+            i18n::format(
+                i18n::t("err.cfg_read"),
+                &[("path", &path.display().to_string())],
+            )
+        })?;
+        Config::parse(&content).with_context(|| {
+            i18n::format(
+                i18n::t("err.cfg_parse"),
+                &[("path", &path.display().to_string())],
+            )
+        })
     }
 
     /// The first server in file order, with its name.

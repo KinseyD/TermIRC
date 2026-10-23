@@ -152,42 +152,29 @@ fn channel_argument(args: &str, single: bool) -> Result<Option<String>, CommandE
     }
 }
 
-/// The supported slash commands with a one-line description each, in the
-/// order the TUI's hint bar lists them. Kept beside the parser so a new
-/// command cannot gain an action without also gaining its hint text.
+/// The supported slash commands with the i18n key of their one-line hint
+/// description (`cmd.<name>` in the catalog), in the order the TUI's hint
+/// bar lists them. Kept beside the parser so a new command cannot gain an
+/// action without also gaining its hint text. Command names are wire tokens
+/// and stay untranslated; only the description resolves through the catalog.
 pub(crate) const COMMANDS: [(&str, &str); 17] = [
-    ("join", "Join or focus a channel on the current server"),
-    (
-        "part",
-        "Leave the named or current channel, keeping its buffer",
-    ),
-    (
-        "query",
-        "Open or reopen a private conversation and focus it",
-    ),
-    ("close", "Hide the current private conversation"),
-    ("msg", "Send a message without switching conversation"),
-    ("me", "Send a CTCP ACTION to the current conversation"),
-    ("nick", "Request a nickname change on the current server"),
-    ("topic", "View the topic of the named or current channel"),
-    ("names", "List members of the named or current channel"),
-    (
-        "mode",
-        "Query or change channel or user modes, passed through",
-    ),
-    ("whois", "Query who a nickname is on the current server"),
-    ("away", "Set an away message; no argument toggles"),
-    ("back", "Clear away status on the current server"),
-    (
-        "connect",
-        "Connect a stopped server, defaulting to the current one",
-    ),
-    ("reconnect", "Restart the connection, or connect if stopped"),
-    (
-        "disconnect",
-        "Disconnect the current server and stop retries",
-    ),
-    ("quit", "Alias for disconnect; the application stays open"),
+    ("join", "cmd.join"),
+    ("part", "cmd.part"),
+    ("query", "cmd.query"),
+    ("close", "cmd.close"),
+    ("msg", "cmd.msg"),
+    ("me", "cmd.me"),
+    ("nick", "cmd.nick"),
+    ("topic", "cmd.topic"),
+    ("names", "cmd.names"),
+    ("mode", "cmd.mode"),
+    ("whois", "cmd.whois"),
+    ("away", "cmd.away"),
+    ("back", "cmd.back"),
+    ("connect", "cmd.connect"),
+    ("reconnect", "cmd.reconnect"),
+    ("disconnect", "cmd.disconnect"),
+    ("quit", "cmd.quit"),
 ];
 
 #[cfg(test)]

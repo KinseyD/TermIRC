@@ -1,0 +1,71 @@
+# termirc 简体中文翻译（zh-CN）
+#
+# 维护规则：
+# - 本文件中的键必须与 src/i18n.rs 内嵌注册表（REGISTRY）的键一一对应；
+#   缺少或多出的键都会在启动时记录一条警告并回退到内置英文。
+# - 花括号参数（如 {server}、{channel}）必须与英文原文完全一致：不能
+#   删除、改名或新增，否则该条目会被拒绝并回退到英文。
+# - 保持原样的内容：数字与单位（512、400）、IRC 协议记号（JOIN、PART、
+#   CTCP ACTION、NUL/CR/LF）、键名（Esc、Enter、PgUp/PgDn、socks5、
+#   sasl_username 等），以及以机器可读前缀开头的错误（如
+#   unsupported_proxy_type:）——前缀冒号之前的部分不翻译。
+# - 下列键实际不会以中文呈现（触发时语言无从得知，永远使用内置英文），
+#   仅为保持键集完整而保留：err.cfg_read、err.startup_home、
+#   err.startup_config_load。
+
+[cmd]
+join = "加入或聚焦当前服务器上的频道"
+part = "离开指定或当前频道，保留其缓冲区"
+query = "打开或重新打开私聊会话并聚焦"
+close = "隐藏当前私聊会话"
+msg = "发送消息而不切换会话"
+me = "向当前会话发送 CTCP ACTION"
+nick = "请求在当前服务器上更改昵称"
+topic = "查看指定或当前频道的主题"
+names = "列出指定或当前频道的成员"
+mode = "查询或更改频道/用户模式（原样传递）"
+whois = "查询当前服务器上某昵称的用户信息"
+away = "设置离开消息；不带参数时切换状态"
+back = "清除当前服务器上的离开状态"
+connect = "连接已停止的服务器，默认为当前服务器"
+reconnect = "重启连接；若已停止则改为连接"
+disconnect = "断开当前服务器并停止重试"
+quit = "disconnect 的别名；应用程序保持运行"
+
+[hint]
+tips = "Esc 退出 · Enter 发送 · PgUp/PgDn 滚动"
+
+[sys]
+connected = "已连接到 {server}"
+connection_lost = "连接丢失，正在重连 {server}"
+disconnected = "已从 {server} 断开"
+restored_one = "已恢复 {n} 条消息（至 {cutoff}）"
+restored_many = "已恢复 {n} 条消息（至 {cutoff}）"
+kicked = "被踢出 {channel}：{reason}"
+kicked_no_reason = "被踢出 {channel}：未给出理由"
+channel_timeout = "{op} 超时；频道成员状态未确认"
+
+[status]
+send_failed = "发送失败（{reason}）"
+send_failed_disconnected = "发送失败（{server} 已断开或繁忙）"
+query_target_changed = "私聊对象已更改；请使用 /query 选择昵称"
+
+[err]
+send_invalid_characters = "消息包含无效的控制字符"
+send_invalid_command = "无效的 IRC 命令"
+send_too_long = "消息超过 512 字节的 IRC 行长限制"
+cfg_server_name_conflict = "服务器名 {previous} 与 {name} 冲突（ASCII 不区分大小写）"
+cfg_channels = "channels 必须包含单独的 # 或 & 频道名，不带密码"
+cfg_queries = "queries 必须包含单独的昵称，不能是频道或多个目标"
+cfg_proxy_type = "unsupported_proxy_type: 仅支持 \"socks5\"，当前为 {type}"
+cfg_proxy_host = "proxy_host_required: proxy.host 必须是非空主机名"
+cfg_proxy_port = "proxy_port_out_of_range: proxy.port 必须介于 1 到 65535 之间"
+cfg_sasl_pair = "sasl_requires_username_and_password: 必须同时设置 sasl_username 和 sasl_password，或都不设置"
+cfg_sasl_characters = "SASL 凭据不能包含 NUL、CR 或 LF 字符"
+cfg_sasl_too_long = "sasl_credentials_too_long: 编码后的 SASL PLAIN 载荷将超过 400 字节"
+cfg_read = "读取失败：{path}"
+cfg_parse = "解析失败：{path}"
+startup_home = "无法解析用户主目录"
+startup_config_load = "无法从 {path} 加载配置 - 请将配置文件复制到那里（例如 config.example.toml）"
+startup_no_servers = "配置中没有服务器"
+startup_mouse = "启用鼠标捕获失败"
