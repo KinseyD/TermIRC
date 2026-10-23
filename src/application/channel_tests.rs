@@ -709,3 +709,60 @@ fn names_replies_update_the_member_cache_until_membership_is_lost() {
     channel_event(&mut session, "#Room", ChannelState::NotJoined, false);
     assert!(session.channel_members(channel).is_empty());
 }
+
+#[test]
+fn registered_servers_each_receive_their_welcome_in_their_own_console() {
+    // Arrange: two configured servers register their console buffers before
+    // any worker event arrives — the startup order `main` restored from
+    // v0.5.0. `Config::parse` keeps the fixture declarative.
+    let config = Config::parse(
+        r##"
+[servers.alpha]
+username="me"
+nickname="me"
+password=""
+server="localhost"
+port=6667
+channels=[]
+queries=[]
+[servers.beta]
+username="me"
+nickname="me"
+password=""
+server="localhost"
+port=6667
+channels=[]
+queries=[]
+"##,
+    )
+    .unwrap();
+    let mut session = Session::default();
+    session.register_config(&config);
+
+    // Act: each server's welcome burst lands as a console line; beta's
+    // arrives while another buffer already exists, which the lazy
+    // empty-session fallback used to drop silently.
+    for (label, text) in [("alpha", "Welcome to Alpha"), ("beta", "Welcome to Beta")] {
+        session.handle_event(IrcEvent::Message(RoutedMessage {
+            server: ServerId::new(label),
+            target: BufferKind::Server,
+            content: MessageContent::console(text),
+        }));
+    }
+
+    // Assert: every registered console holds its own welcome line, so the
+    // composer can reach each server from its buffer.
+    for (label, text) in [("alpha", "Welcome to Alpha"), ("beta", "Welcome to Beta")] {
+        let console = session
+            .buffers
+            .iter()
+            .find(|buffer| {
+                buffer.server == ServerId::new(label) && buffer.kind == BufferKind::Server
+            })
+            .unwrap();
+        let history = session.messages_for(console.id);
+        assert_eq!(history.len(), 1, "{label}");
+        assert_eq!(history[0].text, text);
+        assert_eq!(history[0].kind, MessageKind::Console);
+    }
+}

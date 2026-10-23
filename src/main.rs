@@ -113,5 +113,11 @@ fn run(terminal: &mut ratatui::DefaultTerminal, config: &Config) -> anyhow::Resu
     {
         app.session = termirc::application::Session::with_persist(5_000, sink);
     }
+    // Buffers for every configured server (plus its channels and queries)
+    // must exist before the first worker event arrives: the per-server
+    // console is where the welcome burst (001..004, MOTD) lands and where
+    // raw commands are composed. Registering after the optional
+    // `Session::with_persist` swap keeps the buffers on the live session.
+    app.session.register_config(config);
     termirc::tui::events::run(terminal, config, app, outgoing, rx)
 }
