@@ -1562,6 +1562,27 @@ mod tests {
                     .with_writer(move || writer.clone())
                     .finish();
 
+                // Parallel sibling tests may hit these `tracing::debug!` callsites
+                // first with no subscriber installed, caching `Interest::never()`
+                // process-globally so the scoped subscriber below sees nothing.
+                // Re-register the callsites under a real (discarded) subscriber
+                // before the captured pass so interest can never be `never`.
+                let warmup = tracing_subscriber::fmt()
+                    .with_max_level(tracing::Level::DEBUG)
+                    .with_writer(std::io::sink)
+                    .finish();
+                tracing::subscriber::with_default(warmup, || {
+                    let mut warm_app = Session::default();
+                    if console {
+                        warm_app.open_server("srv");
+                    } else {
+                        warm_app.open_channel("srv", "#a");
+                    }
+                    warm_app.select_buffer(0);
+                    let mut warm_status = String::new();
+                    submit_composer(&mut warm_app, &config, &outgoing, &mut warm_status);
+                });
+
                 tracing::subscriber::with_default(subscriber, || {
                     submit_composer(&mut app, &config, &outgoing, &mut status);
                 });

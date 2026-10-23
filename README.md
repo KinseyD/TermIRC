@@ -1,7 +1,7 @@
 # TermIRC
 
 [![CI](https://github.com/KinseyD/TermIRC/actions/workflows/ci.yml/badge.svg)](https://github.com/KinseyD/TermIRC/actions/workflows/ci.yml)
-[![Rust](https://img.shields.io/badge/Rust-1.85%2B-DEA584?logo=rust)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/Rust-1.88%2B-DEA584?logo=rust)](https://www.rust-lang.org/)
 [![Built With Ratatui](https://img.shields.io/badge/Built_With_Ratatui-000?logo=ratatui&logoColor=fff)](https://ratatui.rs/)
 
 A terminal IRC client written in Rust. TermIRC reads your servers from a
@@ -11,7 +11,7 @@ server/channel sidebar, and a composer to talk with. `Enter` sends.
 
 ## Requirements
 
-- [Rust](https://rustup.rs) 1.85 or newer
+- [Rust](https://rustup.rs) 1.88 or newer
 - A terminal with Unicode support; on Windows use **Windows Terminal**
   (a CJK-capable font is needed if you read CJK channels)
 
