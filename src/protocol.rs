@@ -149,8 +149,9 @@ pub fn channel_control_from_raw(line: &str) -> Result<Option<ConnectionCommand>,
 
 // Presence and automatic registration floods stay hidden. User-requested
 // replies and all 4xx/5xx errors remain available to the application.
-// NAMES replies (353/366) are decoded by `info_payload` instead: they feed
-// the channel member cache and the /names display.
+// NAMES replies (353/366) are also unparsed for now: the member cache and
+// /names display they used to feed are deferred until nick completion
+// lands (dev-plan P1.2), matching the v0.5.0 behavior of dropping them.
 const IGNORED_NUMERICS: &[Response] = &[
     Response::RPL_ISUPPORT,
     Response::RPL_LUSERCLIENT,
@@ -160,6 +161,8 @@ const IGNORED_NUMERICS: &[Response] = &[
     Response::RPL_LUSERME,
     Response::RPL_LOCALUSERS,
     Response::RPL_GLOBALUSERS,
+    Response::RPL_NAMREPLY,
+    Response::RPL_ENDOFNAMES,
 ];
 
 /// Render a CTCP ACTION payload (`\x01ACTION text\x01`) as the shared
@@ -300,11 +303,12 @@ pub fn decode_message(
         {
             error_payload(command.parse().ok()?, args, known_channels)
         }
-        // Topic, names, mode and whois replies for the /topic, /names,
-        // /mode and /whois commands: routed to the channel buffer when the
-        // channel is known, otherwise to the server console. Whois replies
-        // target the console here; the application layer redirects them to
-        // the buffer that issued the command.
+        // Mode and whois replies for the /mode and /whois commands: routed
+        // to the channel buffer when the channel is known, otherwise to the
+        // server console. Whois replies target the console here; the
+        // application layer redirects them to the buffer that issued the
+        // command. Topic (331/332/333) and names (353/366) replies are not
+        // parsed for now and fall through to the drop rules below.
         Command::Response(response, args) if info_reply_code(*response as u16).is_some() => {
             info_payload(*response as u16, args, known_channels)?
         }
@@ -433,10 +437,13 @@ pub fn is_whois_numeric(code: u16) -> bool {
 }
 
 /// Codes decoded by `info_payload`; `None` leaves prior handling untouched.
+/// Topic (331/332/333) and names (353/366) replies are intentionally absent:
+/// their parsing is deferred for now, so they drop in the generic branch
+/// (channel parameter) or `IGNORED_NUMERICS` like in v0.5.0.
 fn info_reply_code(code: u16) -> Option<u16> {
     match code {
-        // Topic, channel modes, names.
-        324 | 329 | 331 | 332 | 333 | 353 | 366 => Some(code),
+        // Channel modes only; whois below.
+        324 | 329 => Some(code),
         code if is_whois_numeric(code) => Some(code),
         _ => None,
     }
@@ -805,10 +812,10 @@ mod tests {
 
     #[test]
     fn channel_param_replies_are_blocked_from_the_console() {
-        // 332/353 for known channels now route to the channel buffer (see
-        // topic_and_names_replies_route_to_the_channel_buffer); other
-        // channel-parameter replies stay out of the console, and
-        // topic/names replies for unknown channels never invent buffers.
+        // Channel-parameter replies stay out of the console; topic and
+        // names replies are dropped entirely for now (see
+        // topic_names_and_topic_who_replies_are_not_parsed_for_now), so
+        // they can never leak here either.
         for line in [
             ":mock 341 smoke #osu alice",
             ":mock 346 smoke #osu alice!a@b",
@@ -829,42 +836,23 @@ mod tests {
     }
 
     #[test]
-    fn names_replies_for_unknown_channels_fall_back_to_the_console() {
-        // #test is not a known channel: the reply stays visible in the
-        // server console instead of being dropped.
-        let names = decode(":mock 353 smoke = #test :smoke alice bob").unwrap();
-        assert_eq!(names.target, BufferKind::Server);
-        assert_eq!(names.content.text, "smoke alice bob");
-        assert_eq!(names.content.kind, MessageKind::Info { code: 353 });
-        let end = decode(":mock 366 smoke #test :End of /NAMES list").unwrap();
-        assert_eq!(end.target, BufferKind::Server);
-        assert_eq!(end.content.kind, MessageKind::Info { code: 366 });
-    }
-
-    #[test]
-    fn topic_and_names_replies_route_to_the_channel_buffer() {
-        let topic = decode(":mock 332 smoke #OSU :Welcome to #osu").unwrap();
-        assert_eq!(topic.target, BufferKind::Channel("#OSU".into()));
-        assert_eq!(topic.content.text, "#OSU Welcome to #osu");
-        assert_eq!(topic.content.kind, MessageKind::Info { code: 332 });
-
-        let no_topic = decode(":mock 331 smoke #osu :No topic is set").unwrap();
-        assert_eq!(no_topic.target, BufferKind::Channel("#osu".into()));
-        assert_eq!(no_topic.content.kind, MessageKind::Info { code: 331 });
-
-        let who = decode(":mock 333 smoke #osu alice!a@b 1700000000").unwrap();
-        assert_eq!(who.target, BufferKind::Channel("#osu".into()));
-        assert_eq!(who.content.kind, MessageKind::Info { code: 333 });
-
-        // The nick list is the trailing parameter, sigils included.
-        let names = decode(":mock 353 smoke = #osu :smoke @op +voice").unwrap();
-        assert_eq!(names.target, BufferKind::Channel("#osu".into()));
-        assert_eq!(names.content.text, "smoke @op +voice");
-        assert_eq!(names.content.kind, MessageKind::Info { code: 353 });
-
-        let end = decode(":mock 366 smoke #osu :End of /NAMES list").unwrap();
-        assert_eq!(end.target, BufferKind::Channel("#osu".into()));
-        assert_eq!(end.content.kind, MessageKind::Info { code: 366 });
+    fn topic_names_and_topic_who_replies_are_not_parsed_for_now() {
+        // Topic (331/332/333) and names (353/366) replies decode to nothing
+        // whether the channel is known or not — the v0.5.0 behavior. NAMES
+        // dies in IGNORED_NUMERICS, the topic family in the generic
+        // branch's channel-parameter rule; /topic and /names still send,
+        // their replies just stay silent until parsing is re-enabled.
+        for line in [
+            ":mock 331 smoke #osu :No topic is set",
+            ":mock 332 smoke #OSU :Welcome to #osu",
+            ":mock 333 smoke #osu alice!a@b 1700000000",
+            ":mock 353 smoke = #osu :smoke @op +voice",
+            ":mock 366 smoke #osu :End of /NAMES list",
+            ":mock 353 smoke = #test :smoke alice bob",
+            ":mock 366 smoke #test :End of /NAMES list",
+        ] {
+            assert!(decode(line).is_none(), "{line}");
+        }
     }
 
     #[test]

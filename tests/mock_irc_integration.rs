@@ -616,3 +616,110 @@ fn invalid_direct_queue_messages_are_skipped_without_closing_connection() {
         .collect();
     assert_eq!(chat, vec!["PRIVMSG #test sentinel"]);
 }
+
+/// A greeting-only mock: on `USER` it sends one labelled welcome plus the
+/// MOTD terminator and keeps the socket open. Used by the two-server
+/// startup test, which needs no channel traffic.
+fn spawn_greeting_mock(welcome: &'static str) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let (socket, _) = match listener.accept() {
+            Ok(pair) => pair,
+            Err(_) => return,
+        };
+        let mut reader = BufReader::new(socket.try_clone().unwrap());
+        let mut writer = socket;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                break;
+            }
+            if line.starts_with("USER") {
+                write!(
+                    writer,
+                    ":mock 001 test :{welcome}\r\n:mock 376 test :End of /MOTD command.\r\n"
+                )
+                .unwrap();
+                writer.flush().unwrap();
+            }
+        }
+    });
+    port
+}
+
+/// Every configured server's console history, in arrival order. `open_server`
+/// is idempotent, so it doubles as the lookup for the existing console.
+fn console_texts(app: &mut termirc::tui::App, label: &str) -> Vec<String> {
+    let console = app.open_server(label);
+    app.session
+        .messages_for(console)
+        .iter()
+        .map(|message| message.text.clone())
+        .collect()
+}
+
+#[test]
+fn every_configured_servers_console_shows_its_own_welcome() {
+    // Arrange: two configured servers behind one event channel, the way
+    // `main` assembles them, plus the startup registration that creates
+    // both console buffers before any worker event arrives.
+    let alpha = spawn_greeting_mock("Welcome to Alpha");
+    let beta = spawn_greeting_mock("Welcome to Beta");
+    let servers = [("alpha", alpha), ("beta", beta)]
+        .into_iter()
+        .map(|(label, port)| {
+            let mut server = server_config_for(port);
+            server.channels.clear();
+            (label.to_string(), server)
+        })
+        .collect();
+    let config = termirc::config::Config {
+        servers,
+        history: Default::default(),
+        theme: Default::default(),
+    };
+    let mut app = termirc::tui::App::new(40, 10);
+    app.session.register_config(&config);
+    let (tx, rx) = mpsc::channel();
+    // The handles must outlive the pump: dropping them closes the workers'
+    // command channels and they shut down before registering.
+    let mut workers = Vec::new();
+    for (label, server) in &config.servers {
+        workers.push(spawn_irc(server.clone(), label.clone(), vec![], tx.clone()));
+    }
+    drop(tx);
+
+    // Act: pump worker events into the session until both consoles hold
+    // their welcome line and the MOTD terminator.
+    let deadline = std::time::Instant::now() + RECV_TIMEOUT;
+    while !(console_texts(&mut app, "alpha").contains(&"Welcome to Alpha".to_string())
+        && console_texts(&mut app, "beta").contains(&"Welcome to Beta".to_string())
+        && console_texts(&mut app, "alpha").contains(&"End of /MOTD command.".to_string())
+        && console_texts(&mut app, "beta").contains(&"End of /MOTD command.".to_string()))
+        && let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now())
+    {
+        match rx.recv_timeout(remaining) {
+            Ok(event) => app.session.handle_event(event),
+            Err(_) => break,
+        }
+    }
+    drop(workers);
+
+    // Assert: each registered console shows its own welcome and MOTD end;
+    // before the startup registration was restored, the second server's
+    // burst was dropped silently with no buffer to receive it.
+    for (label, welcome) in [("alpha", "Welcome to Alpha"), ("beta", "Welcome to Beta")] {
+        assert!(
+            console_texts(&mut app, label).contains(&welcome.to_string()),
+            "{label} console missing its welcome: {:?}",
+            console_texts(&mut app, label)
+        );
+        assert!(
+            console_texts(&mut app, label).contains(&"End of /MOTD command.".to_string()),
+            "{label} console missing the MOTD terminator: {:?}",
+            console_texts(&mut app, label)
+        );
+    }
+}
