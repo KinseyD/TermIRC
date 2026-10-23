@@ -441,10 +441,11 @@ impl App {
         };
     }
 
-    /// The hint bar's items for the current draft: `(name, description)`
-    /// pairs in table order, capped at [`MAX_HINT_ROWS`]. Hidden unless the
-    /// composer is focused on an opened buffer and the draft's leading word
-    /// strictly extends at least one command name.
+    /// The hint bar's items for the current draft: `(name, catalog-key)`
+    /// pairs in table order, capped at [`MAX_HINT_ROWS`]. Keys are resolved
+    /// to description text at render time. Hidden unless the composer is
+    /// focused on an opened buffer and the draft's leading word strictly
+    /// extends at least one command name.
     pub fn command_hints(&self) -> Vec<(&'static str, &'static str)> {
         hint_matches(
             self.input(),

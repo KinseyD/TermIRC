@@ -571,6 +571,30 @@ mod tests {
         assert_eq!(keys.len(), total, "duplicate registry keys");
     }
 
+    /// The command table's second column must reference exactly the `cmd.*`
+    /// registry keys — every command keeps a description and no key goes
+    /// stale when either list changes.
+    #[test]
+    fn command_table_keys_mirror_the_cmd_registry() {
+        let table: Vec<_> = crate::command::COMMANDS
+            .iter()
+            .map(|(name, key)| (*name, *key))
+            .collect();
+        let registry: Vec<_> = REGISTRY
+            .iter()
+            .filter(|(key, _)| key.starts_with("cmd."))
+            .map(|(key, _)| *key)
+            .collect();
+        assert_eq!(
+            table.iter().map(|(_, key)| *key).collect::<Vec<_>>(),
+            registry,
+            "COMMANDS keys must equal the cmd.* registry keys in order"
+        );
+        for (name, key) in &table {
+            assert!(!t(key).is_empty(), "command {name} has no text for {key}");
+        }
+    }
+
     #[test]
     fn format_substitutes_named_parameters() {
         assert_eq!(
