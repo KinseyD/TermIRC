@@ -10,7 +10,7 @@
 //!                    │  ┃                             highlighted row reversed)
 //!                    │  ┃   /join #osu             <- input (4 rows, bg-shaded,
 //!                    │  ┃  connected · q quit …    <- tips row  accent ┃ left)
-//!  server osu_irc ▶ channel #osu ▶ type in    <- status bar (bottom row;
+//!  server osu_irc  channel #osu  type in    <- status bar (bottom row;
 //!                                                   the focused zone is
 //!                                                   highlighted, and clicking
 //!                                                   a segment focuses it)
@@ -59,6 +59,12 @@ pub const INPUT_RIGHT_GAP: u16 = 3;
 /// (INPUT_LEFT_PAD + INPUT_RIGHT_PAD, given how the panel is positioned).
 pub const INPUT_TEXT_INSET: u16 = INPUT_LEFT_PAD + INPUT_RIGHT_PAD;
 
+/// The powerline right-pointing triangle (U+E0B0, from Nerd Fonts) that
+/// closes every status-bar block. Unlike `U+25B6` it is designed to fill
+/// the whole cell, so the arrow spans the bar's full row height; without
+/// a Nerd Font the terminal shows a fallback glyph instead.
+const STATUS_BAR_ARROW: &str = "\u{e0b0}";
+
 /// Render-only chrome state: everything the renderer needs beyond the App.
 pub struct Chrome<'a> {
     pub status: &'a str,
@@ -103,7 +109,8 @@ pub struct ScreenGeometry {
     pub composer: Rect,
     pub gap: Rect,
     /// The one-row status bar across the very bottom of the screen:
-    /// ` server … ▶ channel … ▶ type in `, the focused zone highlighted.
+    /// ` server …  channel …  type in ` (the `` is the full-height
+    /// powerline arrow), the focused zone highlighted.
     /// Height 0 on a terminal too short to keep a content row above it.
     pub status_bar: Rect,
     pub input: Rect,
@@ -881,12 +888,12 @@ fn clip_columns(text: &str, width: usize) -> String {
 }
 
 /// Fit the status bar's visible blocks into `width` columns. Each block
-/// renders as ` text ` plus the `▶` arrow on its right edge (the arrow is
-/// part of the block, hit range included), so consecutive blocks nest
-/// arrow-to-tail powerline-style. When the texts overflow, the value
-/// blocks shrink — the wider one yielding columns to the narrower first —
-/// and are then ellipsized; the fixed input label keeps its width and the
-/// terminal clips the line as a last resort.
+/// renders as ` text ` plus the powerline arrow on its right edge (the
+/// arrow is part of the block, hit range included), so consecutive blocks
+/// nest arrow-to-tail. When the texts overflow, the value blocks shrink —
+/// the wider one yielding columns to the narrower first — and are then
+/// ellipsized; the fixed input label keeps its width and the terminal
+/// clips the line as a last resort.
 fn fit_status_bar(app: &App, width: u16) -> Vec<(StatusZone, u16, u16, String)> {
     let texts = status_bar_texts(app);
     let n = texts.len();
@@ -917,7 +924,7 @@ fn fit_status_bar(app: &App, width: u16) -> Vec<(StatusZone, u16, u16, String)> 
     for (i, (zone, text)) in texts.iter().enumerate() {
         let block = format!(" {} ", clip_columns(text, widths[i]));
         let body = u16::try_from(block.width()).unwrap_or(u16::MAX);
-        // The range includes the block's trailing `▶` column.
+        // The range includes the block's trailing arrow column.
         segments.push((*zone, x, x.saturating_add(body + 1), block));
         x = x.saturating_add(body + 1);
     }
@@ -936,11 +943,12 @@ pub fn status_bar_zone_at(app: &App, width: u16, x: u16) -> Option<StatusZone> {
 }
 
 /// Render the bottom status bar: one block per zone with a value, each
-/// ending in a `▶` whose color is the block's own fill on the background
-/// of whatever follows — so consecutive blocks interlock arrow-to-tail
-/// (powerline style) and a highlighted block's arrow reads as part of it.
-/// All colors come from existing roles: the arrow needs no separate one.
-/// Rendered on every page, including the welcome logo.
+/// ending in the full-height powerline arrow whose foreground is the
+/// block's own fill and whose background is the block to its right (the
+/// screen's background when there is none) — so consecutive blocks
+/// interlock arrow-to-tail and a highlighted block's arrow reads as part
+/// of it. All colors come from existing roles: the arrow needs no
+/// separate one. Rendered on every page, including the welcome logo.
 fn render_status_bar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     if area.is_empty() {
         return;
@@ -971,7 +979,7 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                 }
             });
         spans.push(Span::styled(
-            "▶",
+            STATUS_BAR_ARROW,
             Style::new()
                 .fg(if highlighted_here {
                     theme.status_bar_highlight
@@ -2288,7 +2296,7 @@ mod tests {
 
     /// Column ranges (arrow column included) of the bar's three blocks at
     /// width 50 with the osu_irc/#osu buffer:
-    /// ` server osu_irc ▶ channel #osu ▶ type in ▶`.
+    /// ` server osu_irc  channel #osu  type in `.
     fn bar_segments() -> [(StatusZone, u16, u16); 3] {
         [
             (StatusZone::Server, 0, 17),
@@ -2334,7 +2342,7 @@ mod tests {
         for &(zone, start, end) in bar_segments().iter() {
             for x in start..end {
                 let cell = buffer.cell((x, 9)).unwrap();
-                let arrow = x + 1 == end; // the block's trailing `▶`
+                let arrow = x + 1 == end; // the block's trailing powerline arrow
                 match (zone, arrow) {
                     (StatusZone::Input, false) => {
                         assert_eq!(cell.bg, theme().status_bar_highlight, "col {x}");
@@ -2345,7 +2353,7 @@ mod tests {
                         );
                     }
                     (StatusZone::Input, true) => {
-                        assert_eq!(cell.symbol(), "▶", "col {x}");
+                        assert_eq!(cell.symbol(), STATUS_BAR_ARROW, "col {x}");
                         assert_eq!(cell.fg, theme().status_bar_highlight, "col {x}");
                         assert_eq!(cell.bg, theme().global_bg, "col {x}");
                     }
@@ -2356,7 +2364,7 @@ mod tests {
                             // background: the channel block's arrow sits on
                             // the highlighted input block, the server
                             // block's on the plain channel block.
-                            assert_eq!(cell.symbol(), "▶", "col {x}");
+                            assert_eq!(cell.symbol(), STATUS_BAR_ARROW, "col {x}");
                             let next_highlighted = zone == StatusZone::Channel;
                             assert_eq!(
                                 cell.bg,
@@ -2418,7 +2426,7 @@ mod tests {
         // nothing.
         for &(zone, start, end) in bar_segments().iter() {
             assert_eq!(status_bar_zone_at(&app, 50, start + 1), Some(zone));
-            assert_eq!(status_bar_zone_at(&app, 50, end - 1), Some(zone)); // the `▶`
+            assert_eq!(status_bar_zone_at(&app, 50, end - 1), Some(zone)); // the arrow
         }
         assert_eq!(status_bar_zone_at(&app, 50, 42), None); // past the bar
         assert_eq!(status_bar_zone_at(&app, 50, 49), None);
@@ -2436,7 +2444,7 @@ mod tests {
         // channel label, no placeholder, one trailing arrow.
         let bottom = buffer_line(&buffer, 23);
         assert!(bottom.contains("type in"), "bottom: {bottom:?}");
-        assert!(bottom.contains('▶'), "bottom: {bottom:?}");
+        assert!(bottom.contains(STATUS_BAR_ARROW), "bottom: {bottom:?}");
         assert!(!bottom.contains("server"), "bottom: {bottom:?}");
         assert!(!bottom.contains("channel"), "bottom: {bottom:?}");
         assert!(!bottom.contains("not connected"), "bottom: {bottom:?}");

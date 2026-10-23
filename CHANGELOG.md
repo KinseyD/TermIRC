@@ -13,8 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   type in` blocks nested arrow-to-tail (powerline style), with the block matching
   the current focus (composer, message pane, or sidebar server/buffer navigation)
   highlighted; clicking a block focuses that zone, and blocks without a value
-  (nothing connected, server console) hide entirely. New `statusbar.*` i18n keys
-  and `status_bar_highlight` theme role.
+  (nothing connected, server console) hide entirely. The separator is the
+  full-height powerline arrow `` (Nerd Fonts U+E0B0; a fallback glyph shows
+  without one). New `statusbar.*` i18n keys and `status_bar_highlight` theme
+  role.
 
 ### Added
 

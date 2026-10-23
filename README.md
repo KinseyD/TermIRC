@@ -189,6 +189,11 @@ block moves focus to that zone. Blocks without a value hide entirely:
 nothing connected shows only `type in`, and a server console view drops
 the `channel` block.
 
+The status bar's separator is the powerline right-arrow `` (U+E0B0),
+which fills the row's full height; it comes from a Nerd Font. Without
+one, terminals substitute a fallback glyph — the bar still works, the
+arrow just looks plain (`▶`-like at best, a box at worst).
+
 Inputs beginning with `/` after trimming surrounding whitespace are parsed
 as slash commands in both channels and the server console. Supported
 channel, identity and connection commands are:

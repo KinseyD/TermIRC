@@ -358,7 +358,7 @@ mod tests {
     #[test]
     fn status_bar_segment_clicks_focus_their_zones() {
         // Arrange: viewing #a on srv at 70x10; the bar reads
-        // ` server srv ▶ channel #a ▶ type in ▶` on row 9.
+        // ` server srv > channel #a > type in >` on row 9.
         let mut app = App::new(70, 10);
         app.open_channel("srv", "#a");
         app.select_buffer(0);
@@ -382,7 +382,7 @@ mod tests {
         assert_eq!(app.sidebar_cursor(), Some(0));
         assert_eq!(app.status_zone(), StatusZone::Server);
         handle_mouse(&mut app, bar_click(12), (70, 10));
-        assert_eq!(app.status_zone(), StatusZone::Server); // the `▶`
+        assert_eq!(app.status_zone(), StatusZone::Server); // the arrow
 
         // The channel block moves the cursor to the buffer row.
         handle_mouse(&mut app, bar_click(15), (70, 10));
