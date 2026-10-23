@@ -1767,3 +1767,62 @@ fn completing_a_hint_rewrites_the_leading_word_and_cursor() {
     app.complete_hint();
     assert_eq!(app.input(), "/join ");
 }
+
+#[test]
+fn status_zone_follows_focus_and_the_sidebar_cursor_row_kind() {
+    // Arrange: one server with a channel and a query; sidebar rows are
+    // [osu header, #osu, @alice].
+    let mut app = App::new(40, 5);
+    app.open_channel("osu_irc", "#osu");
+    app.open_query("osu_irc", "alice");
+    app.select_buffer(0);
+
+    // Act / Assert: composer and message focus map to their zones.
+    app.focus_composer();
+    assert_eq!(app.status_zone(), StatusZone::Input);
+    app.focus_messages();
+    assert_eq!(app.status_zone(), StatusZone::Channel);
+
+    // Sidebar focus splits by the cursor's row: the server header lights
+    // the server zone, buffer rows the channel zone.
+    app.focus_sidebar_server();
+    assert_eq!(app.focus(), Focus::Sidebar);
+    assert_eq!(app.sidebar_cursor(), Some(0));
+    assert_eq!(app.status_zone(), StatusZone::Server);
+    app.sidebar_down();
+    assert_eq!(app.status_zone(), StatusZone::Channel);
+    app.sidebar_up();
+    assert_eq!(app.status_zone(), StatusZone::Server);
+
+    // A fresh app with no rows defaults to the server zone.
+    assert_eq!(App::new(40, 5).status_zone(), StatusZone::Server);
+}
+
+#[test]
+fn status_bar_zone_focus_shortcuts_target_the_matching_sidebar_row() {
+    // Arrange: two servers so the header row is not the active buffer's row.
+    let mut app = App::new(40, 5);
+    app.open_channel("alpha", "#one");
+    app.open_channel("beta", "#two");
+    app.select_buffer(1); // viewing #two on beta: sidebar row 3
+    app.focus_composer();
+
+    // Act: the channel-zone shortcut focuses the sidebar on #two.
+    app.focus_sidebar_channel();
+    assert_eq!(app.focus(), Focus::Sidebar);
+    assert_eq!(app.sidebar_cursor(), Some(3));
+    assert_eq!(app.status_zone(), StatusZone::Channel);
+
+    // The server-zone shortcut jumps to beta's header row instead.
+    app.focus_sidebar_server();
+    assert_eq!(app.sidebar_cursor(), Some(2));
+    assert_eq!(app.status_zone(), StatusZone::Server);
+
+    // Enter on that header opens beta's console buffer.
+    app.sidebar_enter();
+    assert_eq!(
+        app.active_buffer().map(|b| b.kind.clone()),
+        Some(BufferKind::Server)
+    );
+    assert_eq!(app.active_buffer().unwrap().server_label, "beta");
+}

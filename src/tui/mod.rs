@@ -4,5 +4,5 @@ pub mod layout;
 pub mod mouse;
 pub mod render;
 pub mod view;
-pub use view::{App, Focus};
+pub use view::{App, Focus, StatusZone};
 pub mod events;

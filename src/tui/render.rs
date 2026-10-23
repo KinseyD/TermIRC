@@ -10,6 +10,10 @@
 //!                    │  ┃                             highlighted row reversed)
 //!                    │  ┃   /join #osu             <- input (4 rows, bg-shaded,
 //!                    │  ┃  connected · q quit …    <- tips row  accent ┃ left)
+//!  server osu_irc  channel #osu  type in    <- status bar (bottom row;
+//!                                                   the focused zone is
+//!                                                   highlighted, and clicking
+//!                                                   a segment focuses it)
 //! ```
 //! Before any channel is opened the main column shows only the centered logo -
 //! no composer. Lines are pre-wrapped by `layout`, so the messages `Paragraph`
@@ -28,7 +32,8 @@ use ratatui::{
 
 use crate::i18n;
 use crate::theme::Theme;
-use crate::tui::{App, Focus};
+use crate::tui::{App, Focus, StatusZone};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Fixed width of the left server/channel sidebar, in columns.
 pub const SIDEBAR_WIDTH: u16 = 22;
@@ -53,6 +58,12 @@ pub const INPUT_RIGHT_GAP: u16 = 3;
 /// The composer text is this many columns narrower than the message viewport
 /// (INPUT_LEFT_PAD + INPUT_RIGHT_PAD, given how the panel is positioned).
 pub const INPUT_TEXT_INSET: u16 = INPUT_LEFT_PAD + INPUT_RIGHT_PAD;
+
+/// The powerline right-pointing triangle (U+E0B0, from Nerd Fonts) that
+/// closes every status-bar block. Unlike `U+25B6` it is designed to fill
+/// the whole cell, so the arrow spans the bar's full row height; without
+/// a Nerd Font the terminal shows a fallback glyph instead.
+const STATUS_BAR_ARROW: &str = "\u{e0b0}";
 
 /// Render-only chrome state: everything the renderer needs beyond the App.
 pub struct Chrome<'a> {
@@ -97,6 +108,11 @@ pub struct ScreenGeometry {
     pub hints: Rect,
     pub composer: Rect,
     pub gap: Rect,
+    /// The one-row status bar across the very bottom of the screen:
+    /// ` server …  channel …  type in ` (the `` is the full-height
+    /// powerline arrow), the focused zone highlighted.
+    /// Height 0 on a terminal too short to keep a content row above it.
+    pub status_bar: Rect,
     pub input: Rect,
     pub first_input_line: usize,
     pub input_layout: super::input::InputLayout,
@@ -109,6 +125,12 @@ pub fn geometry(
     active: bool,
     hint_rows: u16,
 ) -> ScreenGeometry {
+    // The status bar owns the bottom row whenever the terminal is tall
+    // enough to keep one content row above it; a 1-row terminal keeps the
+    // composer instead (the shadowed `height` below excludes the bar).
+    let bar_height = u16::from(height >= 2);
+    let status_bar = Rect::new(0, height - bar_height, width, bar_height);
+    let height = height - bar_height;
     let sidebar = Rect::new(0, 0, width.min(SIDEBAR_WIDTH), height);
     let separator = Rect::new(
         sidebar.width,
@@ -180,6 +202,7 @@ pub fn geometry(
         hints,
         composer,
         gap,
+        status_bar,
         input,
         first_input_line,
         input_layout,
@@ -216,6 +239,7 @@ pub fn draw(frame: &mut Frame, app: &App, chrome: &Chrome<'_>) {
     render_separator(frame, g.separator, theme);
     if app.active_buffer().is_none() {
         render_welcome(frame, g.messages, theme);
+        render_status_bar(frame, g.status_bar, app, theme);
         return;
     }
     frame.render_widget(Paragraph::new(build_text(app, theme)), g.messages);
@@ -238,6 +262,7 @@ pub fn draw(frame: &mut Frame, app: &App, chrome: &Chrome<'_>) {
         theme,
     );
     render_gap(frame, g.gap, frame.area().width, app, theme);
+    render_status_bar(frame, g.status_bar, app, theme);
 }
 
 /// Render the inline slash-command hint bar between the message pane and the
@@ -805,6 +830,171 @@ fn render_gap(frame: &mut Frame, area: Rect, screen_w: u16, app: &App, theme: &T
     );
 }
 
+/// The status bar's visible blocks: `label value` for the server and
+/// channel zones, and the input zone's standing label. A block with no
+/// applicable value hides entirely — the server/channel blocks need an
+/// active buffer, and the channel block also hides while a server console
+/// is viewed (the server block already names it); the input block always
+/// shows, so the bar never renders empty. Names are data, labels are
+/// localized.
+fn status_bar_texts(app: &App) -> Vec<(StatusZone, String)> {
+    let mut segments = Vec::with_capacity(3);
+    if let Some(buffer) = app.active_buffer() {
+        segments.push((
+            StatusZone::Server,
+            i18n::format(
+                i18n::t("statusbar.server"),
+                &[("name", buffer.server_label.as_str())],
+            ),
+        ));
+        let channel_name = match &buffer.kind {
+            crate::core::BufferKind::Channel(name) => Some(name.clone()),
+            crate::core::BufferKind::Query(nick) => Some(format!("@{nick}")),
+            crate::core::BufferKind::Server => None,
+        };
+        if let Some(name) = channel_name {
+            segments.push((
+                StatusZone::Channel,
+                i18n::format(i18n::t("statusbar.channel"), &[("name", name.as_str())]),
+            ));
+        }
+    }
+    segments.push((StatusZone::Input, i18n::t("statusbar.input").to_string()));
+    segments
+}
+
+/// `text` clipped to at most `width` display columns, ending in `…` when
+/// any part was cut. Unicode-width aware, so CJK labels halve correctly.
+fn clip_columns(text: &str, width: usize) -> String {
+    if text.width() <= width {
+        return text.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let w = ch.width().unwrap_or(0);
+        // Reserve one column for the ellipsis whenever anything is cut.
+        if used + w > width - 1 {
+            out.push('…');
+            return out;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out
+}
+
+/// Fit the status bar's visible blocks into `width` columns. Each block
+/// renders as ` text ` plus the powerline arrow on its right edge (the
+/// arrow is part of the block, hit range included), so consecutive blocks
+/// nest arrow-to-tail. When the texts overflow, the value blocks shrink —
+/// the wider one yielding columns to the narrower first — and are then
+/// ellipsized; the fixed input label keeps its width and the terminal
+/// clips the line as a last resort.
+fn fit_status_bar(app: &App, width: u16) -> Vec<(StatusZone, u16, u16, String)> {
+    let texts = status_bar_texts(app);
+    let n = texts.len();
+    // Chrome: one space of padding on each side of every block plus its
+    // right-edge arrow.
+    let budget = usize::from(width).saturating_sub(3 * n);
+    let mut widths: Vec<usize> = texts.iter().map(|(_, text)| text.width()).collect();
+    if widths.iter().sum::<usize>() > budget {
+        // The trailing input label is fixed; the value blocks share what
+        // is left, the wider one yielding columns to the narrower first.
+        let target = budget.saturating_sub(widths[n - 1]);
+        match n - 1 {
+            0 => {}
+            1 => widths[0] = widths[0].min(target),
+            _ => {
+                let (wide, narrow) = if widths[0] >= widths[1] {
+                    (0, 1)
+                } else {
+                    (1, 0)
+                };
+                widths[narrow] = widths[narrow].min(target);
+                widths[wide] = target - widths[narrow];
+            }
+        }
+    }
+    let mut segments = Vec::with_capacity(n);
+    let mut x = 0u16;
+    for (i, (zone, text)) in texts.iter().enumerate() {
+        let block = format!(" {} ", clip_columns(text, widths[i]));
+        let body = u16::try_from(block.width()).unwrap_or(u16::MAX);
+        // The range includes the block's trailing arrow column.
+        segments.push((*zone, x, x.saturating_add(body + 1), block));
+        x = x.saturating_add(body + 1);
+    }
+    segments
+}
+
+/// The status-bar zone containing screen column `x`: shared by drawing
+/// and mouse routing, so clicks land on exactly the block that was
+/// painted (its trailing arrow included). Hidden blocks have no range;
+/// columns past the last block map to none.
+pub fn status_bar_zone_at(app: &App, width: u16, x: u16) -> Option<StatusZone> {
+    fit_status_bar(app, width)
+        .iter()
+        .find(|&&(_, start, end, _)| x >= start && x < end)
+        .map(|&(zone, _, _, _)| zone)
+}
+
+/// Render the bottom status bar: one block per zone with a value, each
+/// ending in the full-height powerline arrow drawn in the CURRENT block's
+/// background color, on the background of the block to its right (the
+/// screen's background when there is none) — powerline semantics, so the
+/// divider only shows where a colored block follows and a highlighted
+/// block's arrow reads as part of it. All colors come from existing
+/// roles: the arrow needs no separate one. Rendered on every page,
+/// including the welcome logo.
+fn render_status_bar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    if area.is_empty() {
+        return;
+    }
+    let highlighted = app.status_zone();
+    let segments = fit_status_bar(app, area.width);
+    let mut spans = Vec::with_capacity(2 * segments.len());
+    for (i, &(zone, _, _, ref body)) in segments.iter().enumerate() {
+        let highlighted_here = zone == highlighted;
+        let style = if highlighted_here {
+            Style::new()
+                .fg(theme.global_bg)
+                .bg(theme.status_bar_highlight)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(theme.dim).bg(theme.global_bg)
+        };
+        spans.push(Span::styled(body.clone(), style));
+        // The right-edge arrow: the current block's own background in the
+        // foreground, the following block's background (or the screen's)
+        // behind it. Powerline semantics: a divider only shows where a
+        // colored block follows, and a plain-on-plain arrow blends into
+        // the global background.
+        let arrow_bg = segments
+            .get(i + 1)
+            .map_or(theme.global_bg, |&(next, _, _, _)| {
+                if next == highlighted {
+                    theme.status_bar_highlight
+                } else {
+                    theme.global_bg
+                }
+            });
+        let block_bg = if highlighted_here {
+            theme.status_bar_highlight
+        } else {
+            theme.global_bg
+        };
+        spans.push(Span::styled(
+            STATUS_BAR_ARROW,
+            Style::new().fg(block_bg).bg(arrow_bg),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
 /// Shrink a region by `pad` columns on each side (vertical unchanged) so
 /// content never touches the region's left/right edges.
 fn inset(area: Rect, pad: u16) -> Rect {
@@ -855,7 +1045,7 @@ mod tests {
         for _ in 0..8 {
             app.sidebar_down();
         }
-        let buffer = render_sized(&app, "", 70, 3);
+        let buffer = render_sized(&app, "", 70, 4);
         assert!(buffer_line(&buffer, 0).contains("@nick5"));
         assert!(buffer_line(&buffer, 2).contains("@nick7*"));
         assert!(!buffer_line(&buffer, 2).contains('●'));
@@ -1065,17 +1255,19 @@ mod tests {
         assert_eq!(active_target(&app), None);
 
         // Act: a 100x30 terminal gives the whole main column to the welcome
-        // page; the 6-row logo is vertically centered -> top at row 12.
+        // page; the 6-row logo is vertically centered in the 29 rows above
+        // the status bar -> top at row 11.
         let buffer = render_sized(&app, "", 100, 30);
 
         // Assert: the logo art is rendered in the accent color...
-        let top_row = buffer_line(&buffer, 12);
-        assert!(top_row.contains("████████╗"), "row 12: {top_row:?}");
+        let top_row = buffer_line(&buffer, 11);
+        assert!(top_row.contains("████████╗"), "row 11: {top_row:?}");
         let logo_cell = buffer
-            .cell((top_row.find('█').unwrap() as u16, 12))
+            .cell((top_row.find('█').unwrap() as u16, 11))
             .unwrap();
         assert_eq!(logo_cell.fg, theme().accent);
-        assert!(buffer_line(&buffer, 17).contains("╚═════╝"));
+        assert!(buffer_line(&buffer, 16).contains("╚═════╝"));
+
         // ...the old welcome text and key hints are gone...
         for y in 0..30 {
             assert!(
@@ -1504,7 +1696,8 @@ mod tests {
 
     #[test]
     fn input_area_has_background_and_accent_column() {
-        // Arrange: 50x10 -> input occupies rows 4..=7 (above the 2-row gap).
+        // Arrange: 50x10 -> input occupies rows 3..=6 (above the 2-row gap
+        // and the status bar on row 9).
         let app = test_app(22, 3);
 
         // Act
@@ -1513,7 +1706,7 @@ mod tests {
         // Assert: each input row has the `┃` accent at the composer's left edge
         // (col INPUT_X) in pale green, standing on the global bg (no panel bg
         // behind it); the panel background starts one column to the right.
-        for y in 4..=7 {
+        for y in 3..=6 {
             let cell = buffer.cell((INPUT_X, y)).unwrap();
             assert_eq!(cell.symbol(), "┃", "accent missing on row {y}");
             assert_eq!(cell.fg, theme().accent, "accent color wrong on row {y}");
@@ -1523,7 +1716,7 @@ mod tests {
                 "accent should sit on global bg on row {y}"
             );
         }
-        assert_eq!(buffer.cell((INPUT_X + 1, 5)).unwrap().bg, theme().input_bg); // panel starts here
+        assert_eq!(buffer.cell((INPUT_X + 1, 4)).unwrap().bg, theme().input_bg); // panel starts here
     }
 
     #[test]
@@ -1534,8 +1727,8 @@ mod tests {
         // Act
         let buffer = render_sized(&app, "connected to irc.example.org", 100, 10);
 
-        // Assert: the input's last row (row 7) carries status plus key hints.
-        let tips = buffer_line(&buffer, 7);
+        // Assert: the input's last row (row 6) carries status plus key hints.
+        let tips = buffer_line(&buffer, 6);
         assert!(
             tips.contains("connected to irc.example.org"),
             "tips: {tips:?}"
@@ -1554,12 +1747,12 @@ mod tests {
         // Act
         let buffer = render_sized(&app, "", 50, 10);
 
-        // Assert: the input line (row 5) shows the text and a reverse-video cursor.
-        let row = buffer_line(&buffer, 5);
+        // Assert: the input line (row 4) shows the text and a reverse-video cursor.
+        let row = buffer_line(&buffer, 4);
         assert!(row.contains("hi"), "row was: {row:?}");
         // The cursor sits just past "hi" (at end) - a block cursor at col 28.
         assert_eq!(
-            buffer.cell((MAIN_COL_X + 2, 5)).unwrap().bg,
+            buffer.cell((MAIN_COL_X + 2, 4)).unwrap().bg,
             theme().input_cursor_bg
         );
     }
@@ -1572,9 +1765,10 @@ mod tests {
         // Act
         let buffer = render_sized(&app, "", 50, 10);
 
-        // Assert: the gray `│` runs the full height (every row) at col SIDEBAR_WIDTH,
-        // no longer overridden by the composer (the `┃` now sits at col INPUT_X).
-        for y in 0..buffer.area.height {
+        // Assert: the gray `│` runs the full content height (every row above
+        // the status bar) at col SIDEBAR_WIDTH, no longer overridden by the
+        // composer (the `┃` now sits at col INPUT_X).
+        for y in 0..buffer.area.height - 1 {
             assert_eq!(
                 buffer.cell((SIDEBAR_WIDTH, y)).unwrap().symbol(),
                 "│",
@@ -1586,7 +1780,7 @@ mod tests {
             );
         }
         // The `┃` lives only on the composer rows, at col INPUT_X.
-        for y in 4..=7 {
+        for y in 3..=6 {
             assert_eq!(buffer.cell((INPUT_X, y)).unwrap().symbol(), "┃");
         }
         assert_eq!(buffer.cell((INPUT_X, 1)).unwrap().symbol(), " ");
@@ -1600,13 +1794,13 @@ mod tests {
         // Act
         let buffer = render_sized(&app, "", 50, 10);
 
-        // Assert: on the fade row (row 8), the composer's `┃` tapers via `╹`
+        // Assert: on the fade row (row 7), the composer's `┃` tapers via `╹`
         // (pale green, on the global bg); the rest of the row is the `▀` fade.
-        let taper = buffer.cell((INPUT_X, 8)).unwrap();
+        let taper = buffer.cell((INPUT_X, 7)).unwrap();
         assert_eq!(taper.symbol(), "╹");
         assert_eq!(taper.fg, theme().accent);
         assert_eq!(taper.bg, theme().global_bg);
-        let fade = buffer.cell((INPUT_X + 1, 8)).unwrap();
+        let fade = buffer.cell((INPUT_X + 1, 7)).unwrap();
         assert_eq!(fade.symbol(), "▀");
         assert_eq!(fade.fg, theme().input_bg);
     }
@@ -1689,10 +1883,12 @@ mod tests {
         // Assert: the separator column carries the override...
         assert_eq!(base[(SIDEBAR_WIDTH, 1)].fg, Theme::default().separator);
         assert_eq!(themed[(SIDEBAR_WIDTH, 1)].fg, theme.separator);
-        // ...and every other cell is untouched.
+        // ...and every other cell is untouched (the status bar's segment
+        // separators also use the role, so its row is skipped with the
+        // divider column).
         for y in 0..10 {
             for x in 0..50 {
-                if x == SIDEBAR_WIDTH {
+                if x == SIDEBAR_WIDTH || y == 9 {
                     continue;
                 }
                 assert_eq!(
@@ -1733,8 +1929,8 @@ mod tests {
     #[test]
     fn message_viewport_extends_down_to_the_composer() {
         // Arrange: H=11 with empty input -> the message viewport owns rows
-        // 0..=4 (the old static spacer row is now the trailing separator in
-        // the stream), composer rows 5..=8. An empty channel lays out to no
+        // 0..=3 (the old static spacer row is now the trailing separator in
+        // the stream), composer rows 4..=7. An empty channel lays out to no
         // rows, so the pane is blank.
         let mut app = App::new(22, 3);
         app.open_channel("osu_irc", "#osu");
@@ -1746,21 +1942,21 @@ mod tests {
         // Assert: the pane's bottom row is blank with the global background
         // across the main column, and the composer ┃ starts on the row below.
         for x in INPUT_X..50 {
-            assert_eq!(buffer.cell((x, 4)).unwrap().symbol(), " ", "col {x}");
+            assert_eq!(buffer.cell((x, 3)).unwrap().symbol(), " ", "col {x}");
             assert_eq!(
-                buffer.cell((x, 4)).unwrap().bg,
+                buffer.cell((x, 3)).unwrap().bg,
                 theme().global_bg,
                 "col {x}"
             );
         }
-        assert_eq!(buffer.cell((INPUT_X, 5)).unwrap().symbol(), "┃");
+        assert_eq!(buffer.cell((INPUT_X, 4)).unwrap().symbol(), "┃");
     }
 
     #[test]
     fn multiline_input_grows_the_composer() {
         // Arrange: 25 chars at text width 19 wrap into 2 lines, so the composer
         // is 5 rows (blank + 2 text + blank + tips). For H=11 that puts the
-        // composer on rows 4..=8.
+        // composer on rows 3..=7.
         let mut app = viewing_app(22, 2);
         for _ in 0..25 {
             app.type_char('x');
@@ -1770,24 +1966,24 @@ mod tests {
         let buffer = render_sized(&app, "", 50, 11);
 
         // Assert: the ┃ spans all 5 composer rows, both wrapped text lines are
-        // shown, and the tips row moved down to row 8.
-        for y in 4..=8 {
+        // shown, and the tips row moved down to row 7.
+        for y in 3..=7 {
             assert_eq!(buffer.cell((INPUT_X, y)).unwrap().symbol(), "┃", "row {y}");
         }
+        assert!(buffer_line(&buffer, 4).contains('x'));
         assert!(buffer_line(&buffer, 5).contains('x'));
-        assert!(buffer_line(&buffer, 6).contains('x'));
-        assert!(buffer_line(&buffer, 8).contains("Esc quit"));
+        assert!(buffer_line(&buffer, 7).contains("Esc quit"));
     }
 
     #[test]
     fn multiline_input_squeezes_the_message_pane() {
-        // Arrange / Act: empty input -> composer 4 rows (┃ top at row 5 for H=11);
-        // 2-line input -> composer 5 rows (┃ top moves up to row 4).
+        // Arrange / Act: empty input -> composer 4 rows (┃ top at row 4 for H=11);
+        // 2-line input -> composer 5 rows (┃ top moves up to row 3).
 
         let app_empty = viewing_app(22, 3);
         let buf_empty = render_sized(&app_empty, "", 50, 11);
-        assert_eq!(buf_empty.cell((INPUT_X, 5)).unwrap().symbol(), "┃");
-        assert_eq!(buf_empty.cell((INPUT_X, 4)).unwrap().symbol(), " ");
+        assert_eq!(buf_empty.cell((INPUT_X, 4)).unwrap().symbol(), "┃");
+        assert_eq!(buf_empty.cell((INPUT_X, 3)).unwrap().symbol(), " ");
 
         let mut app_full = viewing_app(22, 2);
         for _ in 0..25 {
@@ -1796,7 +1992,7 @@ mod tests {
         let buf_full = render_sized(&app_full, "", 50, 11);
 
         // Assert: the composer's top edge moved up one row.
-        assert_eq!(buf_full.cell((INPUT_X, 4)).unwrap().symbol(), "┃");
+        assert_eq!(buf_full.cell((INPUT_X, 3)).unwrap().symbol(), "┃");
     }
 
     #[test]
@@ -1990,7 +2186,7 @@ mod tests {
         let mut app = hint_scroll_app();
         app.restore_input(String::new());
         let plain = render_fitted(&mut app, 60, 14);
-        let plain_row = row_containing(&plain, "line9").unwrap();
+        let plain_row = row_containing(&plain, "line10").unwrap();
 
         // Act: drafting `/j` shows one hint row under its separator rule.
         app.restore_input("/j".into());
@@ -2008,7 +2204,7 @@ mod tests {
         );
         assert_eq!(hinted_g.hints.bottom(), hinted_g.composer.y);
         assert_eq!(
-            row_containing(&hinted, "line9").unwrap(),
+            row_containing(&hinted, "line10").unwrap(),
             plain_row - hinted_g.hints.height
         );
 
@@ -2035,7 +2231,7 @@ mod tests {
         // Assert: no hint text remains and the pane grew back.
         assert!(row_containing(&plain, "/join").is_none());
         let plain_g = geometry(60, 14, "", 0, true, 0);
-        assert_eq!(plain_g.messages.height, 8);
+        assert_eq!(plain_g.messages.height, 7);
         assert_eq!(plain_g.hints.height, 0);
         assert!(app.is_at_bottom());
     }
@@ -2096,6 +2292,218 @@ mod tests {
                 assert!(g.messages.bottom() <= h);
                 if g.hints.height > 0 {
                     assert!(g.messages.height >= 1, "h={h} w={w}");
+                }
+            }
+        }
+    }
+
+    /// Column ranges (arrow column included) of the bar's three blocks at
+    /// width 50 with the osu_irc/#osu buffer:
+    /// ` server osu_irc  channel #osu  type in `.
+    fn bar_segments() -> [(StatusZone, u16, u16); 3] {
+        [
+            (StatusZone::Server, 0, 17),
+            (StatusZone::Channel, 17, 32),
+            (StatusZone::Input, 32, 42),
+        ]
+    }
+
+    #[test]
+    fn status_bar_renders_three_segments_on_the_bottom_row() {
+        // Arrange: viewing #osu on osu_irc with the composer focused.
+        let app = test_app(22, 3);
+
+        // Act
+        let buffer = render_sized(&app, "", 50, 10);
+
+        // Assert: the bottom row carries all three zone labels and their
+        // values, and nothing above the bar mentions them.
+        let bottom = buffer_line(&buffer, 9);
+        assert!(bottom.contains("server osu_irc"), "bottom: {bottom:?}");
+        assert!(bottom.contains("channel #osu"), "bottom: {bottom:?}");
+        assert!(bottom.contains("type in"), "bottom: {bottom:?}");
+        for y in 0..9 {
+            assert!(
+                !buffer_line(&buffer, y).contains("type in"),
+                "bar text leaked to row {y}"
+            );
+        }
+    }
+
+    #[test]
+    fn focused_composer_highlights_the_status_bar_input_segment() {
+        // Arrange: test_app leaves the composer focused.
+        let app = test_app(22, 3);
+
+        // Act
+        let buffer = render_sized(&app, "", 50, 10);
+
+        // Assert: every body cell of the input block (padding included) is
+        // bold on the highlight background; its trailing arrow is drawn in
+        // that same background color pointing onto the global background,
+        // reading as part of the block; the plain blocks keep dim text and
+        // arrows in the global background color (invisible until a colored
+        // block follows them).
+        for &(zone, start, end) in bar_segments().iter() {
+            for x in start..end {
+                let cell = buffer.cell((x, 9)).unwrap();
+                let arrow = x + 1 == end; // the block's trailing powerline arrow
+                match (zone, arrow) {
+                    (StatusZone::Input, false) => {
+                        assert_eq!(cell.bg, theme().status_bar_highlight, "col {x}");
+                        assert_eq!(cell.fg, theme().global_bg, "col {x}");
+                        assert!(
+                            cell.modifier.contains(ratatui::style::Modifier::BOLD),
+                            "col {x}"
+                        );
+                    }
+                    (StatusZone::Input, true) => {
+                        assert_eq!(cell.symbol(), STATUS_BAR_ARROW, "col {x}");
+                        assert_eq!(cell.fg, theme().status_bar_highlight, "col {x}");
+                        assert_eq!(cell.bg, theme().global_bg, "col {x}");
+                    }
+                    _ => {
+                        if arrow {
+                            // The arrow's foreground is the current block's
+                            // background (global bg for plain blocks); its
+                            // background is the following block's: the
+                            // channel block's arrow sits on the highlighted
+                            // input block, the server block's on the plain
+                            // channel block.
+                            assert_eq!(cell.symbol(), STATUS_BAR_ARROW, "col {x}");
+                            assert_eq!(cell.fg, theme().global_bg, "col {x}");
+                            let next_highlighted = zone == StatusZone::Channel;
+                            assert_eq!(
+                                cell.bg,
+                                if next_highlighted {
+                                    theme().status_bar_highlight
+                                } else {
+                                    theme().global_bg
+                                },
+                                "col {x}"
+                            );
+                        } else {
+                            assert_eq!(cell.fg, theme().dim, "col {x}");
+                            assert_eq!(cell.bg, theme().global_bg, "col {x}");
+                        }
+                    }
+                }
+            }
+        }
+        // Nothing is painted past the last block's arrow.
+        assert_eq!(buffer.cell((42, 9)).unwrap().symbol(), " ");
+    }
+
+    #[test]
+    fn sidebar_navigation_highlights_the_selected_zone_segment() {
+        // Arrange: viewing #osu, then focus the sidebar with its cursor on
+        // the server header, then move down onto the channel row.
+        let mut app = viewing_app(22, 3);
+        app.focus_sidebar_server();
+        let server = render_sized(&app, "", 50, 10);
+        assert_eq!(app.sidebar_cursor(), Some(0)); // the osu_irc header
+        app.sidebar_down();
+        let channel = render_sized(&app, "", 50, 10);
+        assert_eq!(app.sidebar_cursor(), Some(1)); // the #osu row
+
+        // Assert: the highlighted segment follows the cursor's row kind —
+        // the server zone while on the header, the channel zone on #osu.
+        let [(_, ss, _), (_, cs, _), _] = bar_segments();
+        assert_eq!(
+            server.cell((ss + 1, 9)).unwrap().bg,
+            theme().status_bar_highlight
+        );
+        assert_eq!(
+            channel.cell((ss + 1, 9)).unwrap().bg,
+            theme().global_bg,
+            "server segment must dim once the cursor leaves the header"
+        );
+        assert_eq!(
+            channel.cell((cs + 1, 9)).unwrap().bg,
+            theme().status_bar_highlight
+        );
+    }
+
+    #[test]
+    fn status_bar_zone_hit_testing_matches_the_painted_blocks() {
+        // Arrange: viewing #osu on osu_irc at width 50.
+        let app = viewing_app(22, 3);
+
+        // Act / Assert: each painted block maps to its zone — body and
+        // trailing arrow alike — and columns past the last block map to
+        // nothing.
+        for &(zone, start, end) in bar_segments().iter() {
+            assert_eq!(status_bar_zone_at(&app, 50, start + 1), Some(zone));
+            assert_eq!(status_bar_zone_at(&app, 50, end - 1), Some(zone)); // the arrow
+        }
+        assert_eq!(status_bar_zone_at(&app, 50, 42), None); // past the bar
+        assert_eq!(status_bar_zone_at(&app, 50, 49), None);
+    }
+
+    #[test]
+    fn status_bar_hides_blocks_without_a_value_instead_of_placeholders() {
+        // Arrange: a fresh app with no buffers (the welcome page).
+        let app = App::new(50, 10);
+
+        // Act
+        let buffer = render_sized(&app, "", 80, 24);
+
+        // Assert: only the standing input block remains — no server or
+        // channel label, no placeholder, one trailing arrow.
+        let bottom = buffer_line(&buffer, 23);
+        assert!(bottom.contains("type in"), "bottom: {bottom:?}");
+        assert!(bottom.contains(STATUS_BAR_ARROW), "bottom: {bottom:?}");
+        assert!(!bottom.contains("server"), "bottom: {bottom:?}");
+        assert!(!bottom.contains("channel"), "bottom: {bottom:?}");
+        assert!(!bottom.contains("not connected"), "bottom: {bottom:?}");
+        // Only the input block's columns are clickable; a server-column
+        // click (where the block would start) is dead space.
+        assert_eq!(status_bar_zone_at(&app, 80, 1), Some(StatusZone::Input));
+        assert_eq!(status_bar_zone_at(&app, 80, 40), None);
+    }
+
+    #[test]
+    fn server_console_view_hides_the_channel_block() {
+        // Arrange: a server console buffer viewed with the composer focused.
+        let mut app = App::new(50, 10);
+        let console = app.open_server("osu_irc");
+        app.activate_buffer(console);
+        app.focus_composer();
+
+        // Act
+        let buffer = render_sized(&app, "", 80, 24);
+
+        // Assert: the server block names the console and the channel block
+        // hides (the server block already identifies it).
+        let bottom = buffer_line(&buffer, 23);
+        assert!(bottom.contains("server osu_irc"), "bottom: {bottom:?}");
+        assert!(bottom.contains("type in"), "bottom: {bottom:?}");
+        assert!(!bottom.contains("channel"), "bottom: {bottom:?}");
+    }
+
+    #[test]
+    fn status_bar_survives_tiny_terminals_without_panicking() {
+        // Arrange: a viewed channel with long-ish names so the bar must
+        // shrink and clip its segments.
+        let mut app = App::new(20, 3);
+        app.open_channel("a_very_long_server_name", "#a-long-channel-name");
+        app.select_buffer(0);
+        app.focus_composer();
+
+        // Act: fit and draw across a grid of tiny sizes (panics surface
+        // here); at h=1 the bar yields its row to the composer.
+        for w in 0..=12u16 {
+            for h in 0..=4u16 {
+                let g = geometry(w, h, app.input(), app.input_cursor(), true, 0);
+                app.set_sidebar_height(g.sidebar.height);
+                app.resize(g.messages.width, g.messages.height);
+                render_sized(&app, "", w, h);
+                if h >= 2 {
+                    assert_eq!(g.status_bar.height, 1, "h={h} w={w}");
+                    assert_eq!(g.status_bar.y, h - 1, "h={h} w={w}");
+                    assert!(g.status_bar.bottom() <= h);
+                } else {
+                    assert_eq!(g.status_bar.height, 0, "h={h} w={w}");
                 }
             }
         }
