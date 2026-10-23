@@ -28,6 +28,12 @@ fn main() -> anyhow::Result<()> {
             return Err(e);
         }
     };
+    let ui = termirc::config::load_ui(&config_path);
+    // Localize before anything user-visible can print or render. The
+    // catalog falls back to the embedded defaults for any language whose
+    // file is absent or incomplete, warning once per problem, so a broken
+    // locale can never keep the client from starting.
+    termirc::i18n::init(&ui.language);
     if config.first_server().is_none() {
         tracing::error!("config has no servers");
         anyhow::bail!("config has no servers");

@@ -129,6 +129,50 @@ impl HistoryConfig {
     }
 }
 
+/// Interface settings from the optional `[ui]` table.
+///
+/// Parsed apart from [`Config`] and consumed exactly once, by `main`, to
+/// initialize the process-wide i18n catalog before anything renders: no
+/// consumer ever needs the language afterwards, so it does not travel with
+/// the connection model.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct UiConfig {
+    /// UI language tag selecting a `locales/<language>.toml` overlay;
+    /// `"en"` (the default) uses the embedded strings and loads no file.
+    pub language: String,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            language: crate::i18n::DEFAULT_LANGUAGE.to_string(),
+        }
+    }
+}
+
+/// Read the `[ui]` table of the configuration file at `path`.
+///
+/// A missing file, missing table, or malformed value yields the default
+/// language: locale problems degrade to English rather than fail startup
+/// (a file too broken to parse here has already failed `Config::load`).
+pub fn load_ui(path: &Path) -> UiConfig {
+    std::fs::read_to_string(path)
+        .map(|content| parse_ui(&content))
+        .unwrap_or_default()
+}
+
+fn parse_ui(content: &str) -> UiConfig {
+    #[derive(Deserialize)]
+    struct UiTables {
+        #[serde(default)]
+        ui: UiConfig,
+    }
+    toml::from_str::<UiTables>(content)
+        .map(|tables| tables.ui)
+        .unwrap_or_default()
+}
+
 /// Root configuration: a map of named servers.
 ///
 /// `IndexMap` (with toml's `preserve_order`) keeps the order in which servers
