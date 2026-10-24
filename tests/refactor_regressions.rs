@@ -157,7 +157,7 @@ fn chinese_input_renders_every_character_and_tiny_windows_do_not_panic() {
 
 #[test]
 fn clipped_composer_keeps_cursor_row_visible_and_mouse_geometry_matches() {
-    use ratatui::{Terminal, backend::TestBackend, style::Color};
+    use ratatui::{Terminal, backend::TestBackend};
     use termirc::tui::{
         mouse::{self, MouseTarget},
         render::{self, Chrome},
@@ -178,8 +178,7 @@ fn clipped_composer_keeps_cursor_row_visible_and_mouse_geometry_matches() {
             app.hint_rows(),
         );
         assert!(g.input.height > 0, "no input row at height {height}");
-        let cursor_x = g.input.x + g.input_layout.cursor_column as u16;
-        let cursor_y = g.input.y + (g.input_layout.cursor_row - g.first_input_line) as u16;
+        let (cursor_x, cursor_y) = render::composer_cursor_cell(&g);
         assert_eq!(mouse::hit(cursor_x, cursor_y, &g), MouseTarget::Composer);
         app.resize(g.messages.width, g.messages.height);
         let mut terminal = Terminal::new(TestBackend::new(44, height)).unwrap();
@@ -195,10 +194,10 @@ fn clipped_composer_keeps_cursor_row_visible_and_mouse_geometry_matches() {
                 )
             })
             .unwrap();
-        assert_eq!(
-            terminal.backend().buffer()[(cursor_x, cursor_y)].bg,
-            Color::White
-        );
+        // The caret is the terminal's real cursor, on the caret cell.
+        assert!(terminal.backend().cursor_visible());
+        let pos = terminal.backend().cursor_position();
+        assert_eq!((pos.x, pos.y), (cursor_x, cursor_y));
     }
 }
 
