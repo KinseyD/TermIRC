@@ -133,8 +133,11 @@ The most useful roles:
 | `status_ok`         | `green`     | connected server dot            |
 
 The remaining roles (`dim`, `accent_dim`, `hover_bg`, `sidebar_cursor_bg`,
-`input_cursor_fg`, `input_cursor_bg`, `status_err`, `status_pending`) follow
-the same rules; see the commented example in `config.example.toml`.
+`status_err`, `status_pending`) follow the same rules; see the commented
+example in `config.example.toml`. The former `input_cursor_fg` /
+`input_cursor_bg` roles are deprecated: they are still accepted (with a
+warning) but ignored, since the composer's cursor is the terminal's real
+cursor and takes the terminal's own cursor styling.
 
 Security notes:
 
@@ -167,6 +170,11 @@ sidebar cursor or the message selection, `Enter` opens the highlighted
 channel (sidebar) or sends your line (composer), `PgUp`/`PgDn` scroll the
 messages, and `Esc` quits — the composer's bottom row always repeats the
 essentials. The rest is there to explore.
+
+While the composer has focus, TermIRC positions your terminal's real cursor
+at the caret — blinking, block, or underline exactly as your terminal
+renders it — and hides it whenever another pane (or the welcome page) has
+focus. The sidebar's cursor is a highlighted row, not a terminal cursor.
 
 While you type a `/` command in the composer, matching commands with
 one-line descriptions appear in a hint area above the input; the message

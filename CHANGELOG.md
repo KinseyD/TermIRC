@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- The composer now uses the terminal's real cursor at the caret (positioned
+  every frame while the composer has focus, hidden otherwise) instead of a
+  simulated reverse-video block; the sidebar cursor stays a highlighted row.
+- The `[theme]` roles `input_cursor_fg` and `input_cursor_bg` are deprecated
+  and ignored: they are still parsed (malformed values still fail) and log a
+  single `termirc::theme` warning, but no longer exist in the theme.
+
 ## [0.7.0] — 2026-10-23
 
 ### Added
