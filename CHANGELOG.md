@@ -12,11 +12,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Focus-aware status bar on the bottom row: `server <name> ▶ channel <name> ▶
   type in` blocks nested arrow-to-tail (powerline style), with the block matching
   the current focus (composer, message pane, or sidebar server/buffer navigation)
-  highlighted; clicking a block focuses that zone, and blocks without a value
-  (nothing connected, server console) hide entirely. The separator is the
-  full-height powerline arrow `` (Nerd Fonts U+E0B0; a fallback glyph shows
-  without one). New `statusbar.*` i18n keys and `status_bar_highlight` theme
-  role.
+  highlighted as the last one shown — blocks to its right hide, as do blocks
+  without a value (nothing connected, server console). Clicking a block focuses
+  that zone. The separator is the full-height powerline arrow `` (Nerd Fonts
+  U+E0B0; a fallback glyph shows without one). New `statusbar.*` i18n keys and
+  `status_bar_highlight` theme role.
+
+### Fixed
+
+- The composer holds focus from the program's first frame (the startup default
+  was the sidebar's first row), so keys type immediately and the status bar
+  highlights the input block at startup.
+
+## [0.7.0] — 2026-10-23
 
 ### Added
 

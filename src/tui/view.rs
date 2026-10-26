@@ -137,7 +137,11 @@ impl App {
         Self {
             session: Session::new(message_cap),
             views: HashMap::new(),
-            focus: Focus::Sidebar,
+            // The composer is where the cursor lives from the first
+            // frame: keys type immediately (Tab or a click moves focus to
+            // the sidebar), so the status bar highlights the input block
+            // at startup instead of the sidebar's first row.
+            focus: Focus::Composer,
             sidebar_cursor: Some(0),
             sidebar_hovered: None,
             sidebar_cursor_id: None,
@@ -432,19 +436,26 @@ impl App {
     pub fn focus_messages(&mut self) {
         self.focus = Focus::Messages;
     }
+    pub fn focus_sidebar(&mut self) {
+        self.focus = Focus::Sidebar;
+    }
     pub fn focus_composer(&mut self) {
         self.focus = Focus::Composer;
     }
 
     /// The status-bar zone the current focus highlights: the composer maps
-    /// to the input zone, the message pane to the channel zone (it shows
-    /// the active buffer's stream), and the sidebar to whichever row its
-    /// cursor is on — a server header highlights the server zone, any
-    /// buffer row the channel zone. An empty sidebar defaults to server.
+    /// to the input zone, the message pane to the zone of the stream it
+    /// shows (the channel zone for a channel/query buffer, the server zone
+    /// for a server console), and the sidebar to whichever row its cursor
+    /// is on — a server header highlights the server zone, any buffer row
+    /// the channel zone. An empty sidebar defaults to server.
     pub fn status_zone(&self) -> StatusZone {
         match self.focus {
             Focus::Composer => StatusZone::Input,
-            Focus::Messages => StatusZone::Channel,
+            Focus::Messages => match self.active_buffer().map(|b| &b.kind) {
+                Some(BufferKind::Server) | None => StatusZone::Server,
+                Some(_) => StatusZone::Channel,
+            },
             Focus::Sidebar => {
                 let rows = self.sidebar_rows();
                 match self.sidebar_cursor.and_then(|index| rows.get(index)) {

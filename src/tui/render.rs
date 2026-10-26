@@ -830,13 +830,13 @@ fn render_gap(frame: &mut Frame, area: Rect, screen_w: u16, app: &App, theme: &T
     );
 }
 
-/// The status bar's visible blocks: `label value` for the server and
+/// The status bar's candidate blocks: `label value` for the server and
 /// channel zones, and the input zone's standing label. A block with no
 /// applicable value hides entirely — the server/channel blocks need an
 /// active buffer, and the channel block also hides while a server console
 /// is viewed (the server block already names it); the input block always
-/// shows, so the bar never renders empty. Names are data, labels are
-/// localized.
+/// exists, so [`fit_status_bar`] always has at least it under input focus.
+/// Names are data, labels are localized.
 fn status_bar_texts(app: &App) -> Vec<(StatusZone, String)> {
     let mut segments = Vec::with_capacity(3);
     if let Some(buffer) = app.active_buffer() {
@@ -887,15 +887,24 @@ fn clip_columns(text: &str, width: usize) -> String {
     out
 }
 
-/// Fit the status bar's visible blocks into `width` columns. Each block
-/// renders as ` text ` plus the powerline arrow on its right edge (the
-/// arrow is part of the block, hit range included), so consecutive blocks
-/// nest arrow-to-tail. When the texts overflow, the value blocks shrink —
-/// the wider one yielding columns to the narrower first — and are then
-/// ellipsized; the fixed input label keeps its width and the terminal
-/// clips the line as a last resort.
+/// Fit the status bar's visible blocks into `width` columns. Blocks to the
+/// RIGHT of the highlighted zone's block hide, so the highlighted block is
+/// always the last one rendered and its arrow sits on the global
+/// background. Each block renders as ` text ` plus the powerline arrow on
+/// its right edge (the arrow is part of the block, hit range included), so
+/// consecutive blocks nest arrow-to-tail. When the texts overflow, the
+/// value blocks shrink — the wider one yielding columns to the narrower
+/// first — and are then ellipsized; the fixed input label keeps its width
+/// and the terminal clips the line as a last resort.
 fn fit_status_bar(app: &App, width: u16) -> Vec<(StatusZone, u16, u16, String)> {
-    let texts = status_bar_texts(app);
+    // Blocks to the right of the highlighted one hide: server focus keeps
+    // only the server block, channel focus adds the channel block, input
+    // focus shows all of them.
+    let highlighted = app.status_zone();
+    let texts: Vec<_> = status_bar_texts(app)
+        .into_iter()
+        .take_while(|&(zone, _)| zone_rank(zone) <= zone_rank(highlighted))
+        .collect();
     let n = texts.len();
     // Chrome: one space of padding on each side of every block plus its
     // right-edge arrow.
@@ -929,6 +938,16 @@ fn fit_status_bar(app: &App, width: u16) -> Vec<(StatusZone, u16, u16, String)> 
         x = x.saturating_add(body + 1);
     }
     segments
+}
+
+/// The zones' fixed left-to-right order in the status bar; used to cut the
+/// block list at the highlighted zone.
+fn zone_rank(zone: StatusZone) -> u8 {
+    match zone {
+        StatusZone::Server => 0,
+        StatusZone::Channel => 1,
+        StatusZone::Input => 2,
+    }
 }
 
 /// The status-bar zone containing screen column `x`: shared by drawing
@@ -1042,6 +1061,7 @@ mod tests {
             content: MessageContent::chat("nick7", "hello"),
         });
         app.set_sidebar_height(3);
+        app.focus_sidebar();
         for _ in 0..8 {
             app.sidebar_down();
         }
@@ -1074,15 +1094,14 @@ mod tests {
         msg_to("osu_irc", "#osu", nick, text)
     }
 
-    /// An app with both channels of the test config registered, viewing #osu,
-    /// with focus moved off the sidebar (as if the user opened a channel).
+    /// An app with both channels of the test config registered, viewing
+    /// #osu with the composer focused (the startup default, and where
+    /// opening a buffer leaves focus).
     fn test_app(width: u16, height: u16) -> App {
         let mut app = App::new(width, height);
         app.open_channel("osu_irc", "#osu");
         app.open_channel("osu_irc", "#chinese");
         app.select_buffer(0);
-        app.tab(); // Sidebar -> Messages
-        app.tab(); // Messages -> Composer
         app
     }
 
@@ -1838,6 +1857,7 @@ mod tests {
         // Arrange
         let mut app = viewing_app(22, 3);
         app.push_message(msg("alice", "hi"));
+        app.focus_messages(); // another pane holds focus: the accent dims
 
         // Act
         let buffer = render_sized(&app, "", 50, 10);
@@ -2297,15 +2317,23 @@ mod tests {
         }
     }
 
-    /// Column ranges (arrow column included) of the bar's three blocks at
-    /// width 50 with the osu_irc/#osu buffer:
-    /// ` server osu_irc  channel #osu  type in `.
-    fn bar_segments() -> [(StatusZone, u16, u16); 3] {
-        [
-            (StatusZone::Server, 0, 17),
+    /// Column ranges (arrow column included) of the bar's blocks at width
+    /// 50 with the osu_irc/#osu buffer, truncated after the highlighted
+    /// zone's block — mirroring `fit_status_bar`'s cut. Input focus:
+    /// ` server osu_irc  channel #osu  type in `; server focus:
+    /// ` server osu_irc ` alone.
+    fn bar_segments(highlighted: StatusZone) -> Vec<(StatusZone, u16, u16)> {
+        let all = [
+            (StatusZone::Server, 0u16, 17u16),
             (StatusZone::Channel, 17, 32),
             (StatusZone::Input, 32, 42),
-        ]
+        ];
+        let cut = match highlighted {
+            StatusZone::Server => 0,
+            StatusZone::Channel => 1,
+            StatusZone::Input => 2,
+        };
+        all.into_iter().take(cut + 1).collect()
     }
 
     #[test]
@@ -2344,7 +2372,7 @@ mod tests {
         // reading as part of the block; the plain blocks keep dim text and
         // arrows in the global background color (invisible until a colored
         // block follows them).
-        for &(zone, start, end) in bar_segments().iter() {
+        for &(zone, start, end) in bar_segments(StatusZone::Input).iter() {
             for x in start..end {
                 let cell = buffer.cell((x, 9)).unwrap();
                 let arrow = x + 1 == end; // the block's trailing powerline arrow
@@ -2395,7 +2423,7 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_navigation_highlights_the_selected_zone_segment() {
+    fn sidebar_navigation_highlights_and_truncates_at_the_selected_zone() {
         // Arrange: viewing #osu, then focus the sidebar with its cursor on
         // the server header, then move down onto the channel row.
         let mut app = viewing_app(22, 3);
@@ -2406,38 +2434,58 @@ mod tests {
         let channel = render_sized(&app, "", 50, 10);
         assert_eq!(app.sidebar_cursor(), Some(1)); // the #osu row
 
-        // Assert: the highlighted segment follows the cursor's row kind —
-        // the server zone while on the header, the channel zone on #osu.
-        let [(_, ss, _), (_, cs, _), _] = bar_segments();
+        // Assert: the highlighted block follows the cursor's row kind and
+        // is always the LAST block — everything to its right hides. Server
+        // focus renders ` server osu_irc ` alone; channel focus adds the
+        // channel block but still hides `type in`.
+        let server_segs = bar_segments(StatusZone::Server);
+        let (ss, se) = (server_segs[0].1, server_segs[0].2);
         assert_eq!(
             server.cell((ss + 1, 9)).unwrap().bg,
             theme().status_bar_highlight
         );
+        assert!(!buffer_line(&server, 9).contains("channel"), "server row");
+        assert!(!buffer_line(&server, 9).contains("type in"), "server row");
+        assert_eq!(server.cell((se, 9)).unwrap().symbol(), " "); // nothing after the arrow
+
+        let channel_segs = bar_segments(StatusZone::Channel);
         assert_eq!(
             channel.cell((ss + 1, 9)).unwrap().bg,
             theme().global_bg,
-            "server segment must dim once the cursor leaves the header"
+            "server block must dim once the cursor leaves the header"
         );
         assert_eq!(
-            channel.cell((cs + 1, 9)).unwrap().bg,
+            channel.cell((channel_segs[1].1 + 1, 9)).unwrap().bg,
             theme().status_bar_highlight
+        );
+        assert!(
+            !buffer_line(&channel, 9).contains("type in"),
+            "input block hides right of the highlighted channel block"
         );
     }
 
     #[test]
     fn status_bar_zone_hit_testing_matches_the_painted_blocks() {
-        // Arrange: viewing #osu on osu_irc at width 50.
-        let app = viewing_app(22, 3);
+        // Arrange: viewing #osu on osu_irc at width 50 with the composer
+        // focused (all three blocks painted).
+        let mut app = viewing_app(22, 3);
 
         // Act / Assert: each painted block maps to its zone — body and
         // trailing arrow alike — and columns past the last block map to
         // nothing.
-        for &(zone, start, end) in bar_segments().iter() {
+        for &(zone, start, end) in bar_segments(StatusZone::Input).iter() {
             assert_eq!(status_bar_zone_at(&app, 50, start + 1), Some(zone));
             assert_eq!(status_bar_zone_at(&app, 50, end - 1), Some(zone)); // the arrow
         }
         assert_eq!(status_bar_zone_at(&app, 50, 42), None); // past the bar
         assert_eq!(status_bar_zone_at(&app, 50, 49), None);
+
+        // Under server focus the channel and input blocks are hidden, so
+        // their old columns turn into dead space.
+        app.focus_sidebar_server();
+        assert_eq!(status_bar_zone_at(&app, 50, 18), None); // channel block gone
+        assert_eq!(status_bar_zone_at(&app, 50, 35), None); // input block gone
+        assert_eq!(status_bar_zone_at(&app, 50, 1), Some(StatusZone::Server));
     }
 
     #[test]
@@ -2449,17 +2497,60 @@ mod tests {
         let buffer = render_sized(&app, "", 80, 24);
 
         // Assert: only the standing input block remains — no server or
-        // channel label, no placeholder, one trailing arrow.
+        // channel label, no placeholder, one trailing arrow — highlighted
+        // from this very first frame (the startup focus).
         let bottom = buffer_line(&buffer, 23);
         assert!(bottom.contains("type in"), "bottom: {bottom:?}");
         assert!(bottom.contains(STATUS_BAR_ARROW), "bottom: {bottom:?}");
         assert!(!bottom.contains("server"), "bottom: {bottom:?}");
         assert!(!bottom.contains("channel"), "bottom: {bottom:?}");
         assert!(!bottom.contains("not connected"), "bottom: {bottom:?}");
+        assert_eq!(
+            buffer.cell((1, 23)).unwrap().bg,
+            theme().status_bar_highlight
+        );
         // Only the input block's columns are clickable; a server-column
         // click (where the block would start) is dead space.
         assert_eq!(status_bar_zone_at(&app, 80, 1), Some(StatusZone::Input));
         assert_eq!(status_bar_zone_at(&app, 80, 40), None);
+    }
+
+    #[test]
+    fn startup_register_config_highlights_the_input_block_on_the_first_frame() {
+        // Arrange: assemble a session exactly like main.rs does — buffers
+        // registered from the config, none activated (welcome page).
+        let config = crate::config::Config::parse(
+            r##"
+[servers.osu_irc]
+username = "me"
+nickname = "me"
+password = ""
+server = "irc.example.org"
+use_tls = true
+port = 6697
+channels = ["#osu"]
+queries = []
+"##,
+        )
+        .unwrap();
+        let mut app = App::new(50, 10);
+        app.session.register_config(&config);
+
+        // Act: the first render of the program.
+        let buffer = render_sized(&app, "", 80, 24);
+
+        // Assert: the composer holds focus from the first frame, so the
+        // input block is the highlighted one — not the sidebar's first
+        // row (the server header) as the pre-fix startup showed.
+        assert_eq!(app.focus(), Focus::Composer);
+        assert_eq!(app.status_zone(), StatusZone::Input);
+        let bottom = buffer_line(&buffer, 23);
+        assert!(bottom.contains("type in"), "bottom: {bottom:?}");
+        assert_eq!(
+            buffer.cell((1, 23)).unwrap().bg,
+            theme().status_bar_highlight
+        );
+        assert_eq!(buffer.cell((1, 23)).unwrap().fg, theme().global_bg);
     }
 
     #[test]

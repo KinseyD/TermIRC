@@ -357,12 +357,12 @@ mod tests {
 
     #[test]
     fn status_bar_segment_clicks_focus_their_zones() {
-        // Arrange: viewing #a on srv at 70x10; the bar reads
-        // ` server srv > channel #a > type in >` on row 9.
+        // Arrange: viewing #a on srv at 70x10. Input focus paints all
+        // three blocks: ` server srv  channel #a  type in `; server
+        // focus truncates to ` server srv ` alone on row 9.
         let mut app = App::new(70, 10);
         app.open_channel("srv", "#a");
         app.select_buffer(0);
-        app.focus_composer();
         let bar_click = |column: u16| MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column,
@@ -370,13 +370,14 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
 
-        // Act / Assert: the input block (arrow included) keeps the
-        // composer focused.
+        // Act / Assert: the input block (arrow included, at col 30/36)
+        // keeps the composer focused — the startup focus.
         handle_mouse(&mut app, bar_click(30), (70, 10));
         assert_eq!(app.focus(), Focus::Composer);
 
         // The server block focuses the sidebar on the server header row;
-        // its trailing arrow column belongs to it too.
+        // its trailing arrow column (col 12) belongs to it too, and the
+        // blocks to its right are hidden.
         handle_mouse(&mut app, bar_click(1), (70, 10));
         assert_eq!(app.focus(), Focus::Sidebar);
         assert_eq!(app.sidebar_cursor(), Some(0));
@@ -384,7 +385,12 @@ mod tests {
         handle_mouse(&mut app, bar_click(12), (70, 10));
         assert_eq!(app.status_zone(), StatusZone::Server); // the arrow
 
-        // The channel block moves the cursor to the buffer row.
+        // Where the channel block used to be is now dead space: the click
+        // changes nothing. Focus the message pane first (the channel zone)
+        // so the channel block is painted again, then click it.
+        handle_mouse(&mut app, bar_click(15), (70, 10));
+        assert_eq!(app.sidebar_cursor(), Some(0));
+        app.focus_messages();
         handle_mouse(&mut app, bar_click(15), (70, 10));
         assert_eq!(app.sidebar_cursor(), Some(1));
         assert_eq!(app.status_zone(), StatusZone::Channel);
