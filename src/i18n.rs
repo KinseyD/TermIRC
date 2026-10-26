@@ -112,12 +112,9 @@ const REGISTRY: &[(&str, &str)] = &[
         "status.query_target_changed",
         "query target changed; use /query to select a nickname",
     ),
-    // statusbar.* — the bottom status bar's zone labels. The server and
-    // channel blocks carry the current buffer's names as {name} and hide
-    // entirely while they have no applicable value; the input block is
-    // the composer zone's standing label.
-    ("statusbar.server", "server {name}"),
-    ("statusbar.channel", "channel {name}"),
+    // statusbar.* — the bottom status bar. The server and channel blocks
+    // show the raw names (pure data); only the input block's standing
+    // label is localized.
     ("statusbar.input", "type in"),
     // err.send_* — SendError variants, surfaced via status.send_failed.
     (
@@ -516,8 +513,6 @@ mod tests {
                 "status.query_target_changed",
                 "query target changed; use /query to select a nickname",
             ),
-            ("statusbar.server", "server {name}"),
-            ("statusbar.channel", "channel {name}"),
             ("statusbar.input", "type in"),
             (
                 "err.send_invalid_characters",

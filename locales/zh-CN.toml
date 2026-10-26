@@ -51,9 +51,8 @@ send_failed_disconnected = "发送失败（{server} 已断开或繁忙）"
 query_target_changed = "私聊对象已更改；请使用 /query 选择昵称"
 
 [statusbar]
-server = "服务器 {name}"
-channel = "频道 {name}"
 input = "输入"
+
 [err]
 send_invalid_characters = "消息包含无效的控制字符"
 send_invalid_command = "无效的 IRC 命令"
