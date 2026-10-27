@@ -7,7 +7,8 @@
 A terminal IRC client written in Rust. TermIRC reads your servers from a
 TOML config file, opens one connection per server — joining every
 configured channel — and gives you a scrollable chat pane, a
-server/channel sidebar, and a composer to talk with. `Enter` sends.
+server/channel sidebar, a composer to talk with, and a focus-aware
+status bar along the bottom. `Enter` sends.
 
 ## Requirements
 
@@ -133,8 +134,9 @@ The most useful roles:
 | `status_ok`         | `green`     | connected server dot            |
 
 The remaining roles (`dim`, `accent_dim`, `hover_bg`, `sidebar_cursor_bg`,
-`input_cursor_fg`, `input_cursor_bg`, `status_err`, `status_pending`) follow
-the same rules; see the commented example in `config.example.toml`.
+`input_cursor_fg`, `input_cursor_bg`, `status_err`, `status_pending`,
+`status_bar_highlight`) follow the same rules; see the commented example in
+`config.example.toml`.
 
 Security notes:
 
@@ -178,6 +180,28 @@ The mouse works too: the wheel scrolls the messages, resting the pointer
 on a message pre-highlights it, and a click focuses a pane — clicking a
 channel in the sidebar opens it. While TermIRC runs, hold `Shift` for the
 terminal's own text selection.
+
+A one-line status bar sits at the very bottom: the server and channel
+names followed by a `type in` label, nested arrow-to-tail. The block
+matching where your focus is — typing in the composer, reading the
+message pane, or navigating the sidebar — is highlighted and always the
+last one shown; blocks to its right hide until focus moves past them.
+While the sidebar holds focus its cursor row supplies the names: a server
+header row shows that server's block alone, a channel or query row adds
+that channel's name (`@nick` for queries), so the entry frame already
+shows a highlighted server block. With focus elsewhere the names come
+from the viewed buffer, and a viewed server console shows the server
+block alone. When no block has a value (nothing connected yet) the bar
+renders fully dim — the `type in` label stands for the composer alone.
+Clicking a block focuses the matching sidebar row (inside the sidebar,
+the row that block already names), blocks without a value hide entirely,
+and the server/channel sidebar holds focus from the program's first
+frame.
+
+The status bar's separator is the powerline right-arrow `` (U+E0B0),
+which fills the row's full height; it comes from a Nerd Font. Without
+one, terminals substitute a fallback glyph — the bar still works, the
+arrow just looks plain (`▶`-like at best, a box at worst).
 
 Inputs beginning with `/` after trimming surrounding whitespace are parsed
 as slash commands in both channels and the server console. Supported

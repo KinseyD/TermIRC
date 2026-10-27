@@ -29,6 +29,7 @@ pub const ROLE_NAMES: &[&str] = &[
     "status_ok",
     "status_err",
     "status_pending",
+    "status_bar_highlight",
 ];
 
 /// A complete color palette for the renderer: one [`Color`] per role.
@@ -67,6 +68,8 @@ pub struct Theme {
     pub status_err: Color,
     /// Sidebar status dot: connecting / joining / parting.
     pub status_pending: Color,
+    /// Background of the focused segment in the bottom status bar.
+    pub status_bar_highlight: Color,
 }
 
 impl Default for Theme {
@@ -88,6 +91,7 @@ impl Default for Theme {
             status_ok: Color::Green,
             status_err: Color::Red,
             status_pending: Color::Gray,
+            status_bar_highlight: Color::Rgb(0x9a, 0xd9, 0x9a),
         }
     }
 }
@@ -112,6 +116,7 @@ impl Theme {
             "status_ok" => self.status_ok = color,
             "status_err" => self.status_err = color,
             "status_pending" => self.status_pending = color,
+            "status_bar_highlight" => self.status_bar_highlight = color,
             _ => return false,
         }
         true
@@ -136,6 +141,7 @@ impl Theme {
             "status_ok" => Some(self.status_ok),
             "status_err" => Some(self.status_err),
             "status_pending" => Some(self.status_pending),
+            "status_bar_highlight" => Some(self.status_bar_highlight),
             _ => None,
         }
     }
@@ -358,6 +364,7 @@ mod tests {
             ("status_ok", Color::Green),
             ("status_err", Color::Red),
             ("status_pending", Color::Gray),
+            ("status_bar_highlight", Color::Rgb(0x9a, 0xd9, 0x9a)),
         ];
         assert_eq!(expected.len(), ROLE_NAMES.len());
         for (name, color) in expected {
