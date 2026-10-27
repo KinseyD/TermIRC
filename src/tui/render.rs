@@ -830,21 +830,39 @@ fn render_gap(frame: &mut Frame, area: Rect, screen_w: u16, app: &App, theme: &T
     );
 }
 
-/// The status bar's candidate blocks: the raw server label and channel
-/// name (queries as `@nick`) — pure data, no label prefix — followed by
-/// the input zone's standing localized label. A block with no value
-/// hides entirely: the server/channel blocks need an active buffer with a
-/// non-empty name, the channel block also hides while a server console is
-/// viewed (the server block already names it), and the input block always
-/// exists so the list is never empty. [`effective_status_zone`] and
-/// [`fit_status_bar`] decide what actually renders.
+/// The status bar's candidate blocks. While the sidebar holds focus its
+/// cursor row IS the bar's data: the server block takes the row's server
+/// label and a channel/query row adds the channel block (queries as
+/// `@nick`) — so the bar tracks the sidebar's own navigation even with
+/// nothing viewed, and the entry frame already shows where focus sits.
+/// Otherwise the blocks come from the active buffer: its raw server label
+/// and channel name — pure data, no label prefix. The input zone's
+/// standing localized label always ends the list. A block with no value
+/// hides entirely: the server/channel blocks need a non-empty name, the
+/// channel block also hides for a server row/console (the server block
+/// already names it), and the input block always exists so the list is
+/// never empty. [`effective_status_zone`] and [`fit_status_bar`] decide
+/// what actually renders.
 fn status_bar_texts(app: &App) -> Vec<(StatusZone, String)> {
+    // The sidebar's cursor row names the blocks while the sidebar holds
+    // focus; a missing cursor row falls back to the active buffer.
+    let named = if app.focus() == Focus::Sidebar {
+        app.sidebar_cursor()
+            .and_then(|index| app.sidebar_rows().get(index).cloned())
+            .map(|row| (row.server, row.kind))
+    } else {
+        None
+    };
+    let named = named.or_else(|| {
+        app.active_buffer()
+            .map(|buffer| (buffer.server_label.clone(), buffer.kind.clone()))
+    });
     let mut segments = Vec::with_capacity(3);
-    if let Some(buffer) = app.active_buffer() {
-        if !buffer.server_label.is_empty() {
-            segments.push((StatusZone::Server, buffer.server_label.clone()));
+    if let Some((server_label, kind)) = named {
+        if !server_label.is_empty() {
+            segments.push((StatusZone::Server, server_label.to_string()));
         }
-        let channel_name = match &buffer.kind {
+        let channel_name = match kind {
             crate::core::BufferKind::Channel(name) => Some(name.clone()),
             crate::core::BufferKind::Query(nick) => Some(format!("@{nick}")),
             crate::core::BufferKind::Server => None,
@@ -884,45 +902,46 @@ fn clip_columns(text: &str, width: usize) -> String {
 }
 
 /// The zone the status bar actually highlights: [`App::status_zone`] when
-/// its block exists in the block list, otherwise the LAST present block's
-/// zone. `status_zone` can name a zone whose block is absent — a server
-/// console hides the channel block, and before anything is connected both
-/// value blocks hide — and an absent highlight would truncate the list
-/// past it into a blank or fully dimmed bar. The clamp keeps the
-/// highlighted block existing and always last. `None` only when the whole
-/// list is empty (unreachable: the input block is unconditional).
+/// its block exists in the block list, otherwise `None` — no block at
+/// all. With the sidebar focused the blocks derive from its cursor row,
+/// so the named zone always has one; `status_zone` can still name a zone
+/// whose block is absent elsewhere (a viewed server console hides the
+/// channel block, and before anything is connected both value blocks
+/// hide), and highlighting any other block would lie about where focus
+/// sits — the input block speaks for the composer only, so it highlights
+/// solely under the composer's own focus. A `None` result paints every
+/// present block dim; the list itself is never empty (the input block is
+/// unconditional).
 fn effective_status_zone(app: &App) -> Option<StatusZone> {
-    let texts = status_bar_texts(app);
     let named = app.status_zone();
-    if texts.iter().any(|&(zone, _)| zone == named) {
-        Some(named)
-    } else {
-        texts.last().map(|&(zone, _)| zone)
-    }
+    status_bar_texts(app)
+        .iter()
+        .any(|&(zone, _)| zone == named)
+        .then_some(named)
 }
 
 /// Fit the status bar's visible blocks into `width` columns. Blocks to the
 /// RIGHT of the highlighted zone's block hide, so the highlighted block is
 /// always the last one rendered and its arrow sits on the global
-/// background. Each block renders as ` text ` plus the powerline arrow on
-/// its right edge (the arrow is part of the block, hit range included), so
-/// consecutive blocks nest arrow-to-tail. When the texts overflow, the
-/// value blocks shrink — the wider one yielding columns to the narrower
-/// first — and are then ellipsized; the fixed input label keeps its width
-/// and the terminal clips the line as a last resort.
+/// background; with no highlighted block (focus elsewhere than the bar's
+/// zones) every present block renders, fully dim. Each block renders as
+/// ` text ` plus the powerline arrow on its right edge (the arrow is part
+/// of the block, hit range included), so consecutive blocks nest
+/// arrow-to-tail. When the texts overflow, the value blocks shrink — the
+/// wider one yielding columns to the narrower first — and are then
+/// ellipsized; the fixed input label keeps its width and the terminal
+/// clips the line as a last resort.
 fn fit_status_bar(app: &App, width: u16) -> Vec<(StatusZone, u16, u16, String)> {
     // Blocks to the right of the highlighted one hide: server focus keeps
     // only the server block, channel focus adds the channel block, input
-    // focus shows all of them.
-    let Some(highlighted) = effective_status_zone(app) else {
-        // Unreachable today — the input block is unconditional — but an
-        // empty block list would paint an empty bar.
-        return Vec::new();
+    // focus shows all of them; no highlight dims everything that exists.
+    let texts: Vec<_> = match effective_status_zone(app) {
+        Some(highlighted) => status_bar_texts(app)
+            .into_iter()
+            .take_while(|&(zone, _)| zone_rank(zone) <= zone_rank(highlighted))
+            .collect(),
+        None => status_bar_texts(app),
     };
-    let texts: Vec<_> = status_bar_texts(app)
-        .into_iter()
-        .take_while(|&(zone, _)| zone_rank(zone) <= zone_rank(highlighted))
-        .collect();
     let n = texts.len();
     // Chrome: one space of padding on each side of every block plus its
     // right-edge arrow.
@@ -1113,13 +1132,14 @@ mod tests {
     }
 
     /// An app with both channels of the test config registered, viewing
-    /// #osu with the composer focused (the startup default, and where
-    /// opening a buffer leaves focus).
+    /// #osu with the composer focused (where opening a buffer leaves
+    /// focus; the raw startup focus is the sidebar).
     fn test_app(width: u16, height: u16) -> App {
         let mut app = App::new(width, height);
         app.open_channel("osu_irc", "#osu");
         app.open_channel("osu_irc", "#chinese");
         app.select_buffer(0);
+        app.focus_composer();
         app
     }
 
@@ -1129,6 +1149,7 @@ mod tests {
         let mut app = App::new(width, height);
         app.open_channel("osu_irc", "#osu");
         app.select_buffer(0);
+        app.focus_composer();
         app
     }
 
@@ -2514,18 +2535,17 @@ mod tests {
         let buffer = render_sized(&app, "", 80, 24);
 
         // Assert: only the standing input block remains — no server or
-        // channel label, no placeholder, one trailing arrow — highlighted
-        // from this very first frame (the startup focus).
+        // channel label, no placeholder, one trailing arrow — rendered
+        // dim: the sidebar holds focus but has no block on this page, and
+        // the input block speaks for the composer only.
         let bottom = buffer_line(&buffer, 23);
         assert!(bottom.contains("type in"), "bottom: {bottom:?}");
         assert!(bottom.contains(STATUS_BAR_ARROW), "bottom: {bottom:?}");
         assert!(!bottom.contains("server"), "bottom: {bottom:?}");
         assert!(!bottom.contains("channel"), "bottom: {bottom:?}");
         assert!(!bottom.contains("not connected"), "bottom: {bottom:?}");
-        assert_eq!(
-            buffer.cell((1, 23)).unwrap().bg,
-            theme().status_bar_highlight
-        );
+        assert_eq!(buffer.cell((1, 23)).unwrap().fg, theme().dim);
+        assert_eq!(buffer.cell((1, 23)).unwrap().bg, theme().global_bg);
         // Only the input block's columns are clickable; a server-column
         // click (where the block would start) is dead space.
         assert_eq!(status_bar_zone_at(&app, 80, 1), Some(StatusZone::Input));
@@ -2533,9 +2553,9 @@ mod tests {
     }
 
     #[test]
-    fn startup_register_config_highlights_the_input_block_on_the_first_frame() {
+    fn startup_view_highlights_the_server_block_on_the_first_frame() {
         // Arrange: assemble a session exactly like main.rs does — buffers
-        // registered from the config, none activated (welcome page).
+        // registered from the config — and view the configured channel.
         let config = crate::config::Config::parse(
             r##"
 [servers.osu_irc]
@@ -2552,17 +2572,25 @@ queries = []
         .unwrap();
         let mut app = App::new(50, 10);
         app.session.register_config(&config);
+        let channel = app
+            .session
+            .buffers
+            .iter()
+            .find(|b| matches!(b.kind, crate::core::BufferKind::Channel(_)))
+            .map(|b| b.id)
+            .unwrap();
+        app.activate_buffer(channel);
 
         // Act: the first render of the program.
         let buffer = render_sized(&app, "", 80, 24);
 
-        // Assert: the composer holds focus from the first frame, so the
-        // input block is the highlighted one — not the sidebar's first
-        // row (the server header) as the pre-fix startup showed.
-        assert_eq!(app.focus(), Focus::Composer);
-        assert_eq!(app.status_zone(), StatusZone::Input);
+        // Assert: the sidebar holds focus from the first frame with the
+        // cursor on the server header row, so the server block is the
+        // highlighted one — and the input block hides to its right.
+        assert_eq!(app.focus(), Focus::Sidebar);
+        assert_eq!(app.status_zone(), StatusZone::Server);
         let bottom = buffer_line(&buffer, 23);
-        assert!(bottom.contains("type in"), "bottom: {bottom:?}");
+        assert!(!bottom.contains("type in"), "bottom: {bottom:?}");
         assert_eq!(
             buffer.cell((1, 23)).unwrap().bg,
             theme().status_bar_highlight
@@ -2590,10 +2618,10 @@ queries = []
     }
 
     #[test]
-    fn console_view_with_channel_zone_cursor_clamps_the_highlight_to_the_input_block() {
-        // Arrange: a console viewed while the sidebar cursor rests on a
-        // channel row — the channel zone, whose block is hidden on a
-        // console view.
+    fn sidebar_cursor_on_a_channel_row_paints_and_highlights_that_channel_block() {
+        // Arrange: a console viewed while the sidebar cursor rests on
+        // #osu's row — the sidebar's own navigation, independent of the
+        // viewed buffer.
         let mut app = App::new(50, 10);
         let console = app.open_server("osu_irc");
         app.open_channel("osu_irc", "#osu");
@@ -2605,46 +2633,130 @@ queries = []
         // Act
         let buffer = render_sized(&app, "", 80, 24);
 
-        // Assert: the highlight clamps to the input block — the last one
-        // present — instead of naming an absent block and dimming the
-        // whole bar: ` osu_irc  type in `, server plain, input
-        // highlighted, nothing after its arrow.
+        // Assert: the bar follows the cursor row, not the viewed console:
+        // ` osu_irc  #osu ` with the channel block highlighted (the
+        // server block stays dim) and the input block hidden to its
+        // right.
         let bottom = buffer_line(&buffer, 23);
         assert!(bottom.contains("osu_irc"), "bottom: {bottom:?}");
-        assert!(bottom.contains("type in"), "bottom: {bottom:?}");
-        assert!(!bottom.contains("channel"), "bottom: {bottom:?}");
-        assert_eq!(buffer.cell((1, 23)).unwrap().fg, theme().dim);
-        assert_eq!(buffer.cell((1, 23)).unwrap().bg, theme().global_bg);
+        assert!(bottom.contains("#osu"), "bottom: {bottom:?}");
+        assert!(!bottom.contains("type in"), "bottom: {bottom:?}");
+        assert_eq!(
+            buffer.cell((1, 23)).unwrap().bg,
+            theme().global_bg,
+            "server block dims left of the highlighted channel block"
+        );
         assert_eq!(
             buffer.cell((11, 23)).unwrap().bg,
             theme().status_bar_highlight
         );
-        assert_eq!(status_bar_zone_at(&app, 80, 11), Some(StatusZone::Input));
+        assert_eq!(buffer.cell((11, 23)).unwrap().fg, theme().global_bg);
+        // Hit-testing matches the paint: both blocks live, everything
+        // past the channel arrow is dead space.
+        assert_eq!(status_bar_zone_at(&app, 80, 1), Some(StatusZone::Server));
+        assert_eq!(status_bar_zone_at(&app, 80, 11), Some(StatusZone::Channel));
+        assert_eq!(status_bar_zone_at(&app, 80, 40), None);
     }
 
     #[test]
-    fn server_zone_without_a_server_block_clamps_to_the_input_block() {
-        // Arrange: buffers exist but none is viewed (welcome page) and the
-        // sidebar cursor sits on the server header row — the server zone,
-        // which has no block while no buffer is active.
+    fn sidebar_cursor_on_a_query_row_paints_the_nick_as_the_channel_block() {
+        // Arrange: a query buffer's row under the sidebar cursor, with
+        // nothing viewed.
         let mut app = App::new(50, 10);
         app.open_channel("osu_irc", "#osu");
-        app.focus_sidebar_channel(); // snaps the cursor to row 0 (header)
+        app.open_query("osu_irc", "alice");
+        app.focus_sidebar_channel(); // snaps to row 0 (the header)
+        app.sidebar_down();
+        app.sidebar_down(); // onto @alice's row
+
+        // Act
+        let buffer = render_sized(&app, "", 80, 24);
+
+        // Assert: the query renders as `@alice` in the channel block and
+        // takes the highlight; the #osu row's name never paints and the
+        // input block hides to the right.
+        let bottom = buffer_line(&buffer, 23);
+        assert!(bottom.contains("@alice"), "bottom: {bottom:?}");
+        assert!(!bottom.contains("#osu"), "bottom: {bottom:?}");
+        assert!(!bottom.contains("type in"), "bottom: {bottom:?}");
+        assert_eq!(
+            buffer.cell((11, 23)).unwrap().bg,
+            theme().status_bar_highlight
+        );
+        assert_eq!(status_bar_zone_at(&app, 80, 11), Some(StatusZone::Channel));
+    }
+
+    #[test]
+    fn sidebar_cursor_on_a_later_server_header_names_that_server_not_the_first() {
+        // Arrange: two servers registered, none viewed (welcome page);
+        // walk the cursor onto the SECOND server's header row.
+        let mut app = App::new(50, 10);
+        app.open_channel("alpha", "#one");
+        app.open_channel("beta", "#two");
+        app.focus_sidebar_channel(); // snaps to row 0 (alpha's header)
+        app.sidebar_down();
+        app.sidebar_down(); // onto beta's header row
         assert_eq!(app.status_zone(), StatusZone::Server);
 
         // Act
         let buffer = render_sized(&app, "", 80, 24);
 
-        // Assert: the input block alone, highlighted through the clamp —
-        // not a blank bar with every block truncated away.
+        // Assert: the server block follows the cursor's own row — beta —
+        // not the first registered server, and as the highlighted block
+        // it is the last one painted.
         let bottom = buffer_line(&buffer, 23);
-        assert!(bottom.contains("type in"), "bottom: {bottom:?}");
-        assert!(!bottom.contains("server"), "bottom: {bottom:?}");
+        assert!(bottom.contains("beta"), "bottom: {bottom:?}");
+        assert!(!bottom.contains("alpha"), "bottom: {bottom:?}");
+        assert!(!bottom.contains("type in"), "bottom: {bottom:?}");
         assert_eq!(
             buffer.cell((1, 23)).unwrap().bg,
             theme().status_bar_highlight
         );
-        assert_eq!(status_bar_zone_at(&app, 80, 1), Some(StatusZone::Input));
+    }
+
+    #[test]
+    fn startup_welcome_page_highlights_the_first_server_header_block() {
+        // Arrange: a fresh app exactly as it boots — sidebar focused, its
+        // cursor on row 0, and no buffer activated (welcome page).
+        let mut app = App::new(50, 10);
+        app.open_channel("osu_irc", "#osu"); // buffers registered, none viewed
+        assert_eq!(app.focus(), Focus::Sidebar);
+        assert_eq!(app.status_zone(), StatusZone::Server);
+
+        // Act: the first render of the program.
+        let buffer = render_sized(&app, "", 80, 24);
+
+        // Assert: the cursor row supplies the blocks, so the server
+        // header paints ` osu_irc ` highlighted — the bar shows where
+        // focus sits from the very first frame — and the input block
+        // hides to its right instead of claiming the focus dimly.
+        let bottom = buffer_line(&buffer, 23);
+        assert!(bottom.contains("osu_irc"), "bottom: {bottom:?}");
+        assert!(!bottom.contains("type in"), "bottom: {bottom:?}");
+        assert_eq!(
+            buffer.cell((1, 23)).unwrap().bg,
+            theme().status_bar_highlight
+        );
+        assert_eq!(buffer.cell((1, 23)).unwrap().fg, theme().global_bg);
+        assert_eq!(status_bar_zone_at(&app, 80, 1), Some(StatusZone::Server));
+    }
+
+    #[test]
+    fn message_focus_on_the_welcome_page_leaves_the_bar_dim() {
+        // Arrange: the message pane focused with no buffer viewed — its
+        // zone defaults to server, which has no block on the welcome page.
+        let mut app = App::new(50, 10);
+        app.open_channel("osu_irc", "#osu");
+        app.focus_messages();
+        assert_eq!(app.status_zone(), StatusZone::Server);
+
+        // Act
+        let buffer = render_sized(&app, "", 80, 24);
+
+        // Assert: the input block stays dim; only the composer's focus
+        // highlights it.
+        assert_eq!(buffer.cell((1, 23)).unwrap().fg, theme().dim);
+        assert_eq!(buffer.cell((1, 23)).unwrap().bg, theme().global_bg);
     }
 
     #[test]

@@ -181,15 +181,22 @@ on a message pre-highlights it, and a click focuses a pane — clicking a
 channel in the sidebar opens it. While TermIRC runs, hold `Shift` for the
 terminal's own text selection.
 
-A one-line status bar sits at the very bottom: the current server and
-channel names followed by a `type in` label, nested arrow-to-tail. The
-block matching where your focus is — typing in the composer, or
-navigating server headers vs. channel rows in the sidebar — is highlighted
-and always the last one shown; blocks to its right hide until focus moves
-past them. Clicking a block focuses that zone, blocks without a value hide
-entirely (nothing connected shows only `type in`; a server console view
-drops the channel block), and the composer holds focus from the program's
-first frame.
+A one-line status bar sits at the very bottom: the server and channel
+names followed by a `type in` label, nested arrow-to-tail. The block
+matching where your focus is — typing in the composer, reading the
+message pane, or navigating the sidebar — is highlighted and always the
+last one shown; blocks to its right hide until focus moves past them.
+While the sidebar holds focus its cursor row supplies the names: a server
+header row shows that server's block alone, a channel or query row adds
+that channel's name (`@nick` for queries), so the entry frame already
+shows a highlighted server block. With focus elsewhere the names come
+from the viewed buffer, and a viewed server console shows the server
+block alone. When no block has a value (nothing connected yet) the bar
+renders fully dim — the `type in` label stands for the composer alone.
+Clicking a block focuses the matching sidebar row (inside the sidebar,
+the row that block already names), blocks without a value hide entirely,
+and the server/channel sidebar holds focus from the program's first
+frame.
 
 The status bar's separator is the powerline right-arrow `` (U+E0B0),
 which fills the row's full height; it comes from a Nerd Font. Without

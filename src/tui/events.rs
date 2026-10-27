@@ -357,9 +357,10 @@ mod tests {
 
     #[test]
     fn status_bar_segment_clicks_focus_their_zones() {
-        // Arrange: viewing #a on srv at 70x10. Input focus paints all
-        // three blocks: ` srv  #a  type in `; server focus truncates to
-        // ` srv ` alone on row 9.
+        // Arrange: viewing #a on srv at 70x10 with the sidebar holding
+        // its startup focus on the server header row, so the bar paints
+        // ` srv ` alone on row 9; the message pane and composer states
+        // are reached below.
         let mut app = App::new(70, 10);
         app.open_channel("srv", "#a");
         app.select_buffer(0);
@@ -370,8 +371,8 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
 
-        // Act / Assert: the input block (arrow included) keeps the
-        // composer focused — the startup focus.
+        // Act / Assert: right of the truncated bar is dead space — this
+        // click changes nothing (the sidebar keeps its startup focus).
         handle_mouse(&mut app, bar_click(15), (70, 10));
 
         // The server block focuses the sidebar on the server header row;

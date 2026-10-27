@@ -137,11 +137,10 @@ impl App {
         Self {
             session: Session::new(message_cap),
             views: HashMap::new(),
-            // The composer is where the cursor lives from the first
-            // frame: keys type immediately (Tab or a click moves focus to
-            // the sidebar), so the status bar highlights the input block
-            // at startup instead of the sidebar's first row.
-            focus: Focus::Composer,
+            // The sidebar owns the cursor from the first frame: the
+            // server/channel bar is where navigation starts (Tab or a
+            // click moves focus to the composer).
+            focus: Focus::Sidebar,
             sidebar_cursor: Some(0),
             sidebar_hovered: None,
             sidebar_cursor_id: None,
@@ -467,16 +466,28 @@ impl App {
         }
     }
 
-    /// Focus the sidebar with its cursor on the active server's header row
-    /// (the status bar's server-zone click). A no-op with no active buffer.
+    /// Focus the sidebar with its cursor on a server header row (the
+    /// status bar's server-zone click). While the sidebar already holds
+    /// focus the bar's server block names the cursor row's own server, so
+    /// the cursor jumps to THAT server's header; otherwise it targets the
+    /// viewed buffer's server. A no-op when neither names a known header.
     pub fn focus_sidebar_server(&mut self) {
-        let Some(buffer) = self.active_buffer() else {
+        let label = if self.focus == Focus::Sidebar {
+            let rows = self.sidebar_rows();
+            self.sidebar_cursor
+                .and_then(|index| rows.get(index))
+                .map(|row| row.server.clone())
+        } else {
+            self.active_buffer()
+                .map(|buffer| buffer.server_label.clone())
+        };
+        let Some(label) = label else {
             return;
         };
         let rows = self.sidebar_rows();
         let Some(index) = rows
             .iter()
-            .position(|row| row.kind == BufferKind::Server && row.server == buffer.server_label)
+            .position(|row| row.kind == BufferKind::Server && row.server == label)
         else {
             return;
         };
@@ -484,11 +495,24 @@ impl App {
         self.focus = Focus::Sidebar;
     }
 
-    /// Focus the sidebar with its cursor on the active buffer's row (the
-    /// status bar's channel-zone click). A no-op with an empty sidebar.
+    /// Focus the sidebar with its cursor on the channel block's row (the
+    /// status bar's channel-zone click). Outside the sidebar the block
+    /// names the viewed buffer, so the cursor snaps to its row; inside the
+    /// sidebar it already names the cursor's own row, so the cursor stays
+    /// put. A no-op with an empty sidebar.
     pub fn focus_sidebar_channel(&mut self) {
         if self.sidebar_rows().is_empty() {
             return;
+        }
+        if self.focus == Focus::Sidebar {
+            let rows = self.sidebar_rows();
+            if self
+                .sidebar_cursor
+                .and_then(|index| rows.get(index))
+                .is_some_and(|row| row.kind != BufferKind::Server)
+            {
+                return;
+            }
         }
         self.set_sidebar_cursor(self.active_sidebar_row());
         self.focus = Focus::Sidebar;

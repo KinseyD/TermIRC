@@ -1050,38 +1050,39 @@ fn tab_cycles_sidebar_messages_composer() {
     let mut app = App::new(40, 10);
     app.open_channel("srv", "#a");
 
-    // Fresh start: the composer is focused (the cursor lives there) and no
-    // channel is viewed.
-    assert_eq!(app.focus(), Focus::Composer);
-    assert_eq!(active_target(&app), None);
-    app.tab();
+    // Fresh start: the sidebar is focused (the server/channel bar owns
+    // the cursor) and no channel is viewed.
     assert_eq!(app.focus(), Focus::Sidebar);
+    assert_eq!(active_target(&app), None);
     app.tab();
     assert_eq!(app.focus(), Focus::Messages);
     app.tab();
     assert_eq!(app.focus(), Focus::Composer);
+    app.tab();
+    assert_eq!(app.focus(), Focus::Sidebar);
 }
 
 #[test]
-fn startup_focuses_the_composer_and_highlights_the_input_zone() {
-    // Fresh start: the composer holds focus from the first frame (keys
-    // type immediately), and the sidebar cursor rests on the first row
-    // for when the user tabs into it.
+fn startup_focuses_the_sidebar_with_the_cursor_on_the_server_row() {
+    // Fresh start: the server/channel bar holds focus from the first
+    // frame, with the cursor resting on its first row (the server
+    // header); Tab moves focus on to the composer.
     let mut app = App::new(40, 10);
     app.open_channel("srv", "#a");
-    assert_eq!(app.focus(), Focus::Composer);
-    assert_eq!(app.status_zone(), StatusZone::Input);
+    assert_eq!(app.focus(), Focus::Sidebar);
+    assert_eq!(app.status_zone(), StatusZone::Server);
     assert_eq!(app.sidebar_cursor(), Some(0));
 }
 
 #[test]
 fn tab_into_sidebar_snaps_cursor_to_active_channel_row() {
     // Arrange: open both channels, view #b (row 2); the composer holds
-    // the startup focus.
+    // the focus (startup focus is the sidebar now).
     let mut app = App::new(40, 10);
     app.open_channel("srv", "#a");
     app.open_channel("srv", "#b");
     app.select_buffer(1); // view #b
+    app.focus_composer();
     assert_eq!(app.focus(), Focus::Composer);
 
     // Act: tab into the sidebar.
@@ -1117,7 +1118,8 @@ fn sidebar_jk_moves_cursor_and_clamps() {
 fn sidebar_jk_ignored_when_sidebar_not_focused() {
     let mut app = App::new(40, 10);
     app.open_channel("srv", "#a");
-    // Startup focus is the composer: the sidebar is not focused.
+    // Move focus off the sidebar (startup focus) so j/k must be ignored.
+    app.focus_composer();
     let before = app.sidebar_cursor();
     app.sidebar_down();
     assert_eq!(app.sidebar_cursor(), before);
@@ -1202,8 +1204,7 @@ fn sidebar_enter_on_channel_switches_view_and_focuses_composer() {
 fn no_selection_when_channel_is_empty() {
     let mut app = App::new(40, 10);
     app.open_channel("srv", "#a");
-    app.tab();
-    app.tab(); // Composer -> Sidebar -> Messages
+    app.tab(); // Sidebar -> Messages
     assert_eq!(app.focus(), Focus::Messages);
     assert_eq!(app.selected(), None);
 }
@@ -1223,8 +1224,7 @@ fn focusing_messages_selects_lowest_fully_visible() {
     assert_eq!(app.scroll_offset(), app.max_offset());
 
     // Act
-    app.tab();
-    app.tab(); // Composer -> Sidebar -> Messages (auto-selects m4)
+    app.tab(); // Sidebar -> Messages (auto-selects m4)
 
     // Assert
     assert_eq!(app.focus(), Focus::Messages);
@@ -1241,8 +1241,7 @@ fn select_prev_moves_up_and_reveals_with_minimal_scroll() {
     for i in 0..5 {
         app.push_message(chan_msg("srv", "#a", &format!("m{i}")));
     }
-    app.tab();
-    app.tab(); // Composer -> Sidebar -> Messages (auto-selects m4)
+    app.tab(); // Sidebar -> Messages (auto-selects m4)
     assert_eq!(app.selected(), Some(4));
 
     // Act / Assert: each step scrolls up just enough to reveal the
@@ -1272,8 +1271,7 @@ fn select_next_moves_down_and_clamps_at_newest() {
     for i in 0..5 {
         app.push_message(chan_msg("srv", "#a", &format!("m{i}")));
     }
-    app.tab();
-    app.tab(); // Composer -> Sidebar -> Messages (auto-selects m4)
+    app.tab(); // Sidebar -> Messages (auto-selects m4)
     for _ in 0..4 {
         app.select_prev();
     }
@@ -1304,8 +1302,7 @@ fn follow_is_paused_while_a_message_is_selected() {
     for i in 0..4 {
         app.push_message(chan_msg("srv", "#a", &format!("m{i}")));
     }
-    app.tab();
-    app.tab(); // Composer -> Sidebar -> Messages (auto-selects m3)
+    app.tab(); // Sidebar -> Messages (auto-selects m3)
     let selected = app.selected().unwrap();
     let offset = app.scroll_offset();
 
@@ -1323,7 +1320,7 @@ fn selection_ignored_when_messages_not_focused() {
     let mut app = App::new(40, 3);
     app.open_channel("srv", "#a");
     app.push_message(chan_msg("srv", "#a", "m0"));
-    assert_eq!(app.focus(), Focus::Composer); // startup focus, not Messages
+    assert_eq!(app.focus(), Focus::Sidebar); // startup focus, not Messages
 
     // Act
     app.select_prev();
@@ -1465,7 +1462,7 @@ fn click_message_selects_and_focuses_the_pane() {
     app.select_buffer(0);
     app.push_message(msg("a", "one"));
     app.push_message(msg("b", "two"));
-    assert_eq!(app.focus(), Focus::Composer); // the startup focus
+    app.focus_composer(); // not the Messages pane
 
     // Act
     app.click_message(1);
@@ -1814,8 +1811,8 @@ fn status_zone_follows_focus_and_the_sidebar_cursor_row_kind() {
     app.focus_messages();
     assert_eq!(app.status_zone(), StatusZone::Server);
 
-    // A fresh app starts in the composer: the input zone.
-    assert_eq!(App::new(40, 5).status_zone(), StatusZone::Input);
+    // A fresh app starts in the sidebar: the server zone.
+    assert_eq!(App::new(40, 5).status_zone(), StatusZone::Server);
 }
 
 #[test]
@@ -1845,4 +1842,30 @@ fn status_bar_zone_focus_shortcuts_target_the_matching_sidebar_row() {
         Some(BufferKind::Server)
     );
     assert_eq!(app.active_buffer().unwrap().server_label, "beta");
+}
+
+#[test]
+fn status_bar_zone_clicks_inside_the_sidebar_target_the_painted_rows_server() {
+    // Arrange: alpha's console viewed while the sidebar cursor sits on
+    // beta's #two row — the bar paints ` beta  #two `.
+    let mut app = App::new(40, 5);
+    app.open_channel("alpha", "#one");
+    app.open_channel("beta", "#two");
+    let console = app.open_server("alpha");
+    app.activate_buffer(console);
+    app.focus_sidebar_server(); // alpha's header (the viewed server)
+    app.sidebar_down();
+    app.sidebar_down();
+    app.sidebar_down(); // onto beta's #two row
+    assert_eq!(app.sidebar_cursor(), Some(3));
+
+    // Act / Assert: the painted blocks name beta, so the channel-block
+    // click keeps the cursor on its own row and the server-block click
+    // jumps to beta's header — never to the viewed alpha rows.
+    app.focus_sidebar_channel();
+    assert_eq!(app.sidebar_cursor(), Some(3));
+    assert_eq!(app.status_zone(), StatusZone::Channel);
+    app.focus_sidebar_server();
+    assert_eq!(app.sidebar_cursor(), Some(2)); // beta's header
+    assert_eq!(app.status_zone(), StatusZone::Server);
 }
