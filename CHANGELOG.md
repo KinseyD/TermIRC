@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-10-28
+
 ### Changed
 
 - The composer now uses the terminal's real cursor at the caret (positioned
@@ -90,6 +92,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - SQLite-backed persistent chat history configured via the `[history]`
   section; restored history obeys the same in-memory cutoffs as live buffers.
 
+[0.9.0]: https://github.com/KinseyD/TermIRC/releases/tag/v0.9.0
 [0.8.0]: https://github.com/KinseyD/TermIRC/releases/tag/v0.8.0
 [0.7.0]: https://github.com/KinseyD/TermIRC/releases/tag/v0.7.0
 [0.6.0]: https://github.com/KinseyD/TermIRC/releases/tag/v0.6.0
