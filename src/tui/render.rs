@@ -943,6 +943,21 @@ fn clip_columns(text: &str, width: usize) -> String {
     out
 }
 
+/// `label` padded with spaces to `width` display columns. Unlike
+/// `{label:<width$}`, which counts chars, this keeps the value column
+/// aligned for double-width (CJK) labels. An already wider label is
+/// returned unchanged rather than truncated.
+fn pad_label(label: &str, width: usize) -> String {
+    let used = label.width();
+    if used >= width {
+        return label.to_string();
+    }
+    let mut padded = String::with_capacity(label.len() + (width - used));
+    padded.push_str(label);
+    padded.extend(std::iter::repeat_n(' ', width - used));
+    padded
+}
+
 /// The zone the status bar actually highlights: [`App::status_zone`] when
 /// its block exists in the block list, otherwise `None` — no block at
 /// all. With the sidebar focused the blocks derive from its cursor row,
@@ -1104,6 +1119,9 @@ fn inset(area: Rect, pad: u16) -> Rect {
     )
 }
 
+/// Display columns reserved for a wizard row's label, after the cursor mark.
+const DIALOG_LABEL_WIDTH: usize = 16;
+
 /// Render the modal setup wizard, centered over the whole screen. The
 /// panel reuses composer colors: `input_bg` fill with a `separator`
 /// border, the focused row accented, and validation errors in the
@@ -1146,18 +1164,22 @@ pub fn render_config_dialog(
             }
         }
     }
-    for (x, y) in [
-        (panel.x, panel.y),
-        (panel.x + panel.width - 1, panel.y),
-        (panel.x, panel.y + panel.height - 1),
-        (panel.x + panel.width - 1, panel.y + panel.height - 1),
+    for (corner, (x, y)) in [
+        ('┌', (panel.x, panel.y)),
+        ('┐', (panel.x + panel.width - 1, panel.y)),
+        ('└', (panel.x, panel.y + panel.height - 1)),
+        ('┘', (panel.x + panel.width - 1, panel.y + panel.height - 1)),
     ] {
         if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
-            cell.set_char('┼').set_style(border);
+            cell.set_char(corner).set_style(border);
         }
     }
 
     let inner = inset(clip_vertical(panel, 1), 1);
+    // Interior budget: one cursor column plus the 16-column label block,
+    // leaving one column of slack so a full-width value never touches
+    // the border.
+    let value_width = (inner.width as usize).saturating_sub(DIALOG_LABEL_WIDTH + 2);
     let mut rows: Vec<Line<'static>> = Vec::new();
     let title = i18n::t("dlg.title");
     let pad = inner.width.saturating_sub(title.width() as u16) / 2;
@@ -1175,7 +1197,7 @@ pub fn render_config_dialog(
             crate::tui::dialog::FieldKind::Toggle => {
                 i18n::t(if field.flag { "dlg.on" } else { "dlg.off" }).to_string()
             }
-            _ => clip_columns(field.text.text(), (inner.width as usize).saturating_sub(18)),
+            crate::tui::dialog::FieldKind::Text => clip_columns(field.text.text(), value_width),
         };
         let label = i18n::t(field.label_key);
         let style = if focused {
@@ -1186,7 +1208,7 @@ pub fn render_config_dialog(
         let cursor_mark = if focused { "┃" } else { " " };
         rows.push(Line::from(vec![
             Span::styled(cursor_mark.to_string(), Style::new().fg(theme.accent)),
-            Span::styled(format!("{label:<16}"), style),
+            Span::styled(pad_label(label, DIALOG_LABEL_WIDTH), style),
             Span::styled(value, Style::new().fg(theme.nick)),
         ]));
     }
@@ -1363,6 +1385,24 @@ mod tests {
     }
 
     #[test]
+    fn pad_label_pads_by_display_columns_and_never_truncates() {
+        // ASCII pads by the difference in columns.
+        assert_eq!(pad_label("host", 16), format!("host{}", " ".repeat(12)));
+
+        // A CJK label is already 10 columns wide, so it only needs 6 spaces
+        // and the result is exactly the label block's width.
+        let cjk = pad_label("服务器地址", 16);
+        assert!(cjk.starts_with("服务器地址"), "{cjk}");
+        assert_eq!(UnicodeWidthStr::width(cjk.as_str()), 16);
+
+        // A label at or past the budget is returned unchanged.
+        let exact = "a".repeat(16);
+        assert_eq!(pad_label(&exact, 16), exact);
+        let overlong = "b".repeat(20);
+        assert_eq!(pad_label(&overlong, 16), overlong);
+    }
+
+    #[test]
     fn the_config_wizard_renders_its_title_fields_and_actions_over_the_page() {
         // Arrange: an empty config (first run) so the welcome page is
         // behind the modal, with the wizard opened on defaults.
@@ -1383,6 +1423,12 @@ mod tests {
         assert!(text.contains(crate::i18n::t("dlg.field_host")), "{text}");
         assert!(text.contains(crate::i18n::t("dlg.save")), "{text}");
         assert!(text.contains(crate::i18n::t("dlg.cancel")), "{text}");
+        // The panel's four corners are real box corners, not the `┼`
+        // that made the outline read as a cross.
+        for corner in ['┌', '┐', '└', '┘'] {
+            assert!(text.contains(corner), "missing {corner}: {text}");
+        }
+        assert!(!text.contains('┼'), "corners must not be crosses: {text}");
         let (_, cursor) = render_frame(&app, "", 70, 20, &theme());
         assert!(cursor.is_none(), "the dialog must not move the cursor");
     }

@@ -15,17 +15,15 @@ use ratatui::crossterm::event::KeyCode;
 /// Index of the pseudo-row below the last field: the Save action.
 pub const SAVE_ROW: usize = 9;
 
-/// How each field edits and validates.
+/// How each field edits: typed text or a boolean toggled in place.
+/// Port and channel syntax are ordinary text here; [`ConfigDialog::collect`]
+/// validates them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldKind {
     /// Free single-line text.
     Text,
-    /// Numeric text collected as a port number.
-    Port,
     /// A boolean toggled in place instead of typed.
     Toggle,
-    /// Comma-separated channel names validated individually.
-    Channels,
 }
 
 /// One editable form row.
@@ -178,14 +176,16 @@ impl ConfigDialog {
                     match (field.kind, code) {
                         (FieldKind::Toggle, KeyCode::Char(' ')) => field.flag = !field.flag,
                         (FieldKind::Toggle, _) => {}
-                        (_, KeyCode::Char(c)) if !c.is_control() => field.text.insert(c),
-                        (_, KeyCode::Backspace) => field.text.backspace(),
-                        (_, KeyCode::Delete) => field.text.delete(),
-                        (_, KeyCode::Left) => field.text.left(),
-                        (_, KeyCode::Right) => field.text.right(),
-                        (_, KeyCode::Home) => field.text.home(),
-                        (_, KeyCode::End) => field.text.end(),
-                        _ => {}
+                        (FieldKind::Text, KeyCode::Char(c)) if !c.is_control() => {
+                            field.text.insert(c);
+                        }
+                        (FieldKind::Text, KeyCode::Backspace) => field.text.backspace(),
+                        (FieldKind::Text, KeyCode::Delete) => field.text.delete(),
+                        (FieldKind::Text, KeyCode::Left) => field.text.left(),
+                        (FieldKind::Text, KeyCode::Right) => field.text.right(),
+                        (FieldKind::Text, KeyCode::Home) => field.text.home(),
+                        (FieldKind::Text, KeyCode::End) => field.text.end(),
+                        (FieldKind::Text, _) => {}
                     }
                 }
                 DialogOutcome::Edited

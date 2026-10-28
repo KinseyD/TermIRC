@@ -468,7 +468,22 @@ fn merge_server_section(existing: &str, name: &str, emitted: &str) -> String {
 /// The write itself is atomic: a temporary file in the same directory,
 /// then `rename` over the target.
 pub fn save_server(path: &Path, name: &str, server: &ServerConfig) -> anyhow::Result<()> {
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    // Only a genuinely missing file means "start from scratch". Treating
+    // any other read failure (permissions, invalid UTF-8, a directory) as
+    // an empty file would rewrite it with just the wizard's section and
+    // silently lose everything else.
+    let existing = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                i18n::format(
+                    i18n::t("err.cfg_write"),
+                    &[("path", &path.display().to_string())],
+                )
+            });
+        }
+    };
     let merged = merge_server_section(&existing, name, &emit_server_table(name, server));
     Config::parse(&merged).map_err(|error| {
         // Log only the top-level context: the toml error chain can embed
@@ -485,14 +500,18 @@ pub fn save_server(path: &Path, name: &str, server: &ServerConfig) -> anyhow::Re
         })?;
     }
     let temp = path.with_extension("toml.tmp");
-    std::fs::write(&temp, &merged)
-        .and_then(|_| std::fs::rename(&temp, path))
-        .with_context(|| {
+    if let Err(error) = std::fs::write(&temp, &merged).and_then(|_| std::fs::rename(&temp, path)) {
+        // Do not leave a partial or misleading `*.toml.tmp` behind when
+        // the atomic write never landed.
+        let _ = std::fs::remove_file(&temp);
+        return Err(error).with_context(|| {
             i18n::format(
                 i18n::t("err.cfg_write"),
                 &[("path", &path.display().to_string())],
             )
-        })
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1104,6 +1123,44 @@ channels = ["#a"]
         assert!(path.exists());
         assert!(!path.with_extension("toml.tmp").exists());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn save_server_refuses_an_unreadable_config_instead_of_rewriting_it() {
+        // Arrange: an existing file that is not UTF-8 (the read fails with
+        // InvalidData, as a permission error would with PermissionDenied)
+        // and a directory where the config file is expected.
+        let invalid = temp_path("invalid-utf8");
+        std::fs::write(&invalid, [0xff, 0xfe, 0x00]).unwrap();
+        let as_directory =
+            std::env::temp_dir().join(format!("termirc-cfg-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&as_directory);
+        std::fs::create_dir_all(&as_directory).unwrap();
+
+        // Act
+        let invalid_result = save_server(&invalid, "new", &wizard_server());
+        let directory_result = save_server(&as_directory, "new", &wizard_server());
+
+        // Assert: both report the write failure and leave the target as it
+        // was instead of replacing it with just the wizard's section.
+        let expected = |path: &std::path::Path| {
+            i18n::format(
+                i18n::t("err.cfg_write"),
+                &[("path", &path.display().to_string())],
+            )
+        };
+        let error = invalid_result.unwrap_err().to_string();
+        assert_eq!(error, expected(&invalid));
+        assert_eq!(std::fs::read(&invalid).unwrap(), [0xff, 0xfe, 0x00]);
+        assert!(!invalid.with_extension("toml.tmp").exists());
+
+        let error = directory_result.unwrap_err().to_string();
+        assert_eq!(error, expected(&as_directory));
+        assert!(as_directory.is_dir());
+        assert!(!as_directory.with_extension("toml.tmp").exists());
+
+        let _ = std::fs::remove_file(&invalid);
+        let _ = std::fs::remove_dir_all(&as_directory);
     }
 
     #[test]
