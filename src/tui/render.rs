@@ -5,7 +5,7 @@
 //!  sidebar (fixed)  │  main column
 //!    ● osu_irc        │  (blank separator)          <- framing separator rows
 //!      ● #osu         │  alice: hello ...            <- messages (scroll)
-//!  \u{f054}   ● #chinese     │  ────────────────            <- hint bar (only while a
+//!  >   ● #chinese     │  ────────────────            <- hint bar (only while a
 //!                    │  /join — Join or focus ...      `/` command is drafted;
 //!                    │  ┃                             highlighted row reversed)
 //!                    │  ┃   /join #osu             <- input (4 rows, bg-shaded,
