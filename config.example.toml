@@ -1,3 +1,7 @@
+# termirc configuration. Copy this file to ~/.config/termirc/config.toml.
+# Running with no config file at all opens the in-TUI setup wizard
+# instead; `/config` reopens it later to edit the first server entry.
+
 [servers.example]
 username = "YourName"
 nickname = "YourName"

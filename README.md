@@ -35,6 +35,15 @@ status bar along the bottom. `Enter` sends.
 
    A sample (`config.example.toml`) ships in the repo root; replace its connection settings before use.
 
+   Alternatively, skip this step: run TermIRC with no config file and
+   the in-TUI setup wizard opens on the first frame. Fill in the server
+   name, host, nickname, port (default `6697`), TLS toggle, initial
+   channels, and the optional SASL pair, then press `Enter` on **Save**:
+   the file is written and the server connects immediately. Type
+   `/config` at any time to reopen the wizard and reconfigure the first
+   server entry (keys the form does not model — `password`, `queries`,
+   `proxy`, `[ui]`, `[theme]` — are preserved verbatim).
+
 2. Run:
 
    ```bash

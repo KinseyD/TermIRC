@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- In-TUI server configuration wizard: on first run (no
+  `~/.config/termirc/config.toml`, or one without servers) the client
+  boots to a modal setup form instead of exiting. It edits the server
+  name, host, port, nickname, username, TLS toggle, startup channels,
+  and the optional SASL pair with the same validation `Config::parse`
+  enforces, writes the file atomically, and connects the new server at
+  runtime without a restart. `/config` reopens the wizard on the first
+  configured server; keys the form does not model (`password`,
+  `queries`, `proxy`, `[ui]`, `[theme]`, comments) are preserved
+  verbatim. `Config::default()` and a server-entry writer
+  (`config::save_server`) back it, and a missing `password` key now
+  defaults to empty instead of failing the parse.
+
 ## [0.9.0] — 2026-10-28
 
 ### Changed
