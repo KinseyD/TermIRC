@@ -1085,6 +1085,28 @@ channels = ["#a"]
     }
 
     #[test]
+    fn save_server_creates_missing_parent_directories() {
+        // Arrange: a nested path whose directories do not exist yet, so
+        // the `create_dir_all` branch (and the same-directory temp rename)
+        // is actually exercised — the other writer tests all use
+        // `std::env::temp_dir()` directly.
+        let root = std::env::temp_dir().join(format!("termirc-cfg-nested-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let path = root.join("deep").join("config.toml");
+
+        // Act
+        save_server(&path, "new", &wizard_server()).unwrap();
+
+        // Assert: the tree and file exist, the file reloads, and no temp
+        // file was left behind.
+        let saved = Config::load(&path).unwrap();
+        assert_eq!(saved.servers["new"].server, "irc.example.org");
+        assert!(path.exists());
+        assert!(!path.with_extension("toml.tmp").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn save_server_appending_a_renamed_label_keeps_the_old_entry() {
         // Arrange
         let path = temp_path("rename");

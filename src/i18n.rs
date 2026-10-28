@@ -204,7 +204,6 @@ const REGISTRY: &[(&str, &str)] = &[
         "err.startup_config_load",
         "failed to load config from {path} - copy your config file there (e.g. config.example.toml)",
     ),
-    ("err.startup_no_servers", "config has no servers"),
     ("err.startup_mouse", "failed to enable mouse capture"),
 ];
 
@@ -630,7 +629,6 @@ mod tests {
                 "err.startup_config_load",
                 "failed to load config from {path} - copy your config file there (e.g. config.example.toml)",
             ),
-            ("err.startup_no_servers", "config has no servers"),
             ("err.startup_mouse", "failed to enable mouse capture"),
         ];
         assert_eq!(REGISTRY.len(), pinned.len(), "registry and pin table sizes");
