@@ -256,16 +256,16 @@ fn handle_key_press(app: &mut App, code: KeyCode, ctrl: bool, ctx: &mut KeyConte
 }
 
 /// Persist the wizard's entry and bring it live: write the merged
-/// config file, spawn a worker for a newly named server (the same
-/// per-server thread startup uses, so the UI never blocks), open its
-/// buffers, and close the dialog. Failures keep the dialog open with
-/// the reason on its error row.
+/// config file, replace the server's worker so the saved host, port and
+/// TLS settings take effect immediately, open its buffers, and close
+/// the dialog. Failures keep the dialog open with the reason on its
+/// error row.
 fn save_dialog(app: &mut App, ctx: &mut KeyContext<'_>) {
     let Some(collected) = app.dialog.as_ref().map(|dialog| dialog.collect()) else {
         return;
     };
     // collect's Err is the i18n key of the violated rule.
-    let (name, server) = match collected {
+    let (name, mut server) = match collected {
         Ok(entry) => entry,
         Err(key) => {
             if let Some(dialog) = app.dialog.as_mut() {
@@ -274,6 +274,16 @@ fn save_dialog(app: &mut App, ctx: &mut KeyContext<'_>) {
             return;
         }
     };
+    // The form does not model `password`, `queries`, or `proxy`, while
+    // the config writer preserves them from the existing section. Carry
+    // the previous entry's values across before spawning so the worker
+    // started below sees the same credentials and startup targets the
+    // file keeps, instead of silently dropping them.
+    if let Some(previous) = ctx.config.servers.get(&name) {
+        server.password = previous.password.clone();
+        server.queries = previous.queries.clone();
+        server.proxy = previous.proxy.clone();
+    }
     if let Err(error) = config::save_server(ctx.config_path, &name, &server) {
         // Log the top-level context only: the error chain can embed raw
         // TOML source lines, which may persist SASL passwords.
@@ -283,23 +293,34 @@ fn save_dialog(app: &mut App, ctx: &mut KeyContext<'_>) {
         }
         return;
     }
-    if !ctx.outgoing.contains_key(&name) {
-        let (_thread, handle) = crate::connection::spawn_irc(
-            server.clone(),
-            name.clone(),
-            server.channels.clone(),
-            ctx.tx.clone(),
-        );
-        ctx.outgoing.insert(name.clone(), handle);
-        app.session.register_server(&name, &server);
-        // Land on the new server's console (idempotent open) so the
-        // composer is usable the moment the wizard closes.
+    // Every save replaces the worker, editing an already-connected
+    // server included: the worker clones its `ServerConfig` at spawn, so
+    // a new host/port/TLS would otherwise wait for a process restart.
+    // Dropping the old handle closes its channels, and the worker's
+    // `control.recv()` returning `None` ends its loop. Only non-server
+    // tables such as `[theme]`/`[history]` still need a restart, and the
+    // wizard does not edit them.
+    ctx.outgoing.remove(&name);
+    let (_thread, handle) = crate::connection::spawn_irc(
+        server.clone(),
+        name.clone(),
+        server.channels.clone(),
+        ctx.tx.clone(),
+    );
+    ctx.outgoing.insert(name.clone(), handle);
+    let had_console = app.session.buffers.iter().any(|buffer| {
+        buffer.kind == crate::core::BufferKind::Server
+            && buffer.server == crate::core::ServerId::new(&name)
+    });
+    // Registration is idempotent: an edit keeps its existing buffers and
+    // current focus, while a first save gains the console view below.
+    app.session.register_server(&name, &server);
+    // Land on a new server's console (idempotent open) so the composer
+    // is usable the moment the wizard closes.
+    if !had_console {
         let console = app.session.open_server(&name);
         app.activate_buffer(console);
     }
-    // A saved edit of an already-connected server updates the file and
-    // the in-memory config; the live worker keeps its settings until the
-    // user reconnects it (/reconnect).
     ctx.config.servers.insert(name, server);
     app.close_dialog();
     *ctx.status = crate::i18n::format(
@@ -739,6 +760,97 @@ mod tests {
         assert!(saved.contains("server = \"127.0.0.1\""));
         assert!(saved.contains("channels = [\"#a\"]"));
         assert!(status.contains(&path.display().to_string()));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn saving_an_edited_server_keeps_the_unmodeled_keys_and_replaces_its_worker() {
+        // Arrange: a config file whose entry carries keys the form does
+        // not model (password, queries, proxy), a live worker handle for
+        // it, and a viewed channel.
+        let path =
+            std::env::temp_dir().join(format!("termirc-wizard-edit-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(
+            &path,
+            "[servers.libera]\nusername = \"me\"\nnickname = \"me\"\npassword = \"keepme\"\nserver = \"old.example.org\"\nuse_tls = false\nport = 6667\nchannels = [\"#one\"]\nqueries = [\"alice\"]\n\n[servers.libera.proxy]\ntype = \"socks5\"\nhost = \"127.0.0.1\"\nport = 9050\n",
+        )
+        .unwrap();
+        let mut config = crate::config::Config::load(&path).unwrap();
+
+        let mut app = App::new(40, 10);
+        app.open_server("libera");
+        let channel = app.open_channel("libera", "#one");
+        app.activate_buffer(channel);
+        app.open_config_dialog(&config);
+        {
+            let dialog = app.dialog.as_mut().unwrap();
+            // Point the edited entry at a port that refuses immediately.
+            dialog.fields[1].text.restore("127.0.0.1".into(), 9);
+            dialog.fields[2].text.restore("1".into(), 1);
+            dialog.cursor = crate::tui::dialog::SAVE_ROW;
+        }
+        // A handle standing in for the worker started at boot. Keeping a
+        // clone of its outgoing sender lets the test tell the channels
+        // apart; nothing else holds the control receiver, so its closure
+        // is observable too.
+        let (old_outgoing, _old_outgoing_rx) = tokio::sync::mpsc::channel(8);
+        let (old_control, mut old_control_rx) = tokio::sync::mpsc::channel(8);
+        let old_sender = old_outgoing.clone();
+        let mut outgoing = std::collections::HashMap::from([(
+            "libera".to_string(),
+            ConnectionHandle {
+                outgoing: old_outgoing,
+                control: old_control,
+            },
+        )]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut status = String::new();
+        let mut ctx = KeyContext {
+            config: &mut config,
+            outgoing: &mut outgoing,
+            tx: &tx,
+            config_path: &path,
+            status: &mut status,
+        };
+
+        // Act
+        handle_key_press(&mut app, KeyCode::Enter, false, &mut ctx);
+
+        // Assert: the worker was replaced rather than duplicated, and the
+        // old control channel closed so its loop ends.
+        drop(rx);
+        assert!(app.dialog.is_none());
+        assert_eq!(outgoing.len(), 1);
+        assert!(
+            !outgoing["libera"].outgoing.same_channel(&old_sender),
+            "a saved edit must replace the server's worker"
+        );
+        assert!(
+            matches!(
+                old_control_rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+            ),
+            "dropping the old handle must close its control channel"
+        );
+        // An edit keeps the user's buffer focused instead of jumping to
+        // the console.
+        assert_eq!(app.active_buffer().unwrap().id, channel);
+
+        // File and memory agree: the new connection details plus the keys
+        // the form does not model.
+        let saved = crate::config::Config::load(&path).unwrap();
+        let entry = &saved.servers["libera"];
+        assert_eq!(entry.server, "127.0.0.1");
+        assert_eq!(entry.port, 1);
+        assert_eq!(entry.password, "keepme");
+        assert_eq!(entry.queries, vec!["alice".to_string()]);
+        assert_eq!(entry.proxy.as_ref().map(|proxy| proxy.port), Some(9050));
+        let memory = &config.servers["libera"];
+        assert_eq!(memory.server, "127.0.0.1");
+        assert_eq!(memory.password, "keepme");
+        assert_eq!(memory.queries, vec!["alice".to_string()]);
+        assert_eq!(memory.proxy.as_ref().map(|proxy| proxy.port), Some(9050));
         let _ = std::fs::remove_file(&path);
     }
 

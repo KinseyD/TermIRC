@@ -41,8 +41,9 @@ status bar along the bottom. `Enter` sends.
    channels, and the optional SASL pair, then press `Enter` on **Save**:
    the file is written and the server connects immediately. Type
    `/config` at any time to reopen the wizard and reconfigure the first
-   server entry (keys the form does not model — `password`, `queries`,
-   `proxy`, `[ui]`, `[theme]` — are preserved verbatim).
+   server entry (saving reconnects it immediately with the new settings;
+   keys the form does not model — `password`, `queries`, `proxy`, `[ui]`,
+   `[theme]` — are preserved verbatim).
 
 2. Run:
 

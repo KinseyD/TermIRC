@@ -14,13 +14,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   boots to a modal setup form instead of exiting. It edits the server
   name, host, port, nickname, username, TLS toggle, startup channels,
   and the optional SASL pair with the same validation `Config::parse`
-  enforces, writes the file atomically, and connects the new server at
-  runtime without a restart. `/config` reopens the wizard on the first
+  enforces, writes the file atomically, and (re)connects the saved
+  server at runtime without a restart. Saving an edit to an already
+  connected server replaces its worker, so a new host, port or TLS
+  setting takes effect immediately; only non-server tables
+  (`[theme]`, `[history]`, ...) still need a restart, and the wizard
+  does not edit those. `/config` reopens the wizard on the first
   configured server; keys the form does not model (`password`,
   `queries`, `proxy`, `[ui]`, `[theme]`, comments) are preserved
-  verbatim. `Config::default()` and a server-entry writer
-  (`config::save_server`) back it, and a missing `password` key now
-  defaults to empty instead of failing the parse. Cancelling the
+  verbatim, both in the file and in the in-memory config.
+  `Config::default()` and a server-entry writer (`config::save_server`)
+  back it, and a missing `password` key now defaults to empty instead
+  of failing the parse. Cancelling the
   first-run wizard keeps the client usable: the welcome page shows a
   dim hint and `c` reopens the wizard there (that page has no composer
   to type `/config` into), while `Esc`/`Ctrl+C` still quit.
