@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- The composer now uses the terminal's real cursor at the caret (positioned
+  every frame while the composer has focus, hidden otherwise) instead of a
+  simulated reverse-video block; the sidebar cursor stays a highlighted row.
+- The `[theme]` roles `input_cursor_fg` and `input_cursor_bg` are deprecated
+  and ignored: they are still parsed (malformed values still fail) and log a
+  single `termirc::theme` warning, but no longer exist in the theme.
+- Every sidebar row now opens with a 2-column pointer lane: an accent Nerd
+  Font chevron (`\u{f054}`) marks the focused navigation-cursor row, while
+  the active (viewed) row keeps its brighter background with its name
+  accent-colored and bold.
+
 ## [0.8.0] — 2026-10-28
 
 ### Added

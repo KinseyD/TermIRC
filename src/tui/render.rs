@@ -3,9 +3,9 @@
 //! Screen layout (no box frames):
 //! ```text
 //!  sidebar (fixed)  │  main column
-//!  osu_irc           │  (blank separator)          <- framing separator rows
-//!    ▶ #osu         │  alice: hello ...            <- messages (scroll)
-//!      #chinese     │  ────────────────            <- hint bar (only while a
+//!    ● osu_irc        │  (blank separator)          <- framing separator rows
+//!      ● #osu         │  alice: hello ...            <- messages (scroll)
+//!  >   ● #chinese     │  ────────────────            <- hint bar (only while a
 //!                    │  /join — Join or focus ...      `/` command is drafted;
 //!                    │  ┃                             highlighted row reversed)
 //!                    │  ┃   /join #osu             <- input (4 rows, bg-shaded,
@@ -15,6 +15,10 @@
 //!                                                   highlighted, and clicking
 //!                                                   a segment focuses it)
 //! ```
+//! The sidebar's pointer lane holds the navigation cursor: while the sidebar
+//! is focused, a Nerd Font chevron (`\u{f054}`, private-use code point)
+//! marks the cursor row; the active (viewed) row instead gets a brighter
+//! background with its name accent-colored and bold.
 //! Before any channel is opened the main column shows only the centered logo -
 //! no composer. Lines are pre-wrapped by `layout`, so the messages `Paragraph`
 //! is rendered without `Wrap`: continuation rows already carry their own
@@ -246,12 +250,7 @@ pub fn draw(frame: &mut Frame, app: &App, chrome: &Chrome<'_>) {
     render_pre_selection(frame, g.messages, app, theme);
     render_selection(frame, g.messages, app, theme);
     render_hints(frame, g.hints, app, theme);
-    let input_lines = build_wrapped_input_lines(
-        &g.input_layout,
-        app.input_cursor(),
-        app.focus() == Focus::Composer,
-        theme,
-    );
+    let input_lines = build_wrapped_input_lines(&g.input_layout);
     render_composer(
         frame,
         &g,
@@ -261,6 +260,12 @@ pub fn draw(frame: &mut Frame, app: &App, chrome: &Chrome<'_>) {
         app,
         theme,
     );
+    // The composer's caret is the terminal's real cursor: positioned at the
+    // caret cell while the composer has focus, hidden otherwise (ratatui
+    // hides the cursor when no position is set for the frame).
+    if app.focus() == Focus::Composer && app.active_buffer().is_some() && !g.input.is_empty() {
+        frame.set_cursor_position(composer_cursor_cell(&g));
+    }
     render_gap(frame, g.gap, frame.area().width, app, theme);
     render_status_bar(frame, g.status_bar, app, theme);
 }
@@ -322,11 +327,15 @@ fn render_separator(frame: &mut Frame, area: Rect, theme: &Theme) {
     frame.render_widget(Paragraph::new(Text::from(lines)), col);
 }
 
-/// Render the server/channel sidebar from the app's row model: a bold
-/// server header per server with its channels beneath, the active row (the
-/// viewed channel, or the server header while its console is viewed) with
-/// a brighter background, and (while the sidebar has focus) a cursor row
-/// with a slightly brighter background plus a block cursor at its start.
+/// Render the server/channel sidebar from the app's row model: every row
+/// starts with a 2-column pointer lane (an accent chevron `\u{f054}` on the
+/// focused cursor row, blank otherwise - including the active row) so rows
+/// stay column-aligned, a bold server header per server with its channels
+/// beneath, the active row (the viewed channel, or the server header while
+/// its console is viewed) with a brighter background and its name
+/// accent-colored and bold, and (while the sidebar has focus) a cursor row
+/// with a slightly brighter background. No terminal cursor is placed here:
+/// the real cursor belongs to the composer.
 fn render_sidebar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let inner = inset(area, 1);
     if inner.width == 0 || inner.height == 0 {
@@ -370,7 +379,10 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             frame.buffer_mut().set_style(row_rect, Style::new().bg(bg));
         }
 
-        // Row text: a leading space reserves room for the block cursor.
+        // Row text: a 2-column pointer lane holding the sidebar's navigation
+        // cursor - an accent chevron on the focused cursor row, blank on
+        // every other row (including the active row) - keeps every row's dot
+        // and name column-aligned.
         let state = app.connection_state(&row.server, row.kind.channel());
         let (symbol, color) = match state {
             crate::connection::ConnectionState::Connected => ("● ", theme.status_ok),
@@ -385,20 +397,39 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             ),
         };
         let dot = Span::styled(symbol, Style::new().fg(color));
+        // Nerd Font chevron-right; \u{f054} is a private-use code point, so
+        // it is written as an escape rather than a literal character.
+        let pointer = if is_cursor {
+            Span::styled("\u{f054} ", Style::new().fg(theme.accent))
+        } else {
+            Span::raw("  ")
+        };
+        let active_name = Style::new().fg(theme.accent).add_modifier(Modifier::BOLD);
         let line = match &row.kind {
             crate::core::BufferKind::Server => Line::from(vec![
-                Span::raw(" "),
+                pointer,
                 dot,
                 Span::styled(
                     row.server.as_str(),
-                    Style::new().add_modifier(Modifier::BOLD),
+                    if is_active {
+                        active_name
+                    } else {
+                        Style::new().add_modifier(Modifier::BOLD)
+                    },
                 ),
             ]),
             crate::core::BufferKind::Channel(channel) => Line::from(vec![
-                Span::raw(" "),
+                pointer.clone(),
                 Span::raw("  "),
                 dot,
-                Span::styled(channel.as_str(), Style::new().fg(theme.dim)),
+                Span::styled(
+                    channel.as_str(),
+                    if is_active {
+                        active_name
+                    } else {
+                        Style::new().fg(theme.dim)
+                    },
+                ),
             ]),
             crate::core::BufferKind::Query(nickname) => {
                 let unread = row
@@ -406,24 +437,20 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                     .and_then(|id| app.buffer(id))
                     .is_some_and(|buffer| buffer.unread);
                 Line::from(vec![
-                    Span::raw("   "),
+                    pointer,
+                    Span::raw("  "),
                     Span::styled(
                         format!("@{nickname}{}", if unread { "*" } else { "" }),
-                        Style::new().fg(theme.dim),
+                        if is_active {
+                            active_name
+                        } else {
+                            Style::new().fg(theme.dim)
+                        },
                     ),
                 ])
             }
         };
         frame.render_widget(Paragraph::new(line), row_rect);
-
-        // Block cursor at the start of the focused row.
-        if is_cursor {
-            frame.buffer_mut()[(inner.x, y)].set_symbol(" ").set_style(
-                Style::new()
-                    .fg(theme.input_cursor_fg)
-                    .bg(theme.input_cursor_bg),
-            );
-        }
     }
 }
 
@@ -449,49 +476,41 @@ pub fn composer_height(input_lines: usize) -> u16 {
         .saturating_add(INPUT_FIXED_ROWS)
 }
 
-/// Build the composer's input lines: hard-wrap `text` to `width` columns; when
-/// `show_cursor` is set, render a reverse-video cursor at the `cursor` char
-/// index (a solid block when the cursor sits at the end of the text).
-fn build_wrapped_input_lines(
-    layout: &super::input::InputLayout,
-    cursor: usize,
-    show_cursor: bool,
-    theme: &Theme,
-) -> Vec<Line<'static>> {
+/// Build the composer's input lines: the layout's hard-wrapped rows, as-is.
+/// The caret is not drawn here - it is the terminal's real cursor, placed by
+/// [`draw`] via [`composer_cursor_cell`].
+fn build_wrapped_input_lines(layout: &super::input::InputLayout) -> Vec<Line<'static>> {
     layout
         .lines
         .iter()
-        .enumerate()
-        .map(|(row, line)| {
-            if !show_cursor || row != layout.cursor_row {
-                return Line::from(line.text.clone());
-            }
-            let local = cursor.saturating_sub(line.start);
-            let chars: Vec<char> = line.text.chars().collect();
-            let before: String = chars.iter().take(local).collect();
-            let at = chars
-                .get(local)
-                .map(char::to_string)
-                .unwrap_or_else(|| " ".into());
-            let after: String = chars.iter().skip(local + 1).collect();
-            Line::from(vec![
-                Span::raw(before),
-                Span::styled(
-                    at,
-                    Style::new()
-                        .fg(theme.input_cursor_fg)
-                        .bg(theme.input_cursor_bg),
-                ),
-                Span::raw(after),
-            ])
-        })
+        .map(|line| Line::from(line.text.clone()))
         .collect()
 }
 
+/// The terminal cell holding the composer's caret: the visible input area's
+/// origin offset by the caret's display column and (scrolled) row, clamped
+/// into the area so a caret resting on the wrap pad or a clipped row never
+/// points outside the composer.
+pub fn composer_cursor_cell(g: &ScreenGeometry) -> (u16, u16) {
+    let row = g.input_layout.cursor_row.saturating_sub(g.first_input_line);
+    let x = g
+        .input
+        .x
+        .saturating_add(u16::try_from(g.input_layout.cursor_column).unwrap_or(u16::MAX));
+    let y = g
+        .input
+        .y
+        .saturating_add(u16::try_from(row).unwrap_or(u16::MAX));
+    (
+        x.min(g.input.right().saturating_sub(1)),
+        y.min(g.input.bottom().saturating_sub(1)),
+    )
+}
+
 /// Render the composer: an `input_bg` panel with a pale-green `┃` accent on its
-/// left (standing on the global background), the wrapped input lines with a
-/// reverse-video cursor, and a tips row. Rows: blank / text×N / blank / tips.
-/// When the composer is not focused the accent dims and no cursor is shown.
+/// left (standing on the global background), the wrapped input lines, and a
+/// tips row. Rows: blank / text×N / blank / tips. When the composer is not
+/// focused the accent dims and the terminal cursor stays hidden.
 fn render_composer(
     frame: &mut Frame,
     g: &ScreenGeometry,
@@ -1083,6 +1102,10 @@ mod tests {
         assert!(!buffer_line(&buffer, 1).contains('●'));
         assert_eq!(buffer.cell((10, 1)).unwrap().bg, theme().sidebar_active_bg);
         assert_ne!(buffer.cell((10, 0)).unwrap().bg, theme().sidebar_active_bg);
+        // The query name aligns with the server header name (both at inner
+        // column 4: pointer lane 2 + 2 leading columns).
+        assert_eq!(buffer.cell((5, 0)).unwrap().symbol(), "s"); // "srv"
+        assert_eq!(buffer.cell((5, 1)).unwrap().symbol(), "@"); // "@alice"
     }
 
     #[test]
@@ -1157,16 +1180,27 @@ mod tests {
     /// what `main.rs` would compute: main column width minus 2*HORIZONTAL_PAD,
     /// height minus the fixed chrome rows.
     fn render_sized(app: &App, status: &str, w: u16, h: u16) -> Buffer {
-        render_with_theme(app, status, w, h, &theme())
+        render_frame(app, status, w, h, &theme()).0
     }
 
-    /// The same, with an explicit theme: for tests that override roles.
-    fn render_with_theme(app: &App, status: &str, w: u16, h: u16, theme: &Theme) -> Buffer {
+    /// The same render, also returning where `draw` placed the terminal
+    /// cursor (`None` = the cursor is hidden for this frame).
+    fn render_frame(
+        app: &App,
+        status: &str,
+        w: u16,
+        h: u16,
+        theme: &Theme,
+    ) -> (Buffer, Option<ratatui::layout::Position>) {
         let chrome = Chrome { status, theme };
         let backend = TestBackend::new(w, h);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, app, &chrome)).unwrap();
-        terminal.backend().buffer().clone()
+        let backend = terminal.backend();
+        (
+            backend.buffer().clone(),
+            backend.cursor_visible().then(|| backend.cursor_position()),
+        )
     }
 
     /// The composer's left accent (`┃`) column: after the sidebar + separator gap.
@@ -1385,14 +1419,14 @@ mod tests {
         }
         app.apply_connection_event(&E::Connection("osu_irc".into(), S::Connecting));
         let pending = render_sized(&app, "", 50, 10);
-        assert_eq!(pending[(2, 0)].symbol(), "●");
-        assert_eq!(pending[(2, 0)].fg, theme().status_pending);
-        assert_eq!(pending[(4, 1)].fg, theme().status_pending);
+        assert_eq!(pending[(3, 0)].symbol(), "●");
+        assert_eq!(pending[(3, 0)].fg, theme().status_pending);
+        assert_eq!(pending[(5, 1)].fg, theme().status_pending);
         app.tick(std::time::Duration::from_millis(500));
         let off = render_sized(&app, "", 50, 10);
-        assert_eq!(off[(2, 0)].symbol(), " ");
-        assert_eq!(off[(4, 1)].symbol(), " ");
-        for x in 4..11 {
+        assert_eq!(off[(3, 0)].symbol(), " ");
+        assert_eq!(off[(5, 1)].symbol(), " ");
+        for x in 5..12 {
             assert_eq!(pending[(x, 0)].symbol(), off[(x, 0)].symbol());
         }
         app.apply_connection_event(&E::Connection("OSU_IRC".into(), S::Connected));
@@ -1413,13 +1447,13 @@ mod tests {
             },
         ));
         let connected = render_sized(&app, "", 50, 10);
-        assert_eq!(connected[(2, 0)].symbol(), "●");
-        assert_eq!(connected[(2, 0)].fg, theme().status_ok);
-        assert_eq!(connected[(4, 1)].fg, theme().status_ok);
-        assert_eq!(connected[(4, 2)].fg, theme().status_err);
+        assert_eq!(connected[(3, 0)].symbol(), "●");
+        assert_eq!(connected[(3, 0)].fg, theme().status_ok);
+        assert_eq!(connected[(5, 1)].fg, theme().status_ok);
+        assert_eq!(connected[(5, 2)].fg, theme().status_err);
         app.apply_connection_event(&E::Connection("osu_irc".into(), S::Stopped));
         let stopped = render_sized(&app, "", 50, 10);
-        for pos in [(2, 0), (4, 1), (4, 2)] {
+        for pos in [(3, 0), (5, 1), (5, 2)] {
             assert_eq!(stopped[pos].symbol(), "●");
             assert_eq!(stopped[pos].fg, theme().status_err);
         }
@@ -1452,12 +1486,12 @@ mod tests {
                 },
             ));
             let on = render_sized(&app, "", 50, 10);
-            assert_eq!(on[(4, 1)].fg, color, "{state:?}");
-            assert_eq!(on[(4, 1)].symbol(), "●");
+            assert_eq!(on[(5, 1)].fg, color, "{state:?}");
+            assert_eq!(on[(5, 1)].symbol(), "●");
             app.tick(std::time::Duration::from_millis(500));
             let off = render_sized(&app, "", 50, 10);
             assert_eq!(
-                off[(4, 1)].symbol(),
+                off[(5, 1)].symbol(),
                 if blinking { " " } else { "●" },
                 "{state:?}"
             );
@@ -1473,7 +1507,7 @@ mod tests {
             },
         ));
         let offline = render_sized(&app, "", 50, 10);
-        assert_eq!(offline[(4, 1)].fg, theme().status_err);
+        assert_eq!(offline[(5, 1)].fg, theme().status_err);
     }
 
     #[test]
@@ -1492,8 +1526,8 @@ mod tests {
         for elapsed in [0, 500] {
             app.tick(std::time::Duration::from_millis(elapsed));
             let rendered = render_sized(&app, "", 50, 10);
-            assert_eq!(rendered[(4, 1)].symbol(), "●");
-            assert_eq!(rendered[(4, 1)].fg, theme().status_err);
+            assert_eq!(rendered[(5, 1)].symbol(), "●");
+            assert_eq!(rendered[(5, 1)].fg, theme().status_err);
         }
     }
 
@@ -1515,8 +1549,72 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_cursor_row_gets_cursor_bg_and_block_cursor() {
-        // Arrange: focus the sidebar; the cursor starts on row 0 (the server).
+    fn sidebar_chevron_marks_the_focused_cursor_row_and_the_active_name_stays_bold() {
+        // Arrange: #osu viewed (row 1), #chinese inactive (row 2), focus on
+        // the composer. The sidebar's inner area starts at column 1; the
+        // pointer lane spans columns 1-2, the channel name starts at column
+        // 7 (lane 2 + indent 2 + dot 2).
+        let mut app = test_app(22, 3);
+
+        // Act: render once with the sidebar unfocused.
+        let buffer = render_sized(&app, "", 50, 10);
+
+        // Assert: the active row keeps the accent + bold name but its lane
+        // is blank - the chevron only follows the navigation cursor, which
+        // is inactive while the sidebar is unfocused.
+        assert_eq!(buffer.cell((1, 1)).unwrap().symbol(), " ");
+        let name = buffer.cell((7, 1)).unwrap();
+        assert_eq!(name.symbol(), "#");
+        assert_eq!(name.fg, theme().accent);
+        assert!(name.modifier.contains(Modifier::BOLD));
+        // The inactive row keeps the blank lane and the dim, non-bold name.
+        assert_eq!(buffer.cell((1, 2)).unwrap().symbol(), " ");
+        let name = buffer.cell((7, 2)).unwrap();
+        assert_eq!(name.fg, theme().dim);
+        assert!(!name.modifier.contains(Modifier::BOLD));
+
+        // Act: focus the sidebar; the cursor snaps onto the active row.
+        app.tab(); // Composer -> Sidebar
+        assert_eq!(app.sidebar_cursor(), Some(1));
+        let buffer = render_sized(&app, "", 50, 10);
+
+        // Assert: the chevron (\u{f054}) now sits on the cursor row in the
+        // accent color.
+        let pointer = buffer.cell((1, 1)).unwrap();
+        assert_eq!(pointer.symbol(), "\u{f054}");
+        assert_eq!(pointer.fg, theme().accent);
+    }
+
+    #[test]
+    fn sidebar_chevron_follows_the_navigation_cursor_off_the_active_row() {
+        // Arrange: the osu_irc console viewed (server header is the active
+        // row 0); focus the sidebar and move the cursor onto #osu (row 1).
+        let mut app = App::new(22, 3);
+        app.open_server("osu_irc");
+        app.open_channel("osu_irc", "#osu");
+        app.select_buffer(0); // the console
+        app.focus_composer();
+        app.tab(); // Composer -> Sidebar
+        app.sidebar_down(); // cursor: server header (0) -> #osu (1)
+        assert_eq!(app.sidebar_cursor(), Some(1));
+
+        // Act
+        let buffer = render_sized(&app, "", 50, 10);
+
+        // Assert: the chevron sits on the cursor row (#osu), not on the
+        // active server-header row, which keeps the accent + bold name
+        // without the chevron.
+        let pointer = buffer.cell((1, 1)).unwrap();
+        assert_eq!(pointer.symbol(), "\u{f054}");
+        assert_eq!(pointer.fg, theme().accent);
+        assert_eq!(buffer.cell((1, 0)).unwrap().symbol(), " ");
+        let name = buffer.cell((5, 0)).unwrap();
+        assert_eq!(name.fg, theme().accent);
+        assert!(name.modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn sidebar_cursor_row_keeps_the_row_highlight_without_a_terminal_cursor() {
         // Arrange: focus the sidebar; the cursor snaps onto the viewed
         // channel's row (#osu, row 1).
         let mut app = test_app(22, 3);
@@ -1525,16 +1623,17 @@ mod tests {
         assert_eq!(app.sidebar_cursor(), Some(1));
 
         // Act
-        let buffer = render_sized(&app, "", 50, 10);
+        let (buffer, cursor) = render_frame(&app, "", 50, 10, &theme());
 
-        // Assert: row 1 shows the reverse-video block cursor; its background
-        // is the (brighter) active-channel one, which takes precedence.
-        let cursor_cell = buffer.cell((1, 1)).unwrap();
-        assert_eq!(cursor_cell.bg, theme().input_cursor_bg);
+        // Assert: the cursor row keeps the (brighter) active-channel
+        // background across the row, and no terminal cursor is placed.
+        let leading_cell = buffer.cell((1, 1)).unwrap();
+        assert_eq!(leading_cell.bg, theme().sidebar_active_bg);
         let inner_cell = buffer.cell((10, 1)).unwrap();
         assert_eq!(inner_cell.bg, theme().sidebar_active_bg);
         // Row 0 (server row, not under the cursor) keeps the plain bg.
         assert_ne!(buffer.cell((10, 0)).unwrap().bg, theme().sidebar_active_bg);
+        assert_eq!(cursor, None);
     }
 
     #[test]
@@ -1588,15 +1687,12 @@ mod tests {
         app.tab(); // messages -> composer unfocused
 
         // Act
-        let buffer = render_sized(&app, "", 50, 10);
+        let (buffer, cursor) = render_frame(&app, "", 50, 10, &theme());
 
-        // Assert: the ┃ accent is dimmed and the input row has no cursor block.
+        // Assert: the ┃ accent is dimmed and the terminal cursor is hidden.
         let accent = buffer.cell((INPUT_X, 5)).unwrap();
         assert_eq!(accent.fg, theme().accent_dim);
-        assert_ne!(
-            buffer.cell((MAIN_COL_X, 5)).unwrap().bg,
-            theme().input_cursor_bg
-        );
+        assert_eq!(cursor, None);
     }
 
     #[test]
@@ -1796,23 +1892,57 @@ mod tests {
     }
 
     #[test]
-    fn input_row_shows_typed_text_and_cursor() {
+    fn input_row_shows_typed_text_and_terminal_cursor() {
         // Arrange
         let mut app = test_app(22, 3);
         app.type_char('h');
         app.type_char('i');
 
         // Act
-        let buffer = render_sized(&app, "", 50, 10);
+        let (buffer, cursor) = render_frame(&app, "", 50, 10, &theme());
 
-        // Assert: the input line (row 4) shows the text and a reverse-video cursor.
+        // Assert: the input line (row 4) shows the text, and the terminal
+        // cursor sits just past "hi" (at its end).
         let row = buffer_line(&buffer, 4);
         assert!(row.contains("hi"), "row was: {row:?}");
-        // The cursor sits just past "hi" (at end) - a block cursor at col 28.
         assert_eq!(
-            buffer.cell((MAIN_COL_X + 2, 4)).unwrap().bg,
-            theme().input_cursor_bg
+            cursor,
+            Some(ratatui::layout::Position::new(MAIN_COL_X + 2, 4))
         );
+    }
+
+    #[test]
+    fn terminal_cursor_follows_the_caret_through_wrapped_and_scrolled_lines() {
+        // Arrange: a 50-wide terminal wraps the draft at 19 columns; a
+        // draft exactly 19 wide puts the caret on the next (empty) row.
+        let mut app = test_app(22, 3);
+        app.restore_input("a".repeat(19));
+
+        // Act: geometry gives the caret's visible cell; drawing agrees.
+        let g = geometry(50, 10, app.input(), app.input_cursor(), true, 0);
+        let (x, y) = composer_cursor_cell(&g);
+        let (_, cursor) = render_frame(&app, "", 50, 10, &theme());
+
+        // Assert: the first row is full, so the caret opens the next input
+        // row at column 0.
+        assert_eq!(
+            (g.input_layout.cursor_row, g.input_layout.cursor_column),
+            (1, 0)
+        );
+        assert_eq!((x, y), (g.input.x, g.input.y + 1));
+        assert_eq!(cursor, Some(ratatui::layout::Position::new(x, y)));
+    }
+
+    #[test]
+    fn welcome_page_hides_the_terminal_cursor() {
+        // Arrange: no buffer open - the welcome page, no composer.
+        let app = App::new(50, 10);
+
+        // Act
+        let (_, cursor) = render_frame(&app, "", 50, 10, &theme());
+
+        // Assert: no composer exists on the welcome page, so no cursor.
+        assert_eq!(cursor, None);
     }
 
     #[test]
@@ -1922,7 +2052,7 @@ mod tests {
             buffer.cell((10, 1)).unwrap().bg,
             Color::Rgb(0x2e, 0x2e, 0x2e) // SIDEBAR_ACTIVE_BG
         );
-        assert_eq!(buffer.cell((4, 1)).unwrap().fg, Color::Red); // status dot (not joined)
+        assert_eq!(buffer.cell((5, 1)).unwrap().fg, Color::Red); // status dot (not joined)
     }
 
     #[test]
@@ -1937,7 +2067,7 @@ mod tests {
 
         // Act: the same scene under the default and the overridden theme.
         let base = render_sized(&app, "", 50, 10);
-        let themed = render_with_theme(&app, "", 50, 10, &theme);
+        let themed = render_frame(&app, "", 50, 10, &theme).0;
 
         // Assert: the separator column carries the override...
         assert_eq!(base[(SIDEBAR_WIDTH, 1)].fg, Theme::default().separator);

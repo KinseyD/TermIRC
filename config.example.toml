@@ -64,7 +64,8 @@ language = "en"
 # sidebar_cursor_bg = "#c8c8c0"
 # message_select_bg = "#d0d0c8"
 # hover_bg = "#e0e0da"
-# input_cursor_bg = "#333333"  # text cursor block
+# input_cursor_fg / input_cursor_bg are deprecated and ignored: the composer
+# cursor is the terminal's own cursor and no longer has theme colors.
 # status_ok = "green"
 # status_err = "red"
 # status_pending = "bright-black"

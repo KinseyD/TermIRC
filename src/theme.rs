@@ -18,8 +18,6 @@ pub const ROLE_NAMES: &[&str] = &[
     "separator",
     "global_bg",
     "input_bg",
-    "input_cursor_fg",
-    "input_cursor_bg",
     "accent",
     "accent_dim",
     "sidebar_active_bg",
@@ -46,10 +44,6 @@ pub struct Theme {
     pub global_bg: Color,
     /// Background of the composer panel.
     pub input_bg: Color,
-    /// Foreground of the composer's text-cursor block.
-    pub input_cursor_fg: Color,
-    /// Background of the composer's text-cursor block.
-    pub input_cursor_bg: Color,
     /// The composer's `┃` accent (and the welcome logo) while focused.
     pub accent: Color,
     /// The accent while another region holds the focus.
@@ -80,8 +74,6 @@ impl Default for Theme {
             separator: Color::Rgb(0x55, 0x55, 0x55),
             global_bg: Color::Rgb(0x0a, 0x0a, 0x0a),
             input_bg: Color::Rgb(0x1e, 0x1e, 0x1e),
-            input_cursor_fg: Color::Rgb(0x1e, 0x1e, 0x1e),
-            input_cursor_bg: Color::White,
             accent: Color::Rgb(0x9a, 0xd9, 0x9a),
             accent_dim: Color::Rgb(0x4a, 0x6a, 0x4a),
             sidebar_active_bg: Color::Rgb(0x2e, 0x2e, 0x2e),
@@ -105,8 +97,6 @@ impl Theme {
             "separator" => self.separator = color,
             "global_bg" => self.global_bg = color,
             "input_bg" => self.input_bg = color,
-            "input_cursor_fg" => self.input_cursor_fg = color,
-            "input_cursor_bg" => self.input_cursor_bg = color,
             "accent" => self.accent = color,
             "accent_dim" => self.accent_dim = color,
             "sidebar_active_bg" => self.sidebar_active_bg = color,
@@ -130,8 +120,6 @@ impl Theme {
             "separator" => Some(self.separator),
             "global_bg" => Some(self.global_bg),
             "input_bg" => Some(self.input_bg),
-            "input_cursor_fg" => Some(self.input_cursor_fg),
-            "input_cursor_bg" => Some(self.input_cursor_bg),
             "accent" => Some(self.accent),
             "accent_dim" => Some(self.accent_dim),
             "sidebar_active_bg" => Some(self.sidebar_active_bg),
@@ -216,6 +204,11 @@ fn parse_ansi16(name: &str) -> Option<Color> {
     Some(color)
 }
 
+/// Legacy `[theme]` keys that are still parsed (so malformed values keep
+/// failing) but no longer affect rendering: the composer's cursor is the
+/// terminal's own cursor, so its old block colors have nothing to style.
+const DEPRECATED_ROLES: &[&str] = &["input_cursor_fg", "input_cursor_bg"];
+
 /// The `[theme]` config table: a map of role names to color values. Absent
 /// roles keep their default.
 #[derive(Debug, Default, Deserialize)]
@@ -232,6 +225,16 @@ impl ThemeTable {
         let mut theme = Theme::default();
         for (role, raw) in &self.roles {
             let color = raw.parse(role)?;
+            if DEPRECATED_ROLES.contains(&role.as_str()) {
+                // Parsed (so malformed values still fail loudly) but ignored:
+                // the composer cursor is the terminal's real cursor now.
+                tracing::warn!(
+                    target: "termirc::theme",
+                    "deprecated_theme_role: {role} is ignored (the composer \
+                     cursor uses the terminal cursor)"
+                );
+                continue;
+            }
             anyhow::ensure!(
                 theme.set(role, color),
                 "unknown_theme_role: {role} (valid roles: {})",
@@ -319,7 +322,16 @@ mod tests {
             error.starts_with("unknown_theme_role: sidebar_read"),
             "reason: {error}"
         );
-        assert!(error.contains("sidebar_active_bg"), "reason: {error}");
+    }
+
+    #[test]
+    fn deprecated_cursor_roles_are_parsed_but_ignored() {
+        let table = table(&[
+            ("input_cursor_fg", ThemeColor::Text("red".into())),
+            ("input_cursor_bg", ThemeColor::Index(200)),
+        ]);
+        let theme = table.build().unwrap();
+        assert_eq!(theme, Theme::default());
     }
 
     #[test]
@@ -353,8 +365,6 @@ mod tests {
             ("separator", Color::Rgb(0x55, 0x55, 0x55)),
             ("global_bg", Color::Rgb(0x0a, 0x0a, 0x0a)),
             ("input_bg", Color::Rgb(0x1e, 0x1e, 0x1e)),
-            ("input_cursor_fg", Color::Rgb(0x1e, 0x1e, 0x1e)),
-            ("input_cursor_bg", Color::White),
             ("accent", Color::Rgb(0x9a, 0xd9, 0x9a)),
             ("accent_dim", Color::Rgb(0x4a, 0x6a, 0x4a)),
             ("sidebar_active_bg", Color::Rgb(0x2e, 0x2e, 0x2e)),
