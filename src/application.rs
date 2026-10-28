@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::command::{
     CommandAction, CommandError, SlashCommand, SlashParseError, parse_slash_command,
 };
-use crate::config::Config;
+use crate::config::{Config, ServerConfig};
 use crate::connection::{ConnectionHandle, ConnectionState, IrcEvent};
 use crate::core::{
     BufferId, BufferKind, ChannelState, ChannelStatus, ConnectionCommand, DeliveryState, Direction,
@@ -78,6 +78,10 @@ pub enum SubmissionEffect {
     #[default]
     None,
     Activate(BufferId),
+    /// `/config` was accepted: open the setup wizard. The TUI layer owns
+    /// the dialog, so this variant is resolved there; the application
+    /// layer only reports it.
+    OpenConfig,
 }
 
 impl Default for Session {
@@ -97,21 +101,28 @@ pub enum InputSubmission {
 impl Session {
     pub fn register_config(&mut self, config: &Config) {
         for (name, server) in &config.servers {
-            self.open_server(name);
-            for channel in &server.channels {
-                self.open_channel(name, channel);
-                if let Some(index) = self.channel_index(name, channel) {
-                    self.buffers[index].channel_status.desired = true;
-                }
-            }
-            for nickname in &server.queries {
-                self.open_query(name, nickname);
-            }
-            self.apply_connection_event(&IrcEvent::Connection(
-                name.clone(),
-                ConnectionState::Connecting,
-            ));
+            self.register_server(name, server);
         }
+    }
+
+    /// Open the buffers for one server (console plus its channels and
+    /// queries) and mark it connecting, exactly as startup does — also
+    /// callable at runtime when the setup wizard adds a server.
+    pub fn register_server(&mut self, name: &str, server: &ServerConfig) {
+        self.open_server(name);
+        for channel in &server.channels {
+            self.open_channel(name, channel);
+            if let Some(index) = self.channel_index(name, channel) {
+                self.buffers[index].channel_status.desired = true;
+            }
+        }
+        for nickname in &server.queries {
+            self.open_query(name, nickname);
+        }
+        self.apply_connection_event(&IrcEvent::Connection(
+            name.to_string(),
+            ConnectionState::Connecting,
+        ));
     }
 
     pub fn new(message_capacity: usize) -> Self {
@@ -863,6 +874,10 @@ impl Composer<'_> {
                     .map(SubmissionEffect::Activate)
                     .ok_or("not_query");
             }
+            // /config opens the setup wizard: no connection is involved,
+            // and the dialog itself lives in the TUI layer, which reacts
+            // to the returned effect.
+            CommandAction::Config => return Ok(SubmissionEffect::OpenConfig),
             CommandAction::Msg { target, text } => {
                 let server = self
                     .session
@@ -989,7 +1004,8 @@ impl Composer<'_> {
             | CommandAction::Topic(_)
             | CommandAction::Names(_)
             | CommandAction::Mode(_)
-            | CommandAction::Whois(_) => return Err("invalid_command"),
+            | CommandAction::Whois(_)
+            | CommandAction::Config => return Err("invalid_command"),
         };
         validate_control(&command).map_err(|_| "invalid_control")?;
         handle

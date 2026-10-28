@@ -244,6 +244,9 @@ pub fn draw(frame: &mut Frame, app: &App, chrome: &Chrome<'_>) {
     if app.active_buffer().is_none() {
         render_welcome(frame, g.messages, theme);
         render_status_bar(frame, g.status_bar, app, theme);
+        if let Some(dialog) = &app.dialog {
+            render_config_dialog(frame, frame.area(), dialog, theme);
+        }
         return;
     }
     frame.render_widget(Paragraph::new(build_text(app, theme)), g.messages);
@@ -263,11 +266,18 @@ pub fn draw(frame: &mut Frame, app: &App, chrome: &Chrome<'_>) {
     // The composer's caret is the terminal's real cursor: positioned at the
     // caret cell while the composer has focus, hidden otherwise (ratatui
     // hides the cursor when no position is set for the frame).
-    if app.focus() == Focus::Composer && app.active_buffer().is_some() && !g.input.is_empty() {
+    if app.dialog.is_none()
+        && app.focus() == Focus::Composer
+        && app.active_buffer().is_some()
+        && !g.input.is_empty()
+    {
         frame.set_cursor_position(composer_cursor_cell(&g));
     }
     render_gap(frame, g.gap, frame.area().width, app, theme);
     render_status_bar(frame, g.status_bar, app, theme);
+    if let Some(dialog) = &app.dialog {
+        render_config_dialog(frame, frame.area(), dialog, theme);
+    }
 }
 
 /// Render the inline slash-command hint bar between the message pane and the
@@ -1081,6 +1091,131 @@ fn inset(area: Rect, pad: u16) -> Rect {
     )
 }
 
+/// Render the modal setup wizard, centered over the whole screen. The
+/// panel reuses composer colors: `input_bg` fill with a `separator`
+/// border, the focused row accented, and validation errors in the
+/// status-error color. The dialog's own cursor is drawn as a `┃`
+/// accent column inside the focused field instead of moving the
+/// terminal cursor, which belongs to the composer.
+pub fn render_config_dialog(
+    frame: &mut Frame,
+    area: Rect,
+    dialog: &crate::tui::dialog::ConfigDialog,
+    theme: &Theme,
+) {
+    let width = area.width.saturating_sub(4).clamp(1, 56);
+    let height = (crate::tui::dialog::SAVE_ROW as u16) + 7; // title, blank, 9 fields, blank, actions, error, pad
+    let height = height.min(area.height.saturating_sub(2)).max(1);
+    let panel = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(
+        Paragraph::new("").style(Style::new().bg(theme.input_bg)),
+        panel,
+    );
+    // Border: the panel's outline in the separator color, drawn as row
+    // and column fills so the dialog stays in the repo's fill idiom.
+    let border = Style::new().fg(theme.separator);
+    for x in panel.x..panel.x + panel.width {
+        for y in [panel.y, panel.y + panel.height - 1] {
+            if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
+                cell.set_char('─').set_style(border);
+            }
+        }
+    }
+    for y in panel.y..panel.y + panel.height {
+        for x in [panel.x, panel.x + panel.width - 1] {
+            if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
+                cell.set_char('│').set_style(border);
+            }
+        }
+    }
+    for (x, y) in [
+        (panel.x, panel.y),
+        (panel.x + panel.width - 1, panel.y),
+        (panel.x, panel.y + panel.height - 1),
+        (panel.x + panel.width - 1, panel.y + panel.height - 1),
+    ] {
+        if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
+            cell.set_char('┼').set_style(border);
+        }
+    }
+
+    let inner = inset(clip_vertical(panel, 1), 1);
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    let title = i18n::t("dlg.title");
+    let pad = inner.width.saturating_sub(title.width() as u16) / 2;
+    rows.push(Line::from(vec![
+        Span::styled(" ".repeat(pad as usize), Style::new()),
+        Span::styled(
+            title,
+            Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    rows.push(Line::from(""));
+    for (index, field) in dialog.fields.iter().enumerate() {
+        let focused = index == dialog.cursor;
+        let value = match field.kind {
+            crate::tui::dialog::FieldKind::Toggle => {
+                i18n::t(if field.flag { "dlg.on" } else { "dlg.off" }).to_string()
+            }
+            _ => clip_columns(field.text.text(), (inner.width as usize).saturating_sub(18)),
+        };
+        let label = i18n::t(field.label_key);
+        let style = if focused {
+            Style::new().bg(theme.accent_dim).fg(theme.nick)
+        } else {
+            Style::new().fg(theme.dim)
+        };
+        let cursor_mark = if focused { "┃" } else { " " };
+        rows.push(Line::from(vec![
+            Span::styled(cursor_mark.to_string(), Style::new().fg(theme.accent)),
+            Span::styled(format!("{label:<16}"), style),
+            Span::styled(value, Style::new().fg(theme.nick)),
+        ]));
+    }
+    rows.push(Line::from(""));
+    let save_selected = dialog.cursor == crate::tui::dialog::SAVE_ROW;
+    let save_style = if save_selected {
+        Style::new().bg(theme.accent).fg(theme.global_bg)
+    } else {
+        Style::new().fg(theme.nick)
+    };
+    rows.push(Line::from(vec![
+        Span::styled(
+            format!(" {} ", i18n::t("dlg.save")),
+            save_style.add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("Enter", Style::new().fg(theme.dim)),
+        Span::styled("   ", Style::new()),
+        Span::styled(
+            format!(" {} ", i18n::t("dlg.cancel")),
+            Style::new().fg(theme.dim),
+        ),
+        Span::styled("Esc", Style::new().fg(theme.dim)),
+    ]));
+    if let Some(key) = dialog.error {
+        rows.push(Line::from(Span::styled(
+            i18n::t(key).to_string(),
+            Style::new().fg(theme.status_err),
+        )));
+    }
+    frame.render_widget(Paragraph::new(rows), inner);
+}
+
+/// Shrink a region vertically by `pad` rows on each side (horizontal
+/// unchanged), for padding a dialog panel inside its border.
+fn clip_vertical(area: Rect, pad: u16) -> Rect {
+    Rect {
+        y: area.y + pad,
+        height: area.height.saturating_sub(pad * 2),
+        ..area
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1212,6 +1347,31 @@ mod tests {
         (0..buffer.area.width)
             .map(|x| buffer.cell((x, y)).unwrap().symbol())
             .collect()
+    }
+
+    #[test]
+    fn the_config_wizard_renders_its_title_fields_and_actions_over_the_page() {
+        // Arrange: an empty config (first run) so the welcome page is
+        // behind the modal, with the wizard opened on defaults.
+        let mut app = App::new(70, 20);
+        app.open_config_dialog(&crate::config::Config::default());
+
+        // Act
+        let buffer = render_sized(&app, "", 70, 20);
+
+        // Assert: the title, one label per field, and both actions are
+        // painted, and the composer's terminal cursor stays hidden (the
+        // dialog has no terminal cursor of its own).
+        let text: String = (0..20)
+            .map(|y| buffer_line(&buffer, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains(crate::i18n::t("dlg.title")), "{text}");
+        assert!(text.contains(crate::i18n::t("dlg.field_host")), "{text}");
+        assert!(text.contains(crate::i18n::t("dlg.save")), "{text}");
+        assert!(text.contains(crate::i18n::t("dlg.cancel")), "{text}");
+        let (_, cursor) = render_frame(&app, "", 70, 20, &theme());
+        assert!(cursor.is_none(), "the dialog must not move the cursor");
     }
 
     #[test]

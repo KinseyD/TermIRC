@@ -1,23 +1,31 @@
 //! Terminal event dispatch; application submission has no terminal dependencies.
-use super::{App, Focus, StatusZone, mouse, render as ui};
+use super::{App, Focus, StatusZone, dialog::DialogOutcome, mouse, render as ui};
 use crate::{
     application::submit_composer,
-    config::Config,
+    config::{self, Config},
     connection::{ConnectionHandle, IrcEvent},
 };
 use ratatui::crossterm::event::{
     self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use std::path::Path;
 use std::time::Duration;
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MOUSE_SCROLL_LINES: i32 = 3;
 pub fn run(
     terminal: &mut ratatui::DefaultTerminal,
-    config: &Config,
+    config: &mut Config,
     mut app: App,
-    outgoing: std::collections::HashMap<String, ConnectionHandle>,
+    outgoing: &mut std::collections::HashMap<String, ConnectionHandle>,
+    tx: std::sync::mpsc::Sender<IrcEvent>,
     rx: std::sync::mpsc::Receiver<IrcEvent>,
+    config_path: &Path,
 ) -> anyhow::Result<()> {
+    // First run (no config file, or one without servers): open the
+    // setup wizard before the first frame so the user lands in the form.
+    if config.first_server().is_none() {
+        app.open_config_dialog(config);
+    }
     let size = terminal.size()?;
     let mut term_size = (size.width, size.height);
     fit_app(&mut app, term_size);
@@ -40,8 +48,18 @@ pub fn run(
                 // Windows also emits Release/Repeat events - handle presses only.
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                    relayout =
-                        handle_key_press(&mut app, key.code, ctrl, config, &outgoing, &mut status);
+                    relayout = handle_key_press(
+                        &mut app,
+                        key.code,
+                        ctrl,
+                        &mut KeyContext {
+                            config,
+                            outgoing,
+                            tx: &tx,
+                            config_path,
+                            status: &mut status,
+                        },
+                    );
                 }
                 Event::Resize(width, height) => {
                     term_size = (width, height);
@@ -84,18 +102,36 @@ fn fit_app(app: &mut App, (w, h): (u16, u16)) {
     }
 }
 
+/// The mutable surroundings one key press may reach: the pieces of the
+/// event loop's state that the setup wizard's save path needs, grouped
+/// to keep key routing within a sane argument list.
+pub(crate) struct KeyContext<'a> {
+    config: &'a mut Config,
+    outgoing: &'a mut std::collections::HashMap<String, ConnectionHandle>,
+    tx: &'a std::sync::mpsc::Sender<IrcEvent>,
+    config_path: &'a Path,
+    status: &'a mut String,
+}
+
 /// Route one key press to the app; returns whether the screen's layout may
 /// have changed (a draft edit or hint completion rewraps the composer).
 /// Extracted from `run` so key routing stays unit-testable without a
 /// terminal.
-fn handle_key_press(
-    app: &mut App,
-    code: KeyCode,
-    ctrl: bool,
-    config: &Config,
-    outgoing: &std::collections::HashMap<String, ConnectionHandle>,
-    status: &mut String,
-) -> bool {
+fn handle_key_press(app: &mut App, code: KeyCode, ctrl: bool, ctx: &mut KeyContext<'_>) -> bool {
+    // The setup wizard is modal: while open it consumes every key.
+    if app.dialog.is_some() {
+        let outcome = app
+            .dialog
+            .as_mut()
+            .map(|dialog| dialog.key(code, ctrl))
+            .unwrap_or(DialogOutcome::Edited);
+        match outcome {
+            DialogOutcome::Cancel => app.close_dialog(),
+            DialogOutcome::Save => save_dialog(app, ctx),
+            DialogOutcome::Edited => {}
+        }
+        return false;
+    }
     let composer_focused = app.focus() == Focus::Composer;
     match code {
         // Tab completes the highlighted hint while the hint bar is active;
@@ -164,8 +200,14 @@ fn handle_key_press(
             match app.focus() {
                 Focus::Sidebar => app.sidebar_enter(),
                 Focus::Composer => {
-                    let effect = submit_composer(&mut app.session, config, outgoing, status);
+                    let effect =
+                        submit_composer(&mut app.session, ctx.config, ctx.outgoing, ctx.status);
                     app.apply_submission_effect(effect);
+                    // The wizard needs the config, which App does not
+                    // hold, so the OpenConfig effect resolves here.
+                    if matches!(effect, crate::application::SubmissionEffect::OpenConfig) {
+                        app.open_config_dialog(ctx.config);
+                    }
                     return true; // the composer may shrink
                 }
                 Focus::Messages => {}
@@ -205,10 +247,68 @@ fn handle_key_press(
     }
 }
 
+/// Persist the wizard's entry and bring it live: write the merged
+/// config file, spawn a worker for a newly named server (the same
+/// per-server thread startup uses, so the UI never blocks), open its
+/// buffers, and close the dialog. Failures keep the dialog open with
+/// the reason on its error row.
+fn save_dialog(app: &mut App, ctx: &mut KeyContext<'_>) {
+    let Some(collected) = app.dialog.as_ref().map(|dialog| dialog.collect()) else {
+        return;
+    };
+    // collect's Err is the i18n key of the violated rule.
+    let (name, server) = match collected {
+        Ok(entry) => entry,
+        Err(key) => {
+            if let Some(dialog) = app.dialog.as_mut() {
+                dialog.error = Some(key);
+            }
+            return;
+        }
+    };
+    if let Err(error) = config::save_server(ctx.config_path, &name, &server) {
+        // Log the top-level context only: the error chain can embed raw
+        // TOML source lines, which may persist SASL passwords.
+        tracing::warn!(target: "termirc::config", "{error}");
+        if let Some(dialog) = app.dialog.as_mut() {
+            dialog.error = Some("err.cfg_write");
+        }
+        return;
+    }
+    if !ctx.outgoing.contains_key(&name) {
+        let (_thread, handle) = crate::connection::spawn_irc(
+            server.clone(),
+            name.clone(),
+            server.channels.clone(),
+            ctx.tx.clone(),
+        );
+        ctx.outgoing.insert(name.clone(), handle);
+        app.session.register_server(&name, &server);
+        // Land on the new server's console (idempotent open) so the
+        // composer is usable the moment the wizard closes.
+        let console = app.session.open_server(&name);
+        app.activate_buffer(console);
+    }
+    // A saved edit of an already-connected server updates the file and
+    // the in-memory config; the live worker keeps its settings until the
+    // user reconnects it (/reconnect).
+    ctx.config.servers.insert(name, server);
+    app.close_dialog();
+    *ctx.status = crate::i18n::format(
+        crate::i18n::t("status.config_saved"),
+        &[("path", &ctx.config_path.display().to_string())],
+    );
+}
+
 /// Route one mouse event: wheel scrolling, click actions, and hover
 /// pre-selection (updated on every event - a scroll also moves content
 /// under a stationary pointer).
 fn handle_mouse(app: &mut App, mouse: MouseEvent, term_size: (u16, u16)) {
+    // The setup wizard is modal: mouse events must not reach the panes
+    // hidden underneath it.
+    if app.dialog.is_some() {
+        return;
+    }
     let g = ui::geometry(
         term_size.0,
         term_size.1,
@@ -403,13 +503,18 @@ mod tests {
 
     /// Press one key with no modifiers; returns the relayout flag.
     fn press(app: &mut App, code: KeyCode) -> bool {
-        let config = crate::config::Config {
-            servers: Default::default(),
-            history: Default::default(),
-            theme: Default::default(),
+        let mut config = crate::config::Config::default();
+        let mut outgoing = std::collections::HashMap::new();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let path = std::path::Path::new("/nonexistent/termirc/config.toml");
+        let mut ctx = KeyContext {
+            config: &mut config,
+            outgoing: &mut outgoing,
+            tx: &tx,
+            config_path: path,
+            status: &mut String::new(),
         };
-        let outgoing = std::collections::HashMap::new();
-        handle_key_press(app, code, false, &config, &outgoing, &mut String::new())
+        handle_key_press(app, code, false, &mut ctx)
     }
 
     #[test]
@@ -482,12 +587,14 @@ mod tests {
         press(&mut app, KeyCode::Down);
 
         // Assert: the highlight moved and clamped, messages did not scroll.
-        assert_eq!(app.hint_selected(), 1);
+        assert_eq!(app.hint_selected(), 2);
         assert_eq!(
             app.scroll_offset(),
             offset,
             "Up/Down must not scroll messages while the hint bar is active"
         );
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.hint_selected(), 1);
         press(&mut app, KeyCode::Up);
         assert_eq!(app.hint_selected(), 0);
         assert_eq!(app.scroll_offset(), offset);
@@ -496,5 +603,135 @@ mod tests {
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Up);
         assert_eq!(app.scroll_offset(), offset);
+    }
+
+    #[test]
+    fn config_command_opens_the_wizard_and_clears_the_draft() {
+        // Arrange: a viewed channel with the composer focused.
+        let mut app = App::new(40, 10);
+        app.open_channel("srv", "#a");
+        app.select_buffer(0);
+        app.focus_composer();
+        app.restore_input("/config".into());
+
+        // Act
+        press(&mut app, KeyCode::Enter);
+
+        // Assert: the dialog opened and the command left the composer.
+        assert!(app.dialog.is_some());
+        assert!(app.input().is_empty());
+    }
+
+    #[test]
+    fn the_open_wizard_consumes_keys_and_escape_closes_it_without_quitting() {
+        // Arrange: a draft typed before the wizard opened.
+        let mut app = App::new(40, 10);
+        app.open_channel("srv", "#a");
+        app.select_buffer(0);
+        app.focus_composer();
+        app.restore_input("draft text".into());
+        app.open_config_dialog(&crate::config::Config::default());
+
+        // Act: typing lands in the focused dialog field, not the composer.
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.input(), "draft text");
+        assert_eq!(
+            app.dialog.as_ref().unwrap().fields[0].text.text(),
+            "liberax"
+        );
+
+        // Act/Assert: Esc closes the dialog instead of quitting the app.
+        press(&mut app, KeyCode::Esc);
+        assert!(app.dialog.is_none());
+        assert!(app.is_running(), "Esc closed the dialog, not the client");
+
+        // A cancelled first run still has an obvious way out: the same
+        // Esc that quit before the wizard existed quits now.
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.is_running(), "Esc on the page still quits");
+    }
+
+    #[test]
+    fn saving_the_wizard_writes_the_file_and_registers_the_server() {
+        // Arrange: a filled wizard pointed at a port that refuses
+        // immediately, and a fresh config path.
+        let path = std::env::temp_dir().join(format!("termirc-wizard-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut app = App::new(40, 10);
+        app.open_config_dialog(&crate::config::Config::default());
+        {
+            let dialog = app.dialog.as_mut().unwrap();
+            dialog.fields[1].text.restore("127.0.0.1".into(), 9);
+            dialog.fields[2].text.restore("1".into(), 1);
+            dialog.fields[3].text.restore("tester".into(), 6);
+            dialog.fields[6].text.restore("#a".into(), 2);
+            dialog.cursor = crate::tui::dialog::SAVE_ROW;
+        }
+        let mut config = crate::config::Config::default();
+        let mut outgoing = std::collections::HashMap::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut status = String::new();
+        let mut ctx = KeyContext {
+            config: &mut config,
+            outgoing: &mut outgoing,
+            tx: &tx,
+            config_path: &path,
+            status: &mut status,
+        };
+
+        // Act
+        handle_key_press(&mut app, KeyCode::Enter, false, &mut ctx);
+
+        // Assert: the file exists, the config and worker maps gained the
+        // entry, the console is viewed, and the dialog closed with the
+        // saved-path note. Drop the receiver so the background worker's
+        // sends fail silently instead of queueing.
+        drop(rx);
+        assert!(app.dialog.is_none());
+        assert!(config.servers.contains_key("libera"));
+        assert!(outgoing.contains_key("libera"));
+        assert_eq!(
+            app.active_buffer().unwrap().kind,
+            crate::core::BufferKind::Server
+        );
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("server = \"127.0.0.1\""));
+        assert!(saved.contains("channels = [\"#a\"]"));
+        assert!(status.contains(&path.display().to_string()));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_wizard_save_with_bad_input_keeps_the_dialog_open_with_the_reason() {
+        // Arrange: an empty host fails before the port is even read.
+        let mut app = App::new(40, 10);
+        app.open_config_dialog(&crate::config::Config::default());
+        {
+            let dialog = app.dialog.as_mut().unwrap();
+            dialog.fields[1].text.restore(String::new(), 0);
+            dialog.cursor = crate::tui::dialog::SAVE_ROW;
+        }
+        let path = std::env::temp_dir().join("termirc-wizard-invalid.toml");
+        let _ = std::fs::remove_file(&path);
+        let mut config = crate::config::Config::default();
+        let mut outgoing = std::collections::HashMap::new();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut ctx = KeyContext {
+            config: &mut config,
+            outgoing: &mut outgoing,
+            tx: &tx,
+            config_path: &path,
+            status: &mut String::new(),
+        };
+
+        // Act
+        handle_key_press(&mut app, KeyCode::Enter, false, &mut ctx);
+
+        // Assert: nothing was written or connected and the reason shows.
+        assert!(app.dialog.is_some());
+        assert_eq!(app.dialog.as_ref().unwrap().error, Some("dlg.err_host"));
+        assert!(config.servers.is_empty());
+        assert!(outgoing.is_empty());
+        assert!(!path.exists());
     }
 }

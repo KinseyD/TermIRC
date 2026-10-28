@@ -78,9 +78,38 @@ const REGISTRY: &[(&str, &str)] = &[
         "cmd.quit",
         "Alias for disconnect; the application stays open",
     ),
+    ("cmd.config", "Open the server configuration wizard"),
     // hint.* — standing TUI chrome. Key names (Esc, PgUp/PgDn) stay verbatim
     // in every language.
     ("hint.tips", "Esc quit · Enter send · PgUp/PgDn scroll"),
+    // dlg.* — the modal setup wizard (first run and /config).
+    ("dlg.title", "Server configuration"),
+    ("dlg.field_label", "Name"),
+    ("dlg.field_host", "Server"),
+    ("dlg.field_port", "Port"),
+    ("dlg.field_nickname", "Nickname"),
+    ("dlg.field_username", "Username"),
+    ("dlg.field_tls", "TLS"),
+    ("dlg.field_channels", "Channels"),
+    ("dlg.field_sasl_user", "SASL username"),
+    ("dlg.field_sasl_pass", "SASL password"),
+    ("dlg.on", "on"),
+    ("dlg.off", "off"),
+    ("dlg.save", "Save"),
+    ("dlg.cancel", "Cancel"),
+    (
+        "dlg.err_label",
+        "the name must be non-empty without spaces or . \" ' [ ] # =",
+    ),
+    ("dlg.err_host", "the server address must not be empty"),
+    (
+        "dlg.err_port",
+        "the port must be a number between 1 and 65535",
+    ),
+    (
+        "dlg.err_nickname",
+        "the nickname must be non-empty without spaces",
+    ),
     // sys.* — system notes appended to buffers.
     ("sys.connected", "Connected to {server}"),
     (
@@ -112,6 +141,7 @@ const REGISTRY: &[(&str, &str)] = &[
         "status.query_target_changed",
         "query target changed; use /query to select a nickname",
     ),
+    ("status.config_saved", "configuration saved to {path}"),
     // statusbar.* — the bottom status bar. The server and channel blocks
     // show the raw names (pure data); only the input block's standing
     // label is localized.
@@ -165,6 +195,7 @@ const REGISTRY: &[(&str, &str)] = &[
     ),
     ("err.cfg_read", "failed to read {path}"),
     ("err.cfg_parse", "failed to parse {path}"),
+    ("err.cfg_write", "failed to write {path}"),
     // err.startup_* — startup failures printed before the TUI exists.
     ("err.startup_home", "could not resolve the home directory"),
     (
@@ -483,7 +514,35 @@ mod tests {
                 "cmd.quit",
                 "Alias for disconnect; the application stays open",
             ),
+            ("cmd.config", "Open the server configuration wizard"),
             ("hint.tips", "Esc quit · Enter send · PgUp/PgDn scroll"),
+            ("dlg.title", "Server configuration"),
+            ("dlg.field_label", "Name"),
+            ("dlg.field_host", "Server"),
+            ("dlg.field_port", "Port"),
+            ("dlg.field_nickname", "Nickname"),
+            ("dlg.field_username", "Username"),
+            ("dlg.field_tls", "TLS"),
+            ("dlg.field_channels", "Channels"),
+            ("dlg.field_sasl_user", "SASL username"),
+            ("dlg.field_sasl_pass", "SASL password"),
+            ("dlg.on", "on"),
+            ("dlg.off", "off"),
+            ("dlg.save", "Save"),
+            ("dlg.cancel", "Cancel"),
+            (
+                "dlg.err_label",
+                "the name must be non-empty without spaces or . \" ' [ ] # =",
+            ),
+            ("dlg.err_host", "the server address must not be empty"),
+            (
+                "dlg.err_port",
+                "the port must be a number between 1 and 65535",
+            ),
+            (
+                "dlg.err_nickname",
+                "the nickname must be non-empty without spaces",
+            ),
             ("sys.connected", "Connected to {server}"),
             (
                 "sys.connection_lost",
@@ -513,6 +572,7 @@ mod tests {
                 "status.query_target_changed",
                 "query target changed; use /query to select a nickname",
             ),
+            ("status.config_saved", "configuration saved to {path}"),
             ("statusbar.input", "type in"),
             (
                 "err.send_invalid_characters",
@@ -561,6 +621,7 @@ mod tests {
             ),
             ("err.cfg_read", "failed to read {path}"),
             ("err.cfg_parse", "failed to parse {path}"),
+            ("err.cfg_write", "failed to write {path}"),
             ("err.startup_home", "could not resolve the home directory"),
             (
                 "err.startup_config_load",

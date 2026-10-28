@@ -24,26 +24,37 @@ fn main() -> anyhow::Result<()> {
     // problem, so a broken locale can never keep the client from starting.
     let ui = termirc::config::load_ui(&config_path);
     termirc::i18n::init(&ui.language);
-    let config = match Config::load(&config_path) {
-        Ok(config) => config,
-        Err(e) => {
-            // Deliberately not localized either: a failure here means the
-            // config file could not be read or parsed, in which case the
-            // language selection inside it is unknowable.
-            let e = e.context(termirc::i18n::format(
-                termirc::i18n::t("err.startup_config_load"),
-                &[("path", &config_path.display().to_string())],
-            ));
-            // Log the top-level context only: the toml error chain embeds
-            // the raw offending source line, which could persist a
-            // password fragment into the log file.
-            tracing::error!("{e}");
-            return Err(e);
+    // A missing config file means first run: start with an empty config
+    // and let the TUI's setup wizard create one. A file that exists but
+    // cannot be read or parsed is still a hard error — silently
+    // replacing a broken config the user wrote would destroy work.
+    let config = if config_path.exists() {
+        match Config::load(&config_path) {
+            Ok(config) => config,
+            Err(e) => {
+                // Deliberately not localized either: a failure here
+                // means the config file could not be read or parsed, in
+                // which case the language selection inside it is
+                // unknowable.
+                let e = e.context(termirc::i18n::format(
+                    termirc::i18n::t("err.startup_config_load"),
+                    &[("path", &config_path.display().to_string())],
+                ));
+                // Log the top-level context only: the toml error chain
+                // embeds the raw offending source line, which could
+                // persist a password fragment into the log file.
+                tracing::error!("{e}");
+                return Err(e);
+            }
         }
+    } else {
+        Config::default()
     };
     if config.first_server().is_none() {
-        tracing::error!("config has no servers");
-        anyhow::bail!("{}", termirc::i18n::t("err.startup_no_servers"));
+        // Not fatal: the setup wizard opens on the first frame and can
+        // create the missing entry (or the user quits and writes the
+        // file by hand).
+        tracing::warn!("config has no servers; opening the setup wizard");
     }
     tracing::info!(
         "termirc v{} starting; config={}; servers={}",
@@ -63,7 +74,8 @@ fn main() -> anyhow::Result<()> {
         ratatui::restore();
         anyhow::bail!("{}", termirc::i18n::t("err.startup_mouse"));
     }
-    let result = run(&mut terminal, &config);
+    let mut config = config;
+    let result = run(&mut terminal, &mut config, &config_path);
     let _ = ratatui::crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     match &result {
         Ok(()) => tracing::info!("termirc exiting"),
@@ -85,12 +97,18 @@ fn install_panic_hook() {
     }));
 }
 
-fn run(terminal: &mut ratatui::DefaultTerminal, config: &Config) -> anyhow::Result<()> {
+fn run(
+    terminal: &mut ratatui::DefaultTerminal,
+    config: &mut Config,
+    config_path: &std::path::Path,
+) -> anyhow::Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
-    // One IRC thread per configured server, joining all of its channels, plus
-    // the sender half of each connection's outgoing-message channel.
-    // Threads are deliberately not joined: they block on network I/O and are
-    // reaped when the process exits.
+    // One IRC thread per configured server, joining all of its channels,
+    // plus the sender half of each connection's outgoing-message channel.
+    // Threads are deliberately not joined: they block on network I/O and
+    // are reaped when the process exits. The sender half stays alive for
+    // the event loop, so the setup wizard can spawn more servers later
+    // the exact same way.
     let mut outgoing: std::collections::HashMap<String, ConnectionHandle> =
         std::collections::HashMap::new();
     for (name, server) in config.servers.iter() {
@@ -102,10 +120,9 @@ fn run(terminal: &mut ratatui::DefaultTerminal, config: &Config) -> anyhow::Resu
         );
         outgoing.insert(name.clone(), sender);
     }
-    drop(tx);
 
     let app = assemble_session(config);
-    termirc::tui::events::run(terminal, config, app, outgoing, rx)
+    termirc::tui::events::run(terminal, config, app, &mut outgoing, tx, rx, config_path)
 }
 
 /// Build the application session exactly as startup does, without spawning
@@ -179,5 +196,22 @@ channels=[]
             });
             assert!(found, "no console buffer registered for {name}");
         }
+    }
+
+    #[test]
+    fn a_first_run_session_boots_without_servers_or_buffers() {
+        // Arrange: no config file existed, so startup uses the default.
+        let config = Config::default();
+
+        // Act
+        let app = assemble_session(&config);
+
+        // Assert: no buffers, nothing viewed, and the app is still
+        // running — the welcome page plus the setup wizard is a valid
+        // first frame (startup no longer bails on zero servers).
+        assert!(config.first_server().is_none());
+        assert_eq!(app.session.buffer_count(), 0);
+        assert!(app.active_buffer().is_none());
+        assert!(app.is_running());
     }
 }
