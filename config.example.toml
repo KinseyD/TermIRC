@@ -69,3 +69,4 @@ language = "en"
 # status_ok = "green"
 # status_err = "red"
 # status_pending = "bright-black"
+# status_bar_highlight = "#2f7d4f" # focused status-bar segment background

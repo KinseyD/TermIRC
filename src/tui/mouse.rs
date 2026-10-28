@@ -13,6 +13,8 @@ pub enum MouseTarget {
     MessageBlank,
     /// The composer region (panel, accent column, right gap).
     Composer,
+    /// The bottom status bar row, any column.
+    StatusBar,
     /// Anything else: separator column, paddings, gap rows.
     None,
 }
@@ -23,6 +25,9 @@ pub enum MouseTarget {
 /// for the current input); 0 on the welcome page, which has no composer.
 pub fn hit(x: u16, y: u16, g: &ScreenGeometry) -> MouseTarget {
     let point = ratatui::layout::Position::new(x, y);
+    if g.status_bar.contains(point) {
+        return MouseTarget::StatusBar;
+    }
     if g.sidebar.contains(point) {
         return MouseTarget::SidebarRow(usize::from(y - g.sidebar.y));
     }
@@ -44,7 +49,8 @@ mod tests {
     }
 
     // A 50x10 screen with a 4-row composer: the message pane owns rows
-    // 0..=3 of the main column; composer rows 4..=7; gap rows 8..=9.
+    // 0..=2 of the main column; composer rows 3..=6; gap rows 7..=8; the
+    // status bar owns row 9.
     const W: u16 = 50;
     const H: u16 = 10;
     const COMPOSER: u16 = 4;
@@ -74,7 +80,7 @@ mod tests {
     fn message_pane_rows_map_to_their_screen_row() {
         // The pane's content spans x = 26..=47 (22 + 2 + 2 .. 50 - 2 - 1).
         assert_eq!(hit(26, 0, W, H, COMPOSER), MouseTarget::MessageRow(0));
-        assert_eq!(hit(47, 3, W, H, COMPOSER), MouseTarget::MessageRow(3));
+        assert_eq!(hit(47, 2, W, H, COMPOSER), MouseTarget::MessageRow(2));
     }
 
     #[test]
@@ -88,14 +94,22 @@ mod tests {
     #[test]
     fn composer_rows_are_composer_including_accent_and_right_gap() {
         assert_eq!(hit(24, 4, W, H, COMPOSER), MouseTarget::Composer); // ┃ accent col
-        assert_eq!(hit(26, 7, W, H, COMPOSER), MouseTarget::Composer); // tips row
+        assert_eq!(hit(26, 6, W, H, COMPOSER), MouseTarget::Composer); // tips row
         assert_eq!(hit(49, 5, W, H, COMPOSER), MouseTarget::Composer); // right gap
     }
 
     #[test]
-    fn rows_below_the_composer_are_none() {
+    fn rows_below_the_composer_are_none_except_the_status_bar() {
         assert_eq!(hit(26, 8, W, H, COMPOSER), MouseTarget::None); // fade row
-        assert_eq!(hit(26, 9, W, H, COMPOSER), MouseTarget::None);
+        assert_eq!(hit(26, 7, W, H, COMPOSER), MouseTarget::None); // blank row
+    }
+
+    #[test]
+    fn the_bottom_row_maps_to_the_status_bar_on_every_column() {
+        assert_eq!(hit(0, 9, W, H, COMPOSER), MouseTarget::StatusBar);
+        assert_eq!(hit(26, 9, W, H, COMPOSER), MouseTarget::StatusBar);
+        assert_eq!(hit(49, 9, W, H, COMPOSER), MouseTarget::StatusBar);
+        assert_eq!(hit(26, 9, W, H, 0), MouseTarget::StatusBar); // welcome page too
     }
 
     #[test]
@@ -103,6 +117,5 @@ mod tests {
         // The welcome page has neither composer nor gap.
         assert_eq!(hit(26, 5, W, H, 0), MouseTarget::MessageRow(5));
         assert_eq!(hit(26, 8, W, H, 0), MouseTarget::MessageRow(8)); // full welcome pane
-        assert_eq!(hit(26, 9, W, H, 0), MouseTarget::MessageRow(9));
     }
 }

@@ -17,6 +17,16 @@ use termirc::tui::App;
 
 const WAIT: Duration = Duration::from_secs(5);
 
+/// Generous cap for polling waits. The per-file WAIT and even a single
+/// fixed 10s window both flaked on slow macOS runners (CI runs
+/// 39726681637 and 39920909588): polling re-checks every 200 ms and only
+/// an expired cap fails.
+const SLOW_WAIT: Duration = Duration::from_secs(30);
+
+/// One poll slice: short enough to retry quickly, long enough that an
+/// idle-but-healthy worker answers within it.
+const POLL_SLICE: Duration = Duration::from_millis(200);
+
 struct MockSession {
     listener: TcpListener,
     socket: Option<BufReader<TcpStream>>,
@@ -176,6 +186,69 @@ impl MockSession {
         }
     }
 
+    /// [`wire`] as a bounded poll: each attempt captures one fresh barrier
+    /// window with short reads, so a JOIN the slow worker writes just
+    /// after one barrier lands in the next window. Returns the first
+    /// window whose capture equals `expected`; fails only when the cap
+    /// (measured from the call) expires.
+    fn wire_until(&mut self, expected: &[&str]) -> Vec<String> {
+        let expected: Vec<String> = expected.iter().map(|line| (*line).to_string()).collect();
+        let deadline = Instant::now() + SLOW_WAIT;
+        loop {
+            self.outgoing(OutgoingMessage::Raw {
+                server: "srv".into(),
+                line: "PING :wire-barrier".into(),
+            });
+            let window = Instant::now() + POLL_SLICE;
+            let mut lines = Vec::new();
+            let captured = loop {
+                match self.read_line_soft(window) {
+                    // Any wire-barrier PING ends the window, including one
+                    // left in flight by an attempt that timed out.
+                    Some(line) if line.starts_with("PING ") && line.contains("wire-barrier") => {
+                        break Some(lines);
+                    }
+                    // Keepalive payloads are bare timestamps (see `wire`).
+                    Some(line)
+                        if line.starts_with("PING ")
+                            && line[5..].bytes().all(|b| b.is_ascii_digit()) => {}
+                    Some(line) => lines.push(line),
+                    None => break None, // window expired before the barrier
+                }
+            };
+            if captured == Some(expected.clone()) {
+                return expected;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "wire never showed {expected:?}; last window: {captured:?}"
+            );
+            std::thread::sleep(POLL_SLICE / 4);
+        }
+    }
+
+    /// [`read_line_until`] without the deadline panic: `None` when the
+    /// read times out, so a polling caller retries instead of failing.
+    fn read_line_soft(&mut self, deadline: Instant) -> Option<String> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let reader = self.socket.as_mut().unwrap();
+        reader.get_ref().set_read_timeout(Some(remaining)).unwrap();
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => panic!("socket closed"),
+            Ok(_) => Some(line.trim_end_matches(['\r', '\n']).into()),
+            Err(error)
+                if error.kind() == ErrorKind::WouldBlock || error.kind() == ErrorKind::TimedOut =>
+            {
+                None
+            }
+            Err(error) => panic!("read failed: {error}"),
+        }
+    }
+
     fn receive_until(&mut self, predicate: impl Fn(&IrcEvent) -> bool) -> Vec<IrcEvent> {
         self.receive_until_deadline(Instant::now() + WAIT, predicate)
     }
@@ -212,6 +285,42 @@ impl MockSession {
             deadline,
             |event| matches!(event, IrcEvent::Message(message) if message.content.text == "event-barrier"),
         )
+    }
+
+    /// [`sync_events_with_wait`] as a bounded poll: one barrier stays
+    /// outstanding and events arrive through short receives until it
+    /// shows up, so a slow runner's momentary stall cannot expire a
+    /// single long fixed window (it flaked at 10s in CI run 39920909588).
+    /// Fails only when the cap expires.
+    fn sync_events_polling(&mut self) -> Vec<IrcEvent> {
+        let deadline = Instant::now() + SLOW_WAIT;
+        self.send(":mock NOTICE * :event-barrier\r\n");
+        let mut received = Vec::new();
+        loop {
+            match self.events.recv_timeout(POLL_SLICE) {
+                Ok(event) => {
+                    let done = matches!(
+                        &event,
+                        IrcEvent::Message(message) if message.content.text == "event-barrier"
+                    );
+                    self.app.session.handle_event(event.clone());
+                    self.observed.push(event.clone());
+                    received.push(event);
+                    if done {
+                        return received;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "event barrier never arrived; received {received:?}"
+                    );
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("missing event: channel closed; received {received:?}")
+                }
+            }
+        }
     }
 
     fn wait_channel(&mut self, channel: &str, state: ChannelState, desired: bool) -> Vec<IrcEvent> {
@@ -385,14 +494,16 @@ fn join_failures_keep_intent_and_route_once_only_for_known_channels() {
     let codes = [403, 405, 407, 437, 471, 473, 474, 475, 476, 477, 489];
     for code in codes {
         session.control(ConnectionCommand::Join("#runtime".into()));
-        assert_eq!(session.wire(), ["JOIN #runtime"]);
-        // macOS runners are slow; deadline flaked in CI run 39726681637
-        session.sync_events_with_wait(Duration::from_secs(10));
+        // macOS runners once wrote the JOIN only after the wire barrier
+        // and stalled past one fixed 10s event window (CI runs
+        // 39726681637, 39920909588): poll barrier windows and short
+        // receives instead, failing only when the SLOW_WAIT cap expires.
+        session.wire_until(&["JOIN #runtime"]);
+        session.sync_events_polling();
         session.send(&format!(
             ":mock {code} test #RUNTIME :Join denied\r\n:mock {code} test #unknown :Unknown channel\r\n"
         ));
-        // macOS runners are slow; deadline flaked in CI run 39726681637
-        let events = session.sync_events_with_wait(Duration::from_secs(10));
+        let events = session.sync_events_polling();
         assert_eq!(
             events
                 .iter()
