@@ -36,6 +36,9 @@ config = "打开服务器配置向导"
 [hint]
 tips = "Esc 退出 · Enter 发送 · PgUp/PgDn 滚动"
 
+[welcome]
+config_hint = "按 c 配置服务器"
+
 [dlg]
 title = "服务器配置"
 field_label = "名称"

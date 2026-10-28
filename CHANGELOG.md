@@ -20,7 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `queries`, `proxy`, `[ui]`, `[theme]`, comments) are preserved
   verbatim. `Config::default()` and a server-entry writer
   (`config::save_server`) back it, and a missing `password` key now
-  defaults to empty instead of failing the parse.
+  defaults to empty instead of failing the parse. Cancelling the
+  first-run wizard keeps the client usable: the welcome page shows a
+  dim hint and `c` reopens the wizard there (that page has no composer
+  to type `/config` into), while `Esc`/`Ctrl+C` still quit.
 
 ## [0.9.0] — 2026-10-28
 

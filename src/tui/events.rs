@@ -132,6 +132,14 @@ fn handle_key_press(app: &mut App, code: KeyCode, ctrl: bool, ctx: &mut KeyConte
         }
         return false;
     }
+    // The welcome page has no buffer, hence no composer, so `/config`
+    // cannot be typed there: a plain `c` reopens the wizard instead. With
+    // a buffer viewed, `c` is composer input and this never fires; Ctrl+C
+    // stays the quit shortcut because `ctrl` is checked.
+    if !ctrl && code == KeyCode::Char('c') && app.active_buffer().is_none() {
+        app.open_config_dialog(ctx.config);
+        return false;
+    }
     let composer_focused = app.focus() == Focus::Composer;
     match code {
         // Tab completes the highlighted hint while the hint bar is active;
@@ -649,6 +657,39 @@ mod tests {
         // Esc that quit before the wizard existed quits now.
         press(&mut app, KeyCode::Esc);
         assert!(!app.is_running(), "Esc on the page still quits");
+    }
+
+    #[test]
+    fn the_welcome_page_reopens_the_wizard_from_the_c_key() {
+        // Arrange: a first-run cancel left the welcome page with no
+        // buffer, hence no composer to type /config into.
+        let mut app = App::new(40, 10);
+        assert!(app.active_buffer().is_none());
+        assert!(app.dialog.is_none());
+
+        // Act
+        press(&mut app, KeyCode::Char('c'));
+
+        // Assert: the wizard opened and the client kept running.
+        assert!(app.dialog.is_some());
+        assert!(app.is_running());
+
+        // Ctrl+C is not intercepted by the welcome shortcut: it still
+        // quits even with the same empty state.
+        let mut bare = App::new(40, 10);
+        let mut config = crate::config::Config::default();
+        let mut outgoing = std::collections::HashMap::new();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut ctx = KeyContext {
+            config: &mut config,
+            outgoing: &mut outgoing,
+            tx: &tx,
+            config_path: std::path::Path::new("/nonexistent/termirc/config.toml"),
+            status: &mut String::new(),
+        };
+        handle_key_press(&mut bare, KeyCode::Char('c'), true, &mut ctx);
+        assert!(bare.dialog.is_none());
+        assert!(!bare.is_running());
     }
 
     #[test]

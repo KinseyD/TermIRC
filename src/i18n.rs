@@ -82,6 +82,8 @@ const REGISTRY: &[(&str, &str)] = &[
     // hint.* — standing TUI chrome. Key names (Esc, PgUp/PgDn) stay verbatim
     // in every language.
     ("hint.tips", "Esc quit · Enter send · PgUp/PgDn scroll"),
+    // welcome.* — the empty welcome page (no buffer viewed).
+    ("welcome.config_hint", "Press c to configure a server"),
     // dlg.* — the modal setup wizard (first run and /config).
     ("dlg.title", "Server configuration"),
     ("dlg.field_label", "Name"),
@@ -516,6 +518,7 @@ mod tests {
             ),
             ("cmd.config", "Open the server configuration wizard"),
             ("hint.tips", "Esc quit · Enter send · PgUp/PgDn scroll"),
+            ("welcome.config_hint", "Press c to configure a server"),
             ("dlg.title", "Server configuration"),
             ("dlg.field_label", "Name"),
             ("dlg.field_host", "Server"),

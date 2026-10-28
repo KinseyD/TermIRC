@@ -810,6 +810,19 @@ fn render_welcome(frame: &mut Frame, area: Rect, theme: &Theme) {
         Paragraph::new(Text::from(art)),
         Rect::new(left, top, logo_w.min(area.width), logo_h.min(area.height)),
     );
+    // Under the logo: how to open the setup wizard. This page has no
+    // composer (no buffer is viewed), so `/config` cannot be typed here;
+    // the `c` shortcut is the entry point instead.
+    let hint = i18n::t("welcome.config_hint");
+    let hint_w = hint.width() as u16;
+    let hint_top = top + logo_h + 1;
+    if hint_w <= area.width && hint_top < area.y + area.height {
+        let hint_left = area.x + area.width.saturating_sub(hint_w) / 2;
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(hint, Style::new().fg(theme.dim)))),
+            Rect::new(hint_left, hint_top, hint_w, 1),
+        );
+    }
 }
 
 /// Fill one row with a half-block character: the filled half in `fg`,
@@ -1519,6 +1532,16 @@ mod tests {
             .unwrap();
         assert_eq!(logo_cell.fg, theme().accent);
         assert!(buffer_line(&buffer, 16).contains("╚═════╝"));
+
+        // ...the setup-wizard shortcut hint sits one row under the logo,
+        // dimmed, because this page has no composer for `/config`.
+        let hint_row = buffer_line(&buffer, 18);
+        assert!(
+            hint_row.contains(crate::i18n::t("welcome.config_hint")),
+            "row 18: {hint_row:?}"
+        );
+        let hint_x = hint_row.find('P').unwrap() as u16;
+        assert_eq!(buffer.cell((hint_x, 18)).unwrap().fg, theme().dim);
 
         // ...the old welcome text and key hints are gone...
         for y in 0..30 {
