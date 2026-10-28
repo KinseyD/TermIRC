@@ -3,14 +3,18 @@
 //! Screen layout (no box frames):
 //! ```text
 //!  sidebar (fixed)  │  main column
-//!  osu_irc           │  (blank separator)          <- framing separator rows
-//!    ▶ #osu         │  alice: hello ...            <- messages (scroll)
-//!      #chinese     │  ────────────────            <- hint bar (only while a
+//!    ● osu_irc        │  (blank separator)          <- framing separator rows
+//!      ● #osu         │  alice: hello ...            <- messages (scroll)
+//!  \u{f054}   ● #chinese     │  ────────────────            <- hint bar (only while a
 //!                    │  /join — Join or focus ...      `/` command is drafted;
 //!                    │  ┃                             highlighted row reversed)
 //!                    │  ┃   /join #osu             <- input (4 rows, bg-shaded,
 //!                    │  ┃  connected · q quit …    <- tips row  accent ┃ left)
 //! ```
+//! The sidebar's pointer lane holds the navigation cursor: while the sidebar
+//! is focused, a Nerd Font chevron (`\u{f054}`, private-use code point)
+//! marks the cursor row; the active (viewed) row instead gets a brighter
+//! background with its name accent-colored and bold.
 //! Before any channel is opened the main column shows only the centered logo -
 //! no composer. Lines are pre-wrapped by `layout`, so the messages `Paragraph`
 //! is rendered without `Wrap`: continuation rows already carry their own
@@ -298,10 +302,13 @@ fn render_separator(frame: &mut Frame, area: Rect, theme: &Theme) {
     frame.render_widget(Paragraph::new(Text::from(lines)), col);
 }
 
-/// Render the server/channel sidebar from the app's row model: a bold
-/// server header per server with its channels beneath, the active row (the
-/// viewed channel, or the server header while its console is viewed) with
-/// a brighter background, and (while the sidebar has focus) a cursor row
+/// Render the server/channel sidebar from the app's row model: every row
+/// starts with a 2-column pointer lane (an accent chevron `\u{f054}` on the
+/// focused cursor row, blank otherwise - including the active row) so rows
+/// stay column-aligned, a bold server header per server with its channels
+/// beneath, the active row (the viewed channel, or the server header while
+/// its console is viewed) with a brighter background and its name
+/// accent-colored and bold, and (while the sidebar has focus) a cursor row
 /// with a slightly brighter background. No terminal cursor is placed here:
 /// the real cursor belongs to the composer.
 fn render_sidebar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
@@ -347,7 +354,10 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             frame.buffer_mut().set_style(row_rect, Style::new().bg(bg));
         }
 
-        // Row text: a leading space indents content off the row edge.
+        // Row text: a 2-column pointer lane holding the sidebar's navigation
+        // cursor - an accent chevron on the focused cursor row, blank on
+        // every other row (including the active row) - keeps every row's dot
+        // and name column-aligned.
         let state = app.connection_state(&row.server, row.kind.channel());
         let (symbol, color) = match state {
             crate::connection::ConnectionState::Connected => ("● ", theme.status_ok),
@@ -362,20 +372,39 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             ),
         };
         let dot = Span::styled(symbol, Style::new().fg(color));
+        // Nerd Font chevron-right; \u{f054} is a private-use code point, so
+        // it is written as an escape rather than a literal character.
+        let pointer = if is_cursor {
+            Span::styled("\u{f054} ", Style::new().fg(theme.accent))
+        } else {
+            Span::raw("  ")
+        };
+        let active_name = Style::new().fg(theme.accent).add_modifier(Modifier::BOLD);
         let line = match &row.kind {
             crate::core::BufferKind::Server => Line::from(vec![
-                Span::raw(" "),
+                pointer,
                 dot,
                 Span::styled(
                     row.server.as_str(),
-                    Style::new().add_modifier(Modifier::BOLD),
+                    if is_active {
+                        active_name
+                    } else {
+                        Style::new().add_modifier(Modifier::BOLD)
+                    },
                 ),
             ]),
             crate::core::BufferKind::Channel(channel) => Line::from(vec![
-                Span::raw(" "),
+                pointer.clone(),
                 Span::raw("  "),
                 dot,
-                Span::styled(channel.as_str(), Style::new().fg(theme.dim)),
+                Span::styled(
+                    channel.as_str(),
+                    if is_active {
+                        active_name
+                    } else {
+                        Style::new().fg(theme.dim)
+                    },
+                ),
             ]),
             crate::core::BufferKind::Query(nickname) => {
                 let unread = row
@@ -383,10 +412,15 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                     .and_then(|id| app.buffer(id))
                     .is_some_and(|buffer| buffer.unread);
                 Line::from(vec![
-                    Span::raw("   "),
+                    pointer,
+                    Span::raw("  "),
                     Span::styled(
                         format!("@{nickname}{}", if unread { "*" } else { "" }),
-                        Style::new().fg(theme.dim),
+                        if is_active {
+                            active_name
+                        } else {
+                            Style::new().fg(theme.dim)
+                        },
                     ),
                 ])
             }
@@ -822,6 +856,10 @@ mod tests {
         assert!(!buffer_line(&buffer, 1).contains('●'));
         assert_eq!(buffer.cell((10, 1)).unwrap().bg, theme().sidebar_active_bg);
         assert_ne!(buffer.cell((10, 0)).unwrap().bg, theme().sidebar_active_bg);
+        // The query name aligns with the server header name (both at inner
+        // column 4: pointer lane 2 + 2 leading columns).
+        assert_eq!(buffer.cell((5, 0)).unwrap().symbol(), "s"); // "srv"
+        assert_eq!(buffer.cell((5, 1)).unwrap().symbol(), "@"); // "@alice"
     }
 
     #[test]
@@ -1131,14 +1169,14 @@ mod tests {
         }
         app.apply_connection_event(&E::Connection("osu_irc".into(), S::Connecting));
         let pending = render_sized(&app, "", 50, 10);
-        assert_eq!(pending[(2, 0)].symbol(), "●");
-        assert_eq!(pending[(2, 0)].fg, theme().status_pending);
-        assert_eq!(pending[(4, 1)].fg, theme().status_pending);
+        assert_eq!(pending[(3, 0)].symbol(), "●");
+        assert_eq!(pending[(3, 0)].fg, theme().status_pending);
+        assert_eq!(pending[(5, 1)].fg, theme().status_pending);
         app.tick(std::time::Duration::from_millis(500));
         let off = render_sized(&app, "", 50, 10);
-        assert_eq!(off[(2, 0)].symbol(), " ");
-        assert_eq!(off[(4, 1)].symbol(), " ");
-        for x in 4..11 {
+        assert_eq!(off[(3, 0)].symbol(), " ");
+        assert_eq!(off[(5, 1)].symbol(), " ");
+        for x in 5..12 {
             assert_eq!(pending[(x, 0)].symbol(), off[(x, 0)].symbol());
         }
         app.apply_connection_event(&E::Connection("OSU_IRC".into(), S::Connected));
@@ -1159,13 +1197,13 @@ mod tests {
             },
         ));
         let connected = render_sized(&app, "", 50, 10);
-        assert_eq!(connected[(2, 0)].symbol(), "●");
-        assert_eq!(connected[(2, 0)].fg, theme().status_ok);
-        assert_eq!(connected[(4, 1)].fg, theme().status_ok);
-        assert_eq!(connected[(4, 2)].fg, theme().status_err);
+        assert_eq!(connected[(3, 0)].symbol(), "●");
+        assert_eq!(connected[(3, 0)].fg, theme().status_ok);
+        assert_eq!(connected[(5, 1)].fg, theme().status_ok);
+        assert_eq!(connected[(5, 2)].fg, theme().status_err);
         app.apply_connection_event(&E::Connection("osu_irc".into(), S::Stopped));
         let stopped = render_sized(&app, "", 50, 10);
-        for pos in [(2, 0), (4, 1), (4, 2)] {
+        for pos in [(3, 0), (5, 1), (5, 2)] {
             assert_eq!(stopped[pos].symbol(), "●");
             assert_eq!(stopped[pos].fg, theme().status_err);
         }
@@ -1198,12 +1236,12 @@ mod tests {
                 },
             ));
             let on = render_sized(&app, "", 50, 10);
-            assert_eq!(on[(4, 1)].fg, color, "{state:?}");
-            assert_eq!(on[(4, 1)].symbol(), "●");
+            assert_eq!(on[(5, 1)].fg, color, "{state:?}");
+            assert_eq!(on[(5, 1)].symbol(), "●");
             app.tick(std::time::Duration::from_millis(500));
             let off = render_sized(&app, "", 50, 10);
             assert_eq!(
-                off[(4, 1)].symbol(),
+                off[(5, 1)].symbol(),
                 if blinking { " " } else { "●" },
                 "{state:?}"
             );
@@ -1219,7 +1257,7 @@ mod tests {
             },
         ));
         let offline = render_sized(&app, "", 50, 10);
-        assert_eq!(offline[(4, 1)].fg, theme().status_err);
+        assert_eq!(offline[(5, 1)].fg, theme().status_err);
     }
 
     #[test]
@@ -1238,8 +1276,8 @@ mod tests {
         for elapsed in [0, 500] {
             app.tick(std::time::Duration::from_millis(elapsed));
             let rendered = render_sized(&app, "", 50, 10);
-            assert_eq!(rendered[(4, 1)].symbol(), "●");
-            assert_eq!(rendered[(4, 1)].fg, theme().status_err);
+            assert_eq!(rendered[(5, 1)].symbol(), "●");
+            assert_eq!(rendered[(5, 1)].fg, theme().status_err);
         }
     }
 
@@ -1258,6 +1296,71 @@ mod tests {
         let inactive_bg = buffer.cell((10, 2)).unwrap().bg;
         assert_eq!(active_bg, theme().sidebar_active_bg);
         assert_ne!(inactive_bg, theme().sidebar_active_bg);
+    }
+
+    #[test]
+    fn sidebar_chevron_marks_the_focused_cursor_row_and_the_active_name_stays_bold() {
+        // Arrange: #osu viewed (row 1), #chinese inactive (row 2), focus on
+        // the composer. The sidebar's inner area starts at column 1; the
+        // pointer lane spans columns 1-2, the channel name starts at column
+        // 7 (lane 2 + indent 2 + dot 2).
+        let mut app = test_app(22, 3);
+
+        // Act: render once with the sidebar unfocused.
+        let buffer = render_sized(&app, "", 50, 10);
+
+        // Assert: the active row keeps the accent + bold name but its lane
+        // is blank - the chevron only follows the navigation cursor, which
+        // is inactive while the sidebar is unfocused.
+        assert_eq!(buffer.cell((1, 1)).unwrap().symbol(), " ");
+        let name = buffer.cell((7, 1)).unwrap();
+        assert_eq!(name.symbol(), "#");
+        assert_eq!(name.fg, theme().accent);
+        assert!(name.modifier.contains(Modifier::BOLD));
+        // The inactive row keeps the blank lane and the dim, non-bold name.
+        assert_eq!(buffer.cell((1, 2)).unwrap().symbol(), " ");
+        let name = buffer.cell((7, 2)).unwrap();
+        assert_eq!(name.fg, theme().dim);
+        assert!(!name.modifier.contains(Modifier::BOLD));
+
+        // Act: focus the sidebar; the cursor snaps onto the active row.
+        app.tab(); // Composer -> Sidebar
+        assert_eq!(app.sidebar_cursor(), Some(1));
+        let buffer = render_sized(&app, "", 50, 10);
+
+        // Assert: the chevron (\u{f054}) now sits on the cursor row in the
+        // accent color.
+        let pointer = buffer.cell((1, 1)).unwrap();
+        assert_eq!(pointer.symbol(), "\u{f054}");
+        assert_eq!(pointer.fg, theme().accent);
+    }
+
+    #[test]
+    fn sidebar_chevron_follows_the_navigation_cursor_off_the_active_row() {
+        // Arrange: the osu_irc console viewed (server header is the active
+        // row 0); focus the sidebar and move the cursor onto #osu (row 1).
+        let mut app = App::new(22, 3);
+        app.open_server("osu_irc");
+        app.open_channel("osu_irc", "#osu");
+        app.select_buffer(0); // the console
+        app.focus_composer();
+        app.tab(); // Composer -> Sidebar
+        app.sidebar_down(); // cursor: server header (0) -> #osu (1)
+        assert_eq!(app.sidebar_cursor(), Some(1));
+
+        // Act
+        let buffer = render_sized(&app, "", 50, 10);
+
+        // Assert: the chevron sits on the cursor row (#osu), not on the
+        // active server-header row, which keeps the accent + bold name
+        // without the chevron.
+        let pointer = buffer.cell((1, 1)).unwrap();
+        assert_eq!(pointer.symbol(), "\u{f054}");
+        assert_eq!(pointer.fg, theme().accent);
+        assert_eq!(buffer.cell((1, 0)).unwrap().symbol(), " ");
+        let name = buffer.cell((5, 0)).unwrap();
+        assert_eq!(name.fg, theme().accent);
+        assert!(name.modifier.contains(Modifier::BOLD));
     }
 
     #[test]
@@ -1696,7 +1799,7 @@ mod tests {
             buffer.cell((10, 1)).unwrap().bg,
             Color::Rgb(0x2e, 0x2e, 0x2e) // SIDEBAR_ACTIVE_BG
         );
-        assert_eq!(buffer.cell((4, 1)).unwrap().fg, Color::Red); // status dot (not joined)
+        assert_eq!(buffer.cell((5, 1)).unwrap().fg, Color::Red); // status dot (not joined)
     }
 
     #[test]
