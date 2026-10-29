@@ -48,10 +48,12 @@ pub fn run(
                 // Windows also emits Release/Repeat events - handle presses only.
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                    let alt = key.modifiers.contains(KeyModifiers::ALT);
                     relayout = handle_key_press(
                         &mut app,
                         key.code,
                         ctrl,
+                        alt,
                         &mut KeyContext {
                             config,
                             outgoing,
@@ -117,13 +119,19 @@ pub(crate) struct KeyContext<'a> {
 /// have changed (a draft edit or hint completion rewraps the composer).
 /// Extracted from `run` so key routing stays unit-testable without a
 /// terminal.
-fn handle_key_press(app: &mut App, code: KeyCode, ctrl: bool, ctx: &mut KeyContext<'_>) -> bool {
+fn handle_key_press(
+    app: &mut App,
+    code: KeyCode,
+    ctrl: bool,
+    alt: bool,
+    ctx: &mut KeyContext<'_>,
+) -> bool {
     // The setup wizard is modal: while open it consumes every key.
     if app.dialog.is_some() {
         let outcome = app
             .dialog
             .as_mut()
-            .map(|dialog| dialog.key(code, ctrl))
+            .map(|dialog| dialog.key(code, ctrl, alt))
             .unwrap_or(DialogOutcome::Edited);
         match outcome {
             DialogOutcome::Cancel => app.close_dialog(),
@@ -539,7 +547,7 @@ mod tests {
             config_path: path,
             status: &mut String::new(),
         };
-        handle_key_press(app, code, false, &mut ctx)
+        handle_key_press(app, code, false, false, &mut ctx)
     }
 
     #[test]
@@ -705,7 +713,7 @@ mod tests {
             config_path: std::path::Path::new("/nonexistent/termirc/config.toml"),
             status: &mut String::new(),
         };
-        handle_key_press(&mut bare, KeyCode::Char('c'), true, &mut ctx);
+        handle_key_press(&mut bare, KeyCode::Char('c'), true, false, &mut ctx);
         assert!(bare.dialog.is_none());
         assert!(!bare.is_running());
     }
@@ -739,7 +747,7 @@ mod tests {
         };
 
         // Act
-        handle_key_press(&mut app, KeyCode::Enter, false, &mut ctx);
+        handle_key_press(&mut app, KeyCode::Enter, false, false, &mut ctx);
 
         // Assert: the file exists, the config and worker maps gained the
         // entry, the console is viewed, and the dialog closed with the
@@ -816,7 +824,7 @@ mod tests {
         };
 
         // Act
-        handle_key_press(&mut app, KeyCode::Enter, false, &mut ctx);
+        handle_key_press(&mut app, KeyCode::Enter, false, false, &mut ctx);
 
         // Assert: the worker was replaced rather than duplicated, and the
         // old control channel closed so its loop ends.
@@ -884,7 +892,7 @@ mod tests {
         };
 
         // Act
-        handle_key_press(&mut app, KeyCode::Enter, false, &mut ctx);
+        handle_key_press(&mut app, KeyCode::Enter, false, false, &mut ctx);
 
         // Assert: nothing was written or connected and the reason shows.
         assert!(app.dialog.is_some());

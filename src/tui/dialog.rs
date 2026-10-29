@@ -322,7 +322,9 @@ impl ConfigDialog {
     }
 
     /// Route one key press; the dialog consumes every key while open.
-    pub fn key(&mut self, code: KeyCode, ctrl: bool) -> DialogOutcome {
+    /// `alt` carries the Alt modifier, which omp's hubs use for page
+    /// cycling (`alt+left`/`alt+right`).
+    pub fn key(&mut self, code: KeyCode, ctrl: bool, alt: bool) -> DialogOutcome {
         if ctrl {
             // Ctrl+C closes the dialog instead of quitting: an accidental
             // interrupt must not take the whole client down.
@@ -334,6 +336,17 @@ impl ConfigDialog {
         }
         if matches!(code, KeyCode::Esc) {
             return DialogOutcome::Cancel;
+        }
+        if alt {
+            // omp's ModelHub turns its kind tabs with alt+left/right
+            // from anywhere in the hub; ours cycles the form's pages.
+            // Any other alt key is swallowed, not typed.
+            match code {
+                KeyCode::Left => self.turn_page(false),
+                KeyCode::Right => self.turn_page(true),
+                _ => {}
+            }
+            return DialogOutcome::Edited;
         }
         match self.pane {
             Pane::List => self.list_key(code),
@@ -367,6 +380,9 @@ impl ConfigDialog {
                 self.load_selection();
                 self.pane = Pane::Form;
             }
+            // → focuses the form (omp's arrows switch hub panes); there
+            // is no pane left of the sidebar, so ← stays a no-op.
+            KeyCode::Right => self.pane = Pane::Form,
             KeyCode::Tab => self.pane = Pane::Form,
             KeyCode::BackTab => self.pane = Pane::Actions,
             KeyCode::PageUp | KeyCode::PageDown => self.turn_page(code == KeyCode::PageDown),
@@ -381,6 +397,10 @@ impl ConfigDialog {
         let range = self.page.fields();
         match code {
             KeyCode::Tab => self.tab_forward(),
+            // ← off the start of a field returns to the sidebar (omp's
+            // hub arrows switch panes); mid-field it still moves the
+            // text caret via the field arms below.
+            KeyCode::Left if self.fields[self.cursor].text.cursor() == 0 => self.pane = Pane::List,
             KeyCode::BackTab => self.tab_backward(),
             // Up/Down stay within the current page: pages are turned
             // explicitly (Tab at the edge, PageUp/PageDown).
@@ -447,6 +467,14 @@ impl ConfigDialog {
                 // an unsaved-edits marker (the dialog closes anyway).
                 self.dirty_row = None;
                 DialogOutcome::Save
+            }
+            KeyCode::Left => {
+                self.pane = Pane::List;
+                DialogOutcome::Edited
+            }
+            KeyCode::Right => {
+                self.pane = Pane::Form;
+                DialogOutcome::Edited
             }
             KeyCode::Tab => {
                 self.pane = Pane::List;
@@ -708,17 +736,20 @@ channels = ["#three"]
 
         // Act / Assert: moving the cursor swaps the previewed entry and
         // restarts it from the first page.
-        dialog.key(KeyCode::Down, false);
+        dialog.key(KeyCode::Down, false, false);
         assert_eq!(dialog.selected.as_deref(), Some("beta"));
         assert_eq!(dialog.field_text("dlg.field_host"), "irc.beta.org");
         assert_eq!(dialog.field_text("dlg.field_password"), "");
         assert_eq!(dialog.page, Page::Connection);
         // Enter commits the preview and moves focus into the form.
-        assert_eq!(dialog.key(KeyCode::Enter, false), DialogOutcome::Edited);
+        assert_eq!(
+            dialog.key(KeyCode::Enter, false, false),
+            DialogOutcome::Edited
+        );
         assert_eq!(dialog.pane, Pane::Form);
         // Up clamps at the first row instead of wrapping.
         dialog.pane = Pane::List;
-        dialog.key(KeyCode::Up, false);
+        dialog.key(KeyCode::Up, false, false);
         assert_eq!(dialog.list_cursor, 0);
         assert_eq!(dialog.selected.as_deref(), Some("alpha"));
     }
@@ -729,19 +760,19 @@ channels = ["#three"]
         let mut dialog = ConfigDialog::from_config(&two_servers());
 
         // Act / Assert: walking onto the pseudo-row previews defaults.
-        dialog.key(KeyCode::Down, false);
-        dialog.key(KeyCode::Down, false);
+        dialog.key(KeyCode::Down, false, false);
+        dialog.key(KeyCode::Down, false, false);
         assert!(dialog.on_new_row());
         assert_eq!(dialog.selected, None);
         assert_eq!(dialog.field_text("dlg.field_label"), "libera");
         assert_eq!(dialog.field_text("dlg.field_host"), "");
         // Enter there focuses the form for the new entry.
-        dialog.key(KeyCode::Enter, false);
+        dialog.key(KeyCode::Enter, false, false);
         assert_eq!(dialog.pane, Pane::Form);
 
         // `n` reaches the same state from anywhere in the list.
         let mut dialog = ConfigDialog::from_config(&two_servers());
-        dialog.key(KeyCode::Char('n'), false);
+        dialog.key(KeyCode::Char('n'), false, false);
         assert_eq!(dialog.pane, Pane::Form);
         assert!(dialog.on_new_row());
         assert_eq!(dialog.selected, None);
@@ -753,54 +784,54 @@ channels = ["#three"]
         let mut dialog = ConfigDialog::from_config(&two_servers());
 
         // Act / Assert: List → Form, then through every field and page.
-        dialog.key(KeyCode::Tab, false);
+        dialog.key(KeyCode::Tab, false, false);
         assert_eq!((dialog.pane, dialog.cursor), (Pane::Form, F_LABEL));
-        dialog.key(KeyCode::Tab, false);
+        dialog.key(KeyCode::Tab, false, false);
         assert_eq!(dialog.cursor, F_HOST);
-        dialog.key(KeyCode::Tab, false);
+        dialog.key(KeyCode::Tab, false, false);
         assert_eq!(dialog.cursor, F_PORT);
-        dialog.key(KeyCode::Tab, false);
+        dialog.key(KeyCode::Tab, false, false);
         assert_eq!(dialog.cursor, F_TLS);
         // Tab off the last field of a page turns the page.
-        dialog.key(KeyCode::Tab, false);
+        dialog.key(KeyCode::Tab, false, false);
         assert_eq!((dialog.page, dialog.cursor), (Page::Identity, F_NICKNAME));
         for expected in [F_USERNAME, F_PASSWORD, F_SASL_USER, F_SASL_PASS] {
-            dialog.key(KeyCode::Tab, false);
+            dialog.key(KeyCode::Tab, false, false);
             assert_eq!(dialog.cursor, expected);
         }
-        dialog.key(KeyCode::Tab, false);
+        dialog.key(KeyCode::Tab, false, false);
         assert_eq!((dialog.page, dialog.cursor), (Page::Channels, F_CHANNELS));
-        dialog.key(KeyCode::Tab, false);
+        dialog.key(KeyCode::Tab, false, false);
         assert_eq!(dialog.cursor, F_QUERIES);
         // Tab off the very last field lands on the actions, then the
         // cycle closes back to the list.
-        dialog.key(KeyCode::Tab, false);
+        dialog.key(KeyCode::Tab, false, false);
         assert_eq!(dialog.pane, Pane::Actions);
-        dialog.key(KeyCode::Tab, false);
+        dialog.key(KeyCode::Tab, false, false);
         assert_eq!(dialog.pane, Pane::List);
 
         // BackTab unwinds the exact same path.
-        dialog.key(KeyCode::BackTab, false);
+        dialog.key(KeyCode::BackTab, false, false);
         assert_eq!(dialog.pane, Pane::Actions);
-        dialog.key(KeyCode::BackTab, false);
+        dialog.key(KeyCode::BackTab, false, false);
         assert_eq!((dialog.pane, dialog.cursor), (Pane::Form, F_QUERIES));
-        dialog.key(KeyCode::BackTab, false);
+        dialog.key(KeyCode::BackTab, false, false);
         assert_eq!((dialog.page, dialog.cursor), (Page::Channels, F_CHANNELS));
-        dialog.key(KeyCode::BackTab, false);
+        dialog.key(KeyCode::BackTab, false, false);
         assert_eq!((dialog.page, dialog.cursor), (Page::Identity, F_SASL_PASS));
         for expected in [F_SASL_USER, F_PASSWORD, F_USERNAME, F_NICKNAME] {
-            dialog.key(KeyCode::BackTab, false);
+            dialog.key(KeyCode::BackTab, false, false);
             assert_eq!(dialog.cursor, expected);
         }
-        dialog.key(KeyCode::BackTab, false);
+        dialog.key(KeyCode::BackTab, false, false);
         assert_eq!((dialog.page, dialog.cursor), (Page::Connection, F_TLS));
-        dialog.key(KeyCode::BackTab, false);
+        dialog.key(KeyCode::BackTab, false, false);
         assert_eq!(dialog.cursor, F_PORT);
-        dialog.key(KeyCode::BackTab, false);
+        dialog.key(KeyCode::BackTab, false, false);
         assert_eq!(dialog.cursor, F_HOST);
-        dialog.key(KeyCode::BackTab, false);
+        dialog.key(KeyCode::BackTab, false, false);
         assert_eq!(dialog.cursor, F_LABEL);
-        dialog.key(KeyCode::BackTab, false);
+        dialog.key(KeyCode::BackTab, false, false);
         assert_eq!(dialog.pane, Pane::List);
     }
 
@@ -811,25 +842,25 @@ channels = ["#three"]
         dialog.pane = Pane::Form;
 
         // Act / Assert: pages turn without wrapping around the ends.
-        dialog.key(KeyCode::PageDown, false);
+        dialog.key(KeyCode::PageDown, false, false);
         assert_eq!(dialog.page, Page::Identity);
-        dialog.key(KeyCode::PageDown, false);
+        dialog.key(KeyCode::PageDown, false, false);
         assert_eq!(dialog.page, Page::Channels);
-        dialog.key(KeyCode::PageDown, false);
+        dialog.key(KeyCode::PageDown, false, false);
         assert_eq!(dialog.page, Page::Channels, "no wrap past the last page");
-        dialog.key(KeyCode::PageUp, false);
+        dialog.key(KeyCode::PageUp, false, false);
         assert_eq!(dialog.page, Page::Identity);
-        dialog.key(KeyCode::PageUp, false);
+        dialog.key(KeyCode::PageUp, false, false);
         assert_eq!(dialog.page, Page::Connection);
-        dialog.key(KeyCode::PageUp, false);
+        dialog.key(KeyCode::PageUp, false, false);
         assert_eq!(dialog.page, Page::Connection, "no wrap before the first");
 
         // The field offset carries into the new page, clamped to it.
         dialog.page = Page::Identity;
         dialog.cursor = F_SASL_PASS; // offset 4 of a 5-field page
-        dialog.key(KeyCode::PageDown, false);
+        dialog.key(KeyCode::PageDown, false, false);
         assert_eq!((dialog.page, dialog.cursor), (Page::Channels, F_QUERIES));
-        dialog.key(KeyCode::PageUp, false);
+        dialog.key(KeyCode::PageUp, false, false);
         assert_eq!((dialog.page, dialog.cursor), (Page::Identity, F_USERNAME));
     }
 
@@ -841,16 +872,16 @@ channels = ["#three"]
 
         // Act / Assert
         for _ in 0..3 {
-            dialog.key(KeyCode::Down, false);
+            dialog.key(KeyCode::Down, false, false);
         }
         assert_eq!(dialog.cursor, F_TLS);
-        dialog.key(KeyCode::Down, false);
+        dialog.key(KeyCode::Down, false, false);
         assert_eq!(dialog.cursor, F_TLS, "Down clamps at the page's last field");
-        dialog.key(KeyCode::Up, false);
+        dialog.key(KeyCode::Up, false, false);
         assert_eq!(dialog.cursor, F_PORT);
-        dialog.key(KeyCode::Up, false);
-        dialog.key(KeyCode::Up, false);
-        dialog.key(KeyCode::Up, false);
+        dialog.key(KeyCode::Up, false, false);
+        dialog.key(KeyCode::Up, false, false);
+        dialog.key(KeyCode::Up, false, false);
         assert_eq!(
             dialog.cursor, F_LABEL,
             "Up clamps at the page's first field"
@@ -865,21 +896,21 @@ channels = ["#three"]
 
         // Act / Assert: Enter steps down a text field...
         dialog.cursor = F_HOST;
-        dialog.key(KeyCode::Enter, false);
+        dialog.key(KeyCode::Enter, false, false);
         assert_eq!(dialog.cursor, F_PORT);
         // ...flips a toggle in place...
         dialog.cursor = F_TLS;
         let before = dialog.fields[F_TLS].flag;
-        dialog.key(KeyCode::Enter, false);
+        dialog.key(KeyCode::Enter, false, false);
         assert_eq!(dialog.fields[F_TLS].flag, !before);
         assert_eq!(dialog.cursor, F_TLS);
         // ...and Space toggles too.
-        dialog.key(KeyCode::Char(' '), false);
+        dialog.key(KeyCode::Char(' '), false, false);
         assert_eq!(dialog.fields[F_TLS].flag, before);
         // Enter off the last field of the last page reaches the actions.
         dialog.page = Page::Channels;
         dialog.cursor = F_QUERIES;
-        dialog.key(KeyCode::Enter, false);
+        dialog.key(KeyCode::Enter, false, false);
         assert_eq!(dialog.pane, Pane::Actions);
     }
 
@@ -889,12 +920,12 @@ channels = ["#three"]
         let mut dialog = ConfigDialog::from_config(&two_servers());
 
         // Act / Assert: ordinary typing is swallowed by the list.
-        dialog.key(KeyCode::Char('x'), false);
-        dialog.key(KeyCode::Backspace, false);
+        dialog.key(KeyCode::Char('x'), false, false);
+        dialog.key(KeyCode::Backspace, false, false);
         assert_eq!(dialog.field_text("dlg.field_label"), "alpha");
         assert_eq!(dialog.pane, Pane::List);
         // `n` is the list's own shortcut for a new entry.
-        dialog.key(KeyCode::Char('n'), false);
+        dialog.key(KeyCode::Char('n'), false, false);
         assert_eq!(dialog.pane, Pane::Form);
         assert_eq!(dialog.selected, None);
     }
@@ -906,14 +937,81 @@ channels = ["#three"]
 
         // Act / Assert
         dialog.pane = Pane::Actions;
-        assert_eq!(dialog.key(KeyCode::Enter, false), DialogOutcome::Save);
-        assert_eq!(dialog.key(KeyCode::Esc, false), DialogOutcome::Cancel);
-        assert_eq!(dialog.key(KeyCode::Char('c'), true), DialogOutcome::Cancel);
-        assert_eq!(dialog.key(KeyCode::Char('x'), true), DialogOutcome::Edited);
+        assert_eq!(
+            dialog.key(KeyCode::Enter, false, false),
+            DialogOutcome::Save
+        );
+        assert_eq!(
+            dialog.key(KeyCode::Esc, false, false),
+            DialogOutcome::Cancel
+        );
+        assert_eq!(
+            dialog.key(KeyCode::Char('c'), true, false),
+            DialogOutcome::Cancel
+        );
+        assert_eq!(
+            dialog.key(KeyCode::Char('x'), true, false),
+            DialogOutcome::Edited
+        );
         dialog.pane = Pane::List;
-        assert_eq!(dialog.key(KeyCode::Esc, false), DialogOutcome::Cancel);
+        assert_eq!(
+            dialog.key(KeyCode::Esc, false, false),
+            DialogOutcome::Cancel
+        );
         dialog.pane = Pane::Form;
-        assert_eq!(dialog.key(KeyCode::Char('c'), true), DialogOutcome::Cancel);
+        assert_eq!(
+            dialog.key(KeyCode::Char('c'), true, false),
+            DialogOutcome::Cancel
+        );
+    }
+
+    #[test]
+    fn left_and_right_move_pane_focus_without_disturbing_the_caret() {
+        // Arrange: the list focused on the first entry.
+        let mut dialog = ConfigDialog::from_config(&two_servers());
+
+        // Act / Assert: → from the list focuses the form — omp's hub
+        // idiom of arrows switching panes.
+        dialog.key(KeyCode::Right, false, false);
+        assert_eq!(dialog.pane, Pane::Form);
+        // ← mid-field still moves the text caret; only ← off the start
+        // of a field returns to the sidebar.
+        dialog.key(KeyCode::Left, false, false);
+        assert_eq!(dialog.pane, Pane::Form, "mid-field left moves the caret");
+        dialog.key(KeyCode::Home, false, false);
+        dialog.key(KeyCode::Left, false, false);
+        assert_eq!(dialog.pane, Pane::List);
+        // From the actions row the arrows pick a side.
+        dialog.pane = Pane::Actions;
+        dialog.key(KeyCode::Left, false, false);
+        assert_eq!(dialog.pane, Pane::List);
+        dialog.pane = Pane::Actions;
+        dialog.key(KeyCode::Right, false, false);
+        assert_eq!(dialog.pane, Pane::Form);
+    }
+
+    #[test]
+    fn alt_arrows_turn_pages_from_any_pane() {
+        // Arrange: the list focused (a preview on the first page).
+        let mut dialog = ConfigDialog::from_config(&two_servers());
+
+        // Act / Assert: alt+→/alt+← cycle the form's pages from any
+        // pane — omp's ModelHub cycles its kind tabs the same way —
+        // without moving the pane focus or the caret.
+        dialog.key(KeyCode::Right, false, true);
+        assert_eq!(dialog.page, Page::Identity);
+        assert_eq!(dialog.pane, Pane::List);
+        dialog.key(KeyCode::Left, false, true);
+        assert_eq!(dialog.page, Page::Connection);
+        // From the form the same keys turn pages, never the caret.
+        dialog.pane = Pane::Form;
+        dialog.cursor = F_LABEL;
+        dialog.key(KeyCode::Right, false, true);
+        assert_eq!(dialog.page, Page::Identity);
+        assert_eq!(dialog.cursor, F_NICKNAME);
+        // Alt with any other key is swallowed, not typed.
+        dialog.key(KeyCode::Char('x'), false, true);
+        assert_eq!(dialog.field_text("dlg.field_label"), "alpha");
     }
 
     #[test]
@@ -991,13 +1089,13 @@ channels = ["#three"]
         dialog.cursor = F_HOST;
 
         // Act / Assert: End + insert appends, Backspace removes the tail.
-        dialog.key(KeyCode::End, false);
-        dialog.key(KeyCode::Char('s'), false);
-        dialog.key(KeyCode::Backspace, false);
+        dialog.key(KeyCode::End, false, false);
+        dialog.key(KeyCode::Char('s'), false, false);
+        dialog.key(KeyCode::Backspace, false, false);
         assert_eq!(dialog.field_text("dlg.field_host"), "irc.libera.chat");
         // Left + Delete removes the character under the cursor.
-        dialog.key(KeyCode::Left, false);
-        dialog.key(KeyCode::Delete, false);
+        dialog.key(KeyCode::Left, false, false);
+        dialog.key(KeyCode::Delete, false, false);
         assert_eq!(dialog.field_text("dlg.field_host"), "irc.libera.cha");
         assert_eq!(dialog.field_text("dlg.field_label"), "libera");
     }
@@ -1009,36 +1107,39 @@ channels = ["#three"]
         dialog.pane = Pane::Form;
 
         // Act / Assert: caret moves alone do not dirty the entry...
-        dialog.key(KeyCode::End, false);
+        dialog.key(KeyCode::End, false, false);
         assert_eq!(dialog.dirty_row, None);
         // ...but text edits and toggle flips do.
-        dialog.key(KeyCode::Char('x'), false);
+        dialog.key(KeyCode::Char('x'), false, false);
         assert_eq!(dialog.dirty_row.as_deref(), Some("alpha"));
         dialog.cursor = F_TLS;
-        dialog.key(KeyCode::Char(' '), false);
+        dialog.key(KeyCode::Char(' '), false, false);
         assert_eq!(dialog.dirty_row.as_deref(), Some("alpha"));
 
         // Moving the list cursor away keeps the marker on the row whose
         // edits were just silently discarded.
         dialog.pane = Pane::List;
-        dialog.key(KeyCode::Down, false);
+        dialog.key(KeyCode::Down, false, false);
         assert_eq!(dialog.selected.as_deref(), Some("beta"));
         assert_eq!(dialog.dirty_row.as_deref(), Some("alpha"));
 
         // A save clears it: the dialog closes on success anyway.
         dialog.pane = Pane::Actions;
-        assert_eq!(dialog.key(KeyCode::Enter, false), DialogOutcome::Save);
+        assert_eq!(
+            dialog.key(KeyCode::Enter, false, false),
+            DialogOutcome::Save
+        );
         assert_eq!(dialog.dirty_row, None);
 
         // Re-landing on the edited row also clears it: the user has now
         // seen that the preview restarted from the saved values.
         let mut dialog = ConfigDialog::from_config(&two_servers());
         dialog.pane = Pane::Form;
-        dialog.key(KeyCode::Char('x'), false);
+        dialog.key(KeyCode::Char('x'), false, false);
         assert_eq!(dialog.dirty_row.as_deref(), Some("alpha"));
         dialog.pane = Pane::List;
-        dialog.key(KeyCode::Down, false);
-        dialog.key(KeyCode::Up, false);
+        dialog.key(KeyCode::Down, false, false);
+        dialog.key(KeyCode::Up, false, false);
         assert_eq!(dialog.selected.as_deref(), Some("alpha"));
         assert_eq!(dialog.dirty_row, None);
     }
