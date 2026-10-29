@@ -847,11 +847,15 @@ mod tests {
         assert_eq!(memory.password, "");
         assert_eq!(memory.queries, vec!["bob".to_string()]);
         assert_eq!(memory.proxy.as_ref().map(|proxy| proxy.port), Some(9050));
-        // The file gains the new connection details and keeps the proxy.
+        // The file gains the new connection details and the form's
+        // password and queries (the wizard's writer owns both keys),
+        // and keeps the proxy no page models.
         let saved = crate::config::Config::load(&path).unwrap();
         let entry = &saved.servers["libera"];
         assert_eq!(entry.server, "127.0.0.1");
         assert_eq!(entry.port, 1);
+        assert_eq!(entry.password, "");
+        assert_eq!(entry.queries, vec!["bob".to_string()]);
         assert_eq!(entry.proxy.as_ref().map(|proxy| proxy.port), Some(9050));
         let _ = std::fs::remove_file(&path);
     }

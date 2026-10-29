@@ -315,15 +315,17 @@ impl Default for Config {
 
 /// The `[servers.<name>]` keys the setup wizard owns. `save_server`
 /// replaces exactly these inside the target section and leaves every
-/// other key (password, queries, proxy, user comments) verbatim, so
-/// re-running the wizard can never destroy what it does not model.
+/// other key (proxy, user comments) verbatim, so re-running the wizard
+/// can never destroy what it does not model.
 const WIZARD_KEYS: &[&str] = &[
     "username",
     "nickname",
+    "password",
     "server",
     "use_tls",
     "port",
     "channels",
+    "queries",
     "sasl_username",
     "sasl_password",
 ];
@@ -349,24 +351,32 @@ fn escape_toml_string(value: &str) -> String {
 }
 
 /// Emit one `[servers.<name>]` section in the style of
-/// `config.example.toml`. The wizard-unmodeled keys (password, queries,
-/// proxy) are omitted here; `save_server`'s merge keeps any existing
-/// copies of them instead.
+/// `config.example.toml`. Every wizard-owned key is emitted except an
+/// empty password, which is indistinguishable from an absent one (no
+/// PASS command either way) and would only add noise; `queries`, like
+/// `channels`, always emits so the array reads as one block. The
+/// wizard-unmodeled keys (proxy) are omitted here; `save_server`'s
+/// merge keeps any existing copy of them instead.
 fn emit_server_table(name: &str, server: &ServerConfig) -> String {
     let mut out = format!("[servers.{name}]\n");
     let string = |key: &str, value: &str| format!("{key} = \"{}\"\n", escape_toml_string(value));
     out.push_str(&string("username", &server.username));
     out.push_str(&string("nickname", &server.nickname));
+    if !server.password.is_empty() {
+        out.push_str(&string("password", &server.password));
+    }
     out.push_str(&string("server", &server.server));
     out.push_str(&format!("use_tls = {}\n", server.use_tls));
     out.push_str(&format!("port = {}\n", server.port));
-    let channels = server
-        .channels
-        .iter()
-        .map(|channel| format!("\"{}\"", escape_toml_string(channel)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    out.push_str(&format!("channels = [{channels}]\n"));
+    let list = |values: &[String]| {
+        values
+            .iter()
+            .map(|value| format!("\"{}\"", escape_toml_string(value)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    out.push_str(&format!("channels = [{}]\n", list(&server.channels)));
+    out.push_str(&format!("queries = [{}]\n", list(&server.queries)));
     if let (Some(username), Some(password)) = (&server.sasl_username, &server.sasl_password) {
         out.push_str(&string("sasl_username", username));
         out.push_str(&string("sasl_password", password));
@@ -1067,9 +1077,10 @@ channels = ["#a"]
     }
 
     #[test]
-    fn save_server_replaces_only_wizard_keys_and_preserves_the_rest() {
-        // Arrange: an existing file with keys the wizard does not model
-        // (password, queries, proxy, comments) plus another server.
+    fn save_server_replaces_the_wizard_keys_and_preserves_the_rest() {
+        // Arrange: an existing file with keys the wizard owns (password,
+        // queries — cleared in the saved form) plus keys it does not
+        // model (proxy, comments) and another table.
         let path = temp_path("merge");
         std::fs::write(
             &path,
@@ -1084,8 +1095,9 @@ channels = ["#a"]
         save_server(&path, "old", &server).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
 
-        // Assert: the wizard's keys are the new ones, everything it does
-        // not model survives verbatim, and the file still loads.
+        // Assert: the wizard's keys are the new ones (its cleared
+        // password and queries erase the old values), everything it
+        // does not model survives verbatim, and the file still loads.
         let saved = Config::load(&path).unwrap();
         let merged = &saved.servers["old"];
         assert_eq!(merged.nickname, "renamed");
@@ -1094,8 +1106,8 @@ channels = ["#a"]
         assert_eq!(merged.port, 6697);
         assert!(merged.use_tls);
         assert_eq!(merged.channels, vec!["#b".to_string(), "#c".to_string()]);
-        assert_eq!(merged.password, "keep");
-        assert_eq!(merged.queries, vec!["alice".to_string()]);
+        assert_eq!(merged.password, "");
+        assert!(merged.queries.is_empty());
         assert!(merged.proxy.is_some());
         assert_eq!(saved.servers.len(), 1);
         assert!(text.contains("# my setup"));
@@ -1179,6 +1191,52 @@ channels = ["#a"]
         assert_eq!(saved.servers.len(), 2);
         assert_eq!(saved.servers["old"].server, "irc.example.org");
         assert_eq!(saved.servers["second"].server, "irc2.example.org");
+        let _ = std::fs::remove_file(&path);
+    }
+    #[test]
+    fn save_server_replaces_the_wizard_owned_password_and_queries() {
+        // Arrange: an existing file whose entry carries a password and
+        // queries; the wizard saves with both cleared.
+        let path = temp_path("owned");
+        std::fs::write(
+            &path,
+            "[servers.old]\nusername = \"x\"\nnickname = \"x\"\npassword = \"keep\"\nserver = \"old.example\"\nport = 6667\nchannels = []\nqueries = [\"alice\"]\n",
+        )
+        .unwrap();
+        let server = wizard_server(); // password empty, queries empty
+
+        // Act
+        save_server(&path, "old", &server).unwrap();
+
+        // Assert: the cleared wizard keys are gone from the file —
+        // saving the form must be able to erase what the form shows.
+        let saved = Config::load(&path).unwrap();
+        assert_eq!(saved.servers["old"].password, "");
+        assert!(saved.servers["old"].queries.is_empty());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("\"keep\""), "{text}");
+        assert!(!text.contains("\"alice\""), "{text}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_server_round_trips_a_password_and_queries() {
+        // Arrange: a wizard entry carrying both.
+        let path = temp_path("credentials");
+        let mut server = wizard_server();
+        server.password = "s3cret pa55".into();
+        server.queries = vec!["alice".into(), "bob".into()];
+
+        // Act
+        save_server(&path, "new", &server).unwrap();
+
+        // Assert: both keys reload exactly as saved.
+        let saved = Config::load(&path).unwrap();
+        assert_eq!(saved.servers["new"].password, "s3cret pa55");
+        assert_eq!(
+            saved.servers["new"].queries,
+            vec!["alice".to_string(), "bob".to_string()]
+        );
         let _ = std::fs::remove_file(&path);
     }
 
