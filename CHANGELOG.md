@@ -11,24 +11,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - In-TUI server configuration wizard: on first run (no
   `~/.config/termirc/config.toml`, or one without servers) the client
-  boots to a modal setup form instead of exiting. It edits the server
-  name, host, port, nickname, username, TLS toggle, startup channels,
-  and the optional SASL pair with the same validation `Config::parse`
-  enforces, writes the file atomically, and (re)connects the saved
-  server at runtime without a restart. Saving an edit to an already
-  connected server replaces its worker, so a new host, port or TLS
-  setting takes effect immediately; only non-server tables
-  (`[theme]`, `[history]`, ...) still need a restart, and the wizard
-  does not edit those. `/config` reopens the wizard on the first
-  configured server; keys the form does not model (`password`,
-  `queries`, `proxy`, `[ui]`, `[theme]`, comments) are preserved
-  verbatim, both in the file and in the in-memory config.
-  `Config::default()` and a server-entry writer (`config::save_server`)
-  back it, and a missing `password` key now defaults to empty instead
-  of failing the parse. Cancelling the
-  first-run wizard keeps the client usable: the welcome page shows a
-  dim hint and `c` reopens the wizard there (that page has no composer
-  to type `/config` into), while `Esc`/`Ctrl+C` still quit.
+  boots to a modal setup wizard instead of exiting. The wizard is a
+  two-pane form modeled after the `/model` picker style: the left
+  column lists every configured server plus a `＋ new server` row, the
+  right column edits the selection across three sequential pages —
+  connection (name/host/port/TLS), identity (nickname, username,
+  server password, SASL pair), and channels (pre-join channels and
+  query nicknames). `Tab` cycles list → form → footer actions (and
+  turns a page at a field edge), `PageUp`/`PageDown` turn pages
+  directly, `n` starts a new entry, and the panel paints over the
+  content beneath it instead of letting it bleed through. Saving
+  validates with the same rules `Config::parse` enforces, writes the
+  file atomically, and (re)connects the saved server at runtime: an
+  edit to an already-connected server replaces its worker, so a new
+  host, port, or TLS setting takes effect immediately; only non-server
+  tables (`[theme]`, `[history]`, ...) still need a restart. The
+  wizard's writer (`config::save_server`) owns every key the form
+  shows — `password` and `queries` included — and preserves `proxy`
+  and unrelated keys verbatim; a missing `password` key now defaults
+  to empty instead of failing the parse. `/config` reopens the wizard,
+  and cancelling the first-run wizard keeps the client usable: the
+  welcome page shows a dim hint and `c` reopens the wizard there
+  (that page has no composer to type `/config` into), while
+  `Esc`/`Ctrl+C` still quit.
 
 ## [0.9.0] — 2026-10-28
 
