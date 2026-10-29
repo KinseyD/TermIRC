@@ -91,7 +91,10 @@ const REGISTRY: &[(&str, &str)] = &[
     ("dlg.page_connection", "connection"),
     ("dlg.page_identity", "identity"),
     ("dlg.page_channels", "channels"),
-    ("dlg.page_hint", "PgUp/PgDn pages"),
+    (
+        "dlg.hub_hint",
+        "enter save · ↑/↓ fields · ←/→ panes · pgup/pgdn page · esc cancel",
+    ),
     ("dlg.field_label", "Name"),
     ("dlg.field_host", "Server"),
     ("dlg.field_port", "Port"),
@@ -535,7 +538,10 @@ mod tests {
             ("dlg.page_connection", "connection"),
             ("dlg.page_identity", "identity"),
             ("dlg.page_channels", "channels"),
-            ("dlg.page_hint", "PgUp/PgDn pages"),
+            (
+                "dlg.hub_hint",
+                "enter save · ↑/↓ fields · ←/→ panes · pgup/pgdn page · esc cancel",
+            ),
             ("dlg.field_label", "Name"),
             ("dlg.field_host", "Server"),
             ("dlg.field_port", "Port"),

@@ -230,6 +230,13 @@ pub fn draw(frame: &mut Frame, app: &App, chrome: &Chrome<'_>) {
         Paragraph::new("").style(Style::new().bg(theme.global_bg)),
         frame.area(),
     );
+    // The configuration hub is fullscreen: while it is open, nothing
+    // else is drawn (no sidebar, messages, status bar or composer
+    // underneath), so the hub needs no Clear over the page.
+    if let Some(dialog) = &app.dialog {
+        render_config_dialog(frame, frame.area(), dialog, theme);
+        return;
+    }
 
     let g = geometry(
         frame.area().width,
@@ -244,9 +251,6 @@ pub fn draw(frame: &mut Frame, app: &App, chrome: &Chrome<'_>) {
     if app.active_buffer().is_none() {
         render_welcome(frame, g.messages, theme);
         render_status_bar(frame, g.status_bar, app, theme);
-        if let Some(dialog) = &app.dialog {
-            render_config_dialog(frame, frame.area(), dialog, theme);
-        }
         return;
     }
     frame.render_widget(Paragraph::new(build_text(app, theme)), g.messages);
@@ -266,18 +270,11 @@ pub fn draw(frame: &mut Frame, app: &App, chrome: &Chrome<'_>) {
     // The composer's caret is the terminal's real cursor: positioned at the
     // caret cell while the composer has focus, hidden otherwise (ratatui
     // hides the cursor when no position is set for the frame).
-    if app.dialog.is_none()
-        && app.focus() == Focus::Composer
-        && app.active_buffer().is_some()
-        && !g.input.is_empty()
-    {
+    if app.focus() == Focus::Composer && app.active_buffer().is_some() && !g.input.is_empty() {
         frame.set_cursor_position(composer_cursor_cell(&g));
     }
     render_gap(frame, g.gap, frame.area().width, app, theme);
     render_status_bar(frame, g.status_bar, app, theme);
-    if let Some(dialog) = &app.dialog {
-        render_config_dialog(frame, frame.area(), dialog, theme);
-    }
 }
 
 /// Render the inline slash-command hint bar between the message pane and the
@@ -1122,131 +1119,186 @@ fn inset(area: Rect, pad: u16) -> Rect {
 /// Display columns reserved for a wizard row's label, after the cursor mark.
 const DIALOG_LABEL_WIDTH: usize = 16;
 
-/// Width of the wizard's left server-list pane, before the separator.
-const DIALOG_LIST_WIDTH: u16 = 26;
+/// Floor and ceiling of the hub's sidebar column budget, mirroring the
+/// ModelHub's `sidebarBounds` (`{ min: 18, max: 26 }`, model-hub.ts).
+const HUB_SIDEBAR_MIN: usize = 18;
+const HUB_SIDEBAR_MAX: usize = 26;
 
-/// Minimum width kept for the wizard's right form pane: the footer row
-/// (` Save Enter · Cancel Esc · <page hint>`) needs this many columns in
-/// the widest locale, so on narrow terminals the list pane yields
-/// columns before the footer starts clipping.
-const DIALOG_FORM_MIN_WIDTH: u16 = 42;
+/// Minimum body width the hub keeps before the sidebar yields columns
+/// (`MODEL_HUB_BODY_MIN_WIDTH`, model-hub.ts).
+const HUB_BODY_MIN_WIDTH: usize = 28;
 
-/// Render the modal setup wizard, centered over the whole screen: a
-/// wide panel with the server list on the left, the selected entry's
-/// paged detail form on the right, and the Save/Cancel actions in the
-/// form's footer. The panel reuses composer colors (`input_bg` fill,
-/// `separator` border); the list borrows the sidebar's chevron pointer
-/// lane and the form keeps its per-field `┃` cursor, each idle while
-/// the other pane holds focus. Validation errors paint in the
-/// status-error color above the footer.
+/// The hub's sidebar column budget, measured from its row labels and
+/// clamped to the hub bounds. Mirrors `HubFrame#sidebarWidth`: the
+/// longest label plus a 5-column margin (cursor lane plus breathing
+/// room), where our labels are the entry names, their unsaved-edits
+/// marker, and the "new server" row.
+fn hub_sidebar_width(dialog: &crate::tui::dialog::ConfigDialog) -> usize {
+    let mut longest = i18n::t("dlg.new_server").width();
+    for (name, _) in &dialog.entries {
+        let mut width = name.width();
+        if dialog.dirty_row.as_deref() == Some(name.as_str()) {
+            width += 2; // the trailing ` *` marker
+        }
+        longest = longest.max(width);
+    }
+    (longest + 5).clamp(HUB_SIDEBAR_MIN, HUB_SIDEBAR_MAX)
+}
+
+/// The hub's `(sidebar width, body width, divider column)` for a frame
+/// `width` columns wide. The divider column is 0-based within the frame
+/// and sits at `sidebar_width + 3` (`splitDividerCol`, overlay-box.ts);
+/// the body keeps its floor first by shrinking the sidebar toward the
+/// hub's 18-column floor (`preserveSidebar`, model-hub.ts), and only
+/// below that does the body itself shrink.
+fn hub_geometry(width: usize, dialog: &crate::tui::dialog::ConfigDialog) -> (usize, usize, usize) {
+    let body_for = |sidebar: usize| width.saturating_sub(sidebar + 7);
+    let mut sidebar = hub_sidebar_width(dialog);
+    if body_for(sidebar) < HUB_BODY_MIN_WIDTH {
+        sidebar = sidebar
+            .min(width.saturating_sub(HUB_BODY_MIN_WIDTH + 7))
+            .max(HUB_SIDEBAR_MIN);
+    }
+    (sidebar, body_for(sidebar), sidebar + 3)
+}
+
+/// `text` cut to at most `width` display columns, without an ellipsis —
+/// the plain truncation omp's `truncateToWidth` applies to border titles
+/// and footer hints.
+fn truncate_plain(text: &str, width: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let w = ch.width().unwrap_or(0);
+        if used + w > width {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out
+}
+
+/// Render the fullscreen configuration hub over the whole terminal: a
+/// 1:1 structural replica of oh-my-pi's `/model` ModelHub screen
+/// (packages/tui/src/overlays/hub-frame.ts and chrome/overlay-box.ts)
+/// with our server-config content. Frame, top to bottom, one row each:
+/// `╭─ Title ─…┬…╮` top border (title bold accent, `┬` over the divider
+/// column), `│ sidebar │ body │` split rows, `├…┴…┤` divider row, a
+/// full-width dim footer hint row, `╰…╯` bottom border.
+///
+/// omp's color roles map onto existing theme roles — accent →
+/// `theme.accent`, border → `theme.separator`, dim → `theme.dim`,
+/// selectedBg → `theme.hover_bg`, success → `theme.status_ok`, error →
+/// `theme.status_err` — so the structure is 1:1 while the palette
+/// follows the user's theme.
 pub fn render_config_dialog(
     frame: &mut Frame,
     area: Rect,
     dialog: &crate::tui::dialog::ConfigDialog,
     theme: &Theme,
 ) {
-    let width = area.width.saturating_sub(4).clamp(1, 78);
-    let height = area.height.saturating_sub(2).clamp(1, 22);
-    let panel = Rect {
-        x: area.x + (area.width.saturating_sub(width)) / 2,
-        y: area.y + (area.height.saturating_sub(height)) / 2,
-        width,
-        height,
-    };
-    // The modal must fully own its rectangle: reset every cell first so
-    // the page underneath (welcome logo, chat lines) cannot bleed
-    // through the panel's background tint.
-    frame.render_widget(ratatui::widgets::Clear, panel);
-    frame.render_widget(
-        Paragraph::new("").style(Style::new().bg(theme.input_bg)),
-        panel,
-    );
-    // Border: the panel's outline in the separator color, drawn as row
-    // and column fills so the dialog stays in the repo's fill idiom.
-    let border = Style::new().fg(theme.separator);
-    for x in panel.x..panel.x + panel.width {
-        for y in [panel.y, panel.y + panel.height - 1] {
-            if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
-                cell.set_char('─').set_style(border);
-            }
-        }
-    }
-    for y in panel.y..panel.y + panel.height {
-        for x in [panel.x, panel.x + panel.width - 1] {
-            if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
-                cell.set_char('│').set_style(border);
-            }
-        }
-    }
-    for (corner, (x, y)) in [
-        ('┌', (panel.x, panel.y)),
-        ('┐', (panel.x + panel.width - 1, panel.y)),
-        ('└', (panel.x, panel.y + panel.height - 1)),
-        ('┘', (panel.x + panel.width - 1, panel.y + panel.height - 1)),
-    ] {
-        if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
-            cell.set_char(corner).set_style(border);
-        }
-    }
-
-    let inner = inset(clip_vertical(panel, 1), 1);
-    // Title row, centered across the whole panel.
-    let title = i18n::t("dlg.title");
-    let pad = inner.width.saturating_sub(title.width() as u16) / 2;
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(" ".repeat(pad as usize), Style::new()),
-            Span::styled(
-                title,
-                Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
-            ),
-        ])),
-        Rect { height: 1, ..inner },
-    );
-    // Body: the two panes below the title row and its blank, with one
-    // padding row at the bottom. Degenerate terminals keep the panel
-    // (still cleared and bordered) without the panes.
-    let body = Rect {
-        y: inner.y + 2,
-        height: inner.height.saturating_sub(3),
-        ..inner
-    };
-    if body.width < 30 || body.height < 10 {
+    let width = usize::from(area.width);
+    if width < 4 || area.height < 5 {
         return;
     }
-    let list_width = DIALOG_LIST_WIDTH.min(body.width.saturating_sub(DIALOG_FORM_MIN_WIDTH + 1));
-    // Vertical rule between the panes, in the same separator color as
-    // the border.
-    for y in body.y..body.y + body.height {
-        if let Some(cell) = frame.buffer_mut().cell_mut((body.x + list_width, y)) {
-            cell.set_char('│').set_style(border);
+    let (sidebar_w, body_w, divider_col) = hub_geometry(width, dialog);
+    let border = Style::new().fg(theme.separator);
+    let last_col = width - 1;
+    let top = area.y;
+    let rows_bottom = area.y + area.height - 3; // divider row
+    let footer_y = area.y + area.height - 2;
+    let bottom = area.y + area.height - 1;
+    // Paint one frame cell (0-based `x`, absolute `y`).
+    let mut put = |x: usize, y: u16, ch: char, style: Style| {
+        if let Some(cell) = frame.buffer_mut().cell_mut((area.x + x as u16, y)) {
+            cell.set_char(ch).set_style(style);
         }
+    };
+
+    // Top border (topBorderSplit): `╭` + one dash + ` Title ` (bold
+    // accent, truncated to the left arm's budget) + dashes + `┬` +
+    // dashes + `╮`.
+    put(0, top, '╭', border);
+    put(divider_col, top, '┬', border);
+    put(last_col, top, '╮', border);
+    for x in 1..divider_col {
+        put(x, top, '─', border);
     }
-    render_dialog_list(
-        frame,
-        Rect {
-            width: list_width,
-            ..body
-        },
-        dialog,
-        theme,
+    for x in divider_col + 1..last_col {
+        put(x, top, '─', border);
+    }
+    let title = truncate_plain(
+        &format!(" {} ", i18n::t("dlg.title")),
+        divider_col.saturating_sub(2),
     );
-    render_dialog_form(
-        frame,
-        Rect {
-            x: body.x + list_width + 1,
-            width: body.width - list_width - 1,
-            ..body
-        },
-        dialog,
-        theme,
-    );
+    let title_style = Style::new().fg(theme.accent).add_modifier(Modifier::BOLD);
+    for (x, ch) in title.chars().enumerate() {
+        put(x + 2, top, ch, title_style);
+    }
+
+    // Split rows: `│ … │ … │` walls, one column inset on every side.
+    for y in top + 1..rows_bottom {
+        put(0, y, '│', border);
+        put(divider_col, y, '│', border);
+        put(last_col, y, '│', border);
+    }
+
+    // Divider row (dividerSplit): `├` + dashes + `┴` under the `┬` +
+    // dashes + `┤`.
+    put(0, rows_bottom, '├', border);
+    put(divider_col, rows_bottom, '┴', border);
+    put(last_col, rows_bottom, '┤', border);
+    for x in 1..divider_col {
+        put(x, rows_bottom, '─', border);
+    }
+    for x in divider_col + 1..last_col {
+        put(x, rows_bottom, '─', border);
+    }
+
+    // Footer row: a single full-width pane holding the dim key hint.
+    put(0, footer_y, '│', border);
+    put(last_col, footer_y, '│', border);
+    let hint_style = Style::new().fg(theme.dim);
+    for (x, ch) in truncate_plain(i18n::t("dlg.hub_hint"), width - 4)
+        .chars()
+        .enumerate()
+    {
+        put(x + 2, footer_y, ch, hint_style);
+    }
+
+    // Bottom border.
+    put(0, bottom, '╰', border);
+    put(last_col, bottom, '╯', border);
+    for x in 1..last_col {
+        put(x, bottom, '─', border);
+    }
+
+    // Panes: the sidebar content sits at x = 2 (one-column inset), the
+    // body at the column after the divider plus its inset.
+    let rows = Rect {
+        x: area.x + 2,
+        y: top + 1,
+        width: sidebar_w as u16,
+        height: rows_bottom - top - 1,
+    };
+    let body = Rect {
+        x: area.x + divider_col as u16 + 2,
+        y: rows.y,
+        width: body_w as u16,
+        height: rows.height,
+    };
+    render_dialog_list(frame, rows, dialog, theme);
+    render_dialog_form(frame, body, dialog, theme);
 }
 
-/// The wizard's left pane: every configured server plus the accent
-/// "new server" pseudo-row. The focused selection reuses the sidebar's
-/// pointer lane — an accent chevron on the cursor row, blank elsewhere
-/// — so rows stay column-aligned.
+/// The hub's sidebar column: every configured server, a separator rule,
+/// then the accent "new server" action row. Mirrors omp's
+/// `HubFrame#renderSidebar` (hub-frame.ts): the `❯` cursor glyph
+/// (accent, only while the sidebar is focused and the row selected),
+/// the selected row's label bold accent with the others dim, separator
+/// rows as border-colored dash rules, and a full-width `selectedBg`
+/// band on the selected row.
 fn render_dialog_list(
     frame: &mut Frame,
     area: Rect,
@@ -1254,26 +1306,25 @@ fn render_dialog_list(
     theme: &Theme,
 ) {
     let focused = dialog.pane == crate::tui::dialog::Pane::List;
-    let mut rows = vec![Line::from(Span::styled(
-        i18n::t("dlg.servers").to_string(),
-        Style::new().fg(theme.nick).add_modifier(Modifier::BOLD),
-    ))];
     let name_width = (area.width as usize).saturating_sub(4);
+    let mut rows: Vec<Line<'static>> = Vec::new();
     for (index, (name, _)) in dialog.entries.iter().enumerate() {
-        let selected = focused && index == dialog.list_cursor;
-        // Nerd Font chevron-right; \u{f054} is a private-use code point,
-        // so it is written as an escape rather than a literal character.
-        let pointer = if selected {
-            Span::styled("\u{f054} ", Style::new().fg(theme.accent))
+        let selected = index == dialog.list_cursor;
+        let cursor = if selected && focused {
+            Span::styled("❯", Style::new().fg(theme.accent))
         } else {
-            Span::raw("  ")
+            Span::raw(" ")
         };
         let style = if selected {
-            Style::new().bg(theme.accent_dim).fg(theme.nick)
+            Style::new().fg(theme.accent).add_modifier(Modifier::BOLD)
         } else {
             Style::new().fg(theme.dim)
         };
-        let mut spans = vec![pointer, Span::styled(clip_columns(name, name_width), style)];
+        let mut spans = vec![
+            cursor,
+            Span::raw(" "),
+            Span::styled(clip_columns(name, name_width), style),
+        ];
         // Unsaved-edits marker: the entry's preview was edited and the
         // edits dropped when the cursor moved. Literal `*`, no i18n key.
         if dialog.dirty_row.as_deref() == Some(name.as_str()) {
@@ -1281,34 +1332,43 @@ fn render_dialog_list(
         }
         rows.push(Line::from(spans));
     }
-    // The pseudo-row starts a new entry; it reads as an action, so it
-    // carries the accent color until selected.
-    let selected = focused && dialog.on_new_row();
-    let pointer = if selected {
-        Span::styled("\u{f054} ", Style::new().fg(theme.accent))
+    // The separator rule closes the entry rows: omp's `kind:
+    // "separator"` rows paint a border-colored dash line.
+    rows.push(Line::from(Span::styled(
+        "─".repeat(area.width as usize),
+        Style::new().fg(theme.separator),
+    )));
+    // The action row starts a new entry; it reads as an action, so it
+    // carries the accent color, bold once selected.
+    let selected = dialog.on_new_row();
+    let cursor = if selected && focused {
+        Span::styled("❯", Style::new().fg(theme.accent))
     } else {
-        Span::raw("  ")
+        Span::raw(" ")
     };
     let style = if selected {
-        Style::new().bg(theme.accent_dim).fg(theme.nick)
+        Style::new().fg(theme.accent).add_modifier(Modifier::BOLD)
     } else {
         Style::new().fg(theme.accent)
     };
     rows.push(Line::from(vec![
-        pointer,
-        Span::styled(format!("＋ {}", i18n::t("dlg.new_server")), style),
+        cursor,
+        Span::raw(" "),
+        Span::styled(i18n::t("dlg.new_server").to_string(), style),
     ]));
     frame.render_widget(Paragraph::new(rows), area);
-    // The selected row's band spans the pane's full width — the same
-    // idiom as the sidebar's row rect — so the highlight does not stop
-    // mid-row where the name ends.
+    // omp reserves the `selectedBg` band for mouse hover; ours marks
+    // the keyboard selection, spanning the sidebar's full width like
+    // the sidebar's row rect so the highlight does not stop mid-row.
     if focused {
         let row = if dialog.on_new_row() {
-            dialog.entries.len()
+            // One past the list cursor: the separator rule sits between
+            // the entries and the action row.
+            dialog.entries.len() + 1
         } else {
             dialog.list_cursor
         };
-        let y = area.y + 1 + row as u16;
+        let y = area.y + row as u16;
         if y < area.y + area.height {
             frame.buffer_mut().set_style(
                 Rect {
@@ -1317,41 +1377,49 @@ fn render_dialog_list(
                     width: area.width,
                     height: 1,
                 },
-                Style::new().bg(theme.accent_dim),
+                Style::new().bg(theme.hover_bg),
             );
         }
     }
 }
 
-/// The wizard's right pane: the page tabs, the current page's fields,
-/// a dim helper row, the validation error, and the footer actions.
+/// The hub's body column: the page track, the current page's field
+/// rows, a dim helper row, and the validation error. The page track
+/// mirrors omp's ` Kind:` tab track (model-hub.ts) — dim label, active
+/// page accent, the rest dim, joined by dim `·` separators; the field
+/// rows mirror model-browser.ts's list rows: an accent `❯ ` prefix on
+/// the focused field, two spaces otherwise.
 fn render_dialog_form(
     frame: &mut Frame,
     area: Rect,
     dialog: &crate::tui::dialog::ConfigDialog,
     theme: &Theme,
 ) {
-    // Interior budget: one cursor column plus the 16-column label block,
-    // leaving one column of slack so a full-width value never touches
-    // the separator or the border.
+    // Interior budget: the two-column cursor prefix plus the 16-column
+    // label block, leaving one column of slack so a full-width value
+    // never touches the frame's border.
     let value_width = (area.width as usize).saturating_sub(DIALOG_LABEL_WIDTH + 2);
     let mut rows: Vec<Line<'static>> = Vec::new();
-    // Page tabs: the three page names with the active one accented.
-    let mut tabs = Vec::new();
+    // Page track: ` Page: connection · identity · channels`, the active
+    // page accented, the others dim.
+    let mut track = vec![Span::styled(
+        " Page:".to_string(),
+        Style::new().fg(theme.dim),
+    )];
     for (index, page) in crate::tui::dialog::Page::ALL.iter().enumerate() {
         if index > 0 {
-            tabs.push(Span::styled(" · ", Style::new().fg(theme.separator)));
+            track.push(Span::styled(" · ".to_string(), Style::new().fg(theme.dim)));
         }
         let style = if *page == dialog.page {
             Style::new().fg(theme.accent).add_modifier(Modifier::BOLD)
         } else {
             Style::new().fg(theme.dim)
         };
-        tabs.push(Span::styled(i18n::t(page.tab_key()).to_string(), style));
+        track.push(Span::styled(i18n::t(page.tab_key()).to_string(), style));
     }
-    rows.push(Line::from(tabs));
+    rows.push(Line::from(track));
     rows.push(Line::from(""));
-    // Fields of the shown page; the `┃` cursor follows the focused
+    // Fields of the shown page; the `❯` prefix follows the focused
     // field only while the form pane holds focus.
     let form_focused = dialog.pane == crate::tui::dialog::Pane::Form;
     for index in dialog.page.fields() {
@@ -1364,15 +1432,19 @@ fn render_dialog_form(
             crate::tui::dialog::FieldKind::Text => clip_columns(field.text.text(), value_width),
         };
         let label = i18n::t(field.label_key);
-        let style = if is_cursor {
-            Style::new().bg(theme.accent_dim).fg(theme.nick)
+        let prefix = if is_cursor {
+            Span::styled("❯ ".to_string(), Style::new().fg(theme.accent))
+        } else {
+            Span::raw("  ")
+        };
+        let label_style = if is_cursor {
+            Style::new().fg(theme.accent)
         } else {
             Style::new().fg(theme.dim)
         };
-        let cursor_mark = if is_cursor { "┃" } else { " " };
         rows.push(Line::from(vec![
-            Span::styled(cursor_mark.to_string(), Style::new().fg(theme.accent)),
-            Span::styled(pad_label(label, DIALOG_LABEL_WIDTH), style),
+            prefix,
+            Span::styled(pad_label(label, DIALOG_LABEL_WIDTH), label_style),
             Span::styled(value, Style::new().fg(theme.nick)),
         ]));
     }
@@ -1381,8 +1453,8 @@ fn render_dialog_form(
         i18n::t(dialog.page.help_key()).to_string(),
         Style::new().fg(theme.dim),
     )));
-    // The error row keeps its place (blank when idle) so the footer
-    // never jumps when validation fails.
+    // The error row keeps its place (blank when idle) so the frame's
+    // footer never jumps when validation fails.
     rows.push(match dialog.error {
         Some(key) => Line::from(Span::styled(
             i18n::t(key).to_string(),
@@ -1390,42 +1462,7 @@ fn render_dialog_form(
         )),
         None => Line::from(""),
     });
-    // Footer: the Save action (accented while focused) with its key
-    // hints and the page-turn hint.
-    let save_style = if dialog.pane == crate::tui::dialog::Pane::Actions {
-        Style::new().bg(theme.accent).fg(theme.global_bg)
-    } else {
-        Style::new().fg(theme.nick)
-    };
-    rows.push(Line::from(vec![
-        Span::styled(
-            format!(" {} ", i18n::t("dlg.save")),
-            save_style.add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("Enter", Style::new().fg(theme.dim)),
-        Span::styled(" · ", Style::new().fg(theme.dim)),
-        Span::styled(
-            i18n::t("dlg.cancel").to_string(),
-            Style::new().fg(theme.dim),
-        ),
-        Span::styled(" Esc", Style::new().fg(theme.dim)),
-        Span::styled(" · ", Style::new().fg(theme.dim)),
-        Span::styled(
-            i18n::t("dlg.page_hint").to_string(),
-            Style::new().fg(theme.dim),
-        ),
-    ]));
     frame.render_widget(Paragraph::new(rows), area);
-}
-
-/// Shrink a region vertically by `pad` rows on each side (horizontal
-/// unchanged), for padding a dialog panel inside its border.
-fn clip_vertical(area: Rect, pad: u16) -> Rect {
-    Rect {
-        y: area.y + pad,
-        height: area.height.saturating_sub(pad * 2),
-        ..area
-    }
 }
 
 #[cfg(test)]
@@ -1580,60 +1617,120 @@ mod tests {
     }
 
     #[test]
-    fn the_wizard_panel_hides_the_welcome_logo_underneath_it() {
-        // Arrange: a first-run app (no buffers, welcome page) with the
-        // wizard opened over it.
-        let mut app = App::new(70, 20);
-        app.open_config_dialog(&crate::config::Config::default());
+    fn the_config_hub_takes_over_the_entire_screen() {
+        // Arrange: a first-run app (welcome page behind the hub) with
+        // the wizard open, on both terminal sizes the hub must own.
+        for (w, h) in [(80u16, 24u16), (100, 30)] {
+            let mut app = App::new(w, h);
+            app.open_config_dialog(&two_server_config());
 
-        // Sanity: without the dialog the block-art logo fills the main
-        // column, so there is art to hide.
-        let bare = render_sized(&App::new(70, 20), "", 70, 20);
-        let bare_text: String = (0..20)
-            .map(|y| buffer_line(&bare, y))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(bare_text.contains('█'), "expected the logo: {bare_text}");
+            // Act
+            let buffer = render_sized(&app, "", w, h);
 
-        // Act
-        let buffer = render_sized(&app, "", 70, 20);
-
-        // Assert: the box shared by every panel size the renderer uses
-        // shows none of the art — the modal must paint over the page,
-        // not just tint it.
-        for y in 3..17u16 {
-            for x in 10..60u16 {
-                assert_ne!(
-                    buffer.cell((x, y)).unwrap().symbol(),
-                    "█",
-                    "logo art bleeds through at ({x},{y}): {}",
-                    buffer_line(&buffer, y)
-                );
+            // Assert: the hub frame owns every row — no welcome logo
+            // art and no composer panel (`input_bg` fill) anywhere —
+            // while its own top and bottom borders bracket the screen
+            // with the sidebar junction above the divider column.
+            for y in 0..h {
+                for x in 0..w {
+                    let cell = buffer.cell((x, y)).unwrap();
+                    assert_ne!(cell.symbol(), "█", "logo art at ({x},{y})");
+                    assert_ne!(cell.bg, theme().input_bg, "composer panel at ({x},{y})");
+                }
             }
+            assert!(buffer_line(&buffer, 0).starts_with("╭─"));
+            assert!(buffer_line(&buffer, h - 1).starts_with("╰─"));
+            assert!(buffer_line(&buffer, h - 1).ends_with("╯"));
+            // Short labels clamp the sidebar to its 18-column floor, so
+            // the divider column is 18 + 3 = 21.
+            assert_eq!(buffer.cell((21, 0)).unwrap().symbol(), "┬");
+            assert_eq!(buffer.cell((21, h - 3)).unwrap().symbol(), "┴");
         }
     }
 
     #[test]
-    fn the_config_wizard_renders_both_panes_pages_and_actions_over_the_page() {
-        // Arrange: an empty config (first run) so the welcome page is
-        // behind the modal, with the wizard opened on new-entry defaults.
-        let mut app = App::new(70, 20);
+    fn the_hub_frame_paints_corners_junctions_split_rows_and_footer() {
+        // Arrange: 100x30 with short labels (sidebar at its 18-column
+        // floor, divider column 21, body 100 - 18 - 7 = 67 wide).
+        let mut app = App::new(100, 30);
+        app.open_config_dialog(&two_server_config());
+
+        // Act
+        let buffer = render_sized(&app, "", 100, 30);
+
+        // Assert: rounded corners, the `┬`/`┴` junction pair over the
+        // divider column, `│` walls on a content row, the `├ ┴ ┤`
+        // divider row, and a footer row that spans the full width.
+        assert_eq!(buffer.cell((0, 0)).unwrap().symbol(), "╭");
+        assert_eq!(buffer.cell((99, 0)).unwrap().symbol(), "╮");
+        assert_eq!(buffer.cell((0, 29)).unwrap().symbol(), "╰");
+        assert_eq!(buffer.cell((99, 29)).unwrap().symbol(), "╯");
+        assert_eq!(buffer.cell((21, 0)).unwrap().symbol(), "┬");
+        let divider_row = buffer_line(&buffer, 27);
+        assert_eq!(divider_row.chars().next(), Some('├'));
+        assert_eq!(divider_row.chars().nth(21), Some('┴'));
+        assert_eq!(divider_row.chars().last(), Some('┤'));
+        let content_row = buffer_line(&buffer, 5);
+        assert_eq!(content_row.chars().next(), Some('│'));
+        assert_eq!(content_row.chars().nth(21), Some('│'));
+        assert_eq!(content_row.chars().last(), Some('│'));
+        let footer = buffer_line(&buffer, 28);
+        assert_eq!(footer.chars().next(), Some('│'));
+        assert_eq!(footer.chars().last(), Some('│'));
+        assert!(footer.contains(crate::i18n::t("dlg.hub_hint")), "{footer}");
+    }
+
+    #[test]
+    fn the_hub_sidebar_width_clamps_and_keeps_a_body_floor() {
+        // Arrange: long server names push the sidebar to its 26-column
+        // ceiling, so the junction moves to column 29 on a 100-wide
+        // screen.
+        let long = crate::config::Config::parse(
+            r##"
+[servers.abcdefghijklmnopqrstuvwxyz0123]
+username = "me"
+nickname = "mynick"
+server = "irc.example.org"
+port = 6667
+channels = []
+"##,
+        )
+        .unwrap();
+        let mut app = App::new(100, 30);
+        app.open_config_dialog(&long);
+        let buffer = render_sized(&app, "", 100, 30);
+        assert_eq!(buffer.cell((29, 0)).unwrap().symbol(), "┬");
+
+        // A 53-wide screen would give a 26-column sidebar only a
+        // 20-column body, so the sidebar yields to its floor and the
+        // body keeps its 28-column minimum (divider column 21).
+        let mut narrow = App::new(53, 24);
+        narrow.open_config_dialog(&long);
+        let buffer = render_sized(&narrow, "", 53, 24);
+        assert_eq!(buffer.cell((21, 0)).unwrap().symbol(), "┬");
+    }
+
+    #[test]
+    fn the_config_hub_renders_its_sidebar_pages_and_fields() {
+        // Arrange: an empty config (first run) so the hub opens on
+        // new-entry defaults.
+        let mut app = App::new(100, 30);
         app.open_config_dialog(&crate::config::Config::default());
 
         // Act
-        let buffer = render_sized(&app, "", 70, 20);
+        let buffer = render_sized(&app, "", 100, 30);
 
-        // Assert: the two-pane layout is painted — the title, the list
-        // pane's header and new-server row, the form pane's page tabs
-        // with the first page's fields, and the footer actions — while
-        // the terminal cursor stays hidden (the dialog has none of its
-        // own).
-        let text: String = (0..20)
+        // Assert: the hub paints its content — the title, the sidebar's
+        // new-server row, the body's page track with the first page's
+        // fields — while the terminal cursor stays hidden (the hub has
+        // none of its own).
+        let text: String = (0..30)
             .map(|y| buffer_line(&buffer, y))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains(crate::i18n::t("dlg.title")), "{text}");
-        assert!(text.contains(crate::i18n::t("dlg.servers")), "{text}");
+        // The top border truncates the title to the left arm's budget
+        // (omp's topBorderSplit does the same over a narrow sidebar).
+        assert!(text.contains("Server configur"), "{text}");
         assert!(text.contains(crate::i18n::t("dlg.new_server")), "{text}");
         assert!(
             text.contains(crate::i18n::t("dlg.page_connection")),
@@ -1651,17 +1748,13 @@ mod tests {
             text.contains(crate::i18n::t("dlg.help_connection")),
             "{text}"
         );
-        assert!(text.contains(crate::i18n::t("dlg.save")), "{text}");
-        assert!(text.contains(crate::i18n::t("dlg.cancel")), "{text}");
-        assert!(text.contains(crate::i18n::t("dlg.page_hint")), "{text}");
-        // The panel's four corners are real box corners, not the `┼`
-        // that made the outline read as a cross.
-        for corner in ['┌', '┐', '└', '┘'] {
+        assert!(text.contains(crate::i18n::t("dlg.hub_hint")), "{text}");
+        // The frame's four corners are the rounded hub glyphs.
+        for corner in ['╭', '╮', '╰', '╯'] {
             assert!(text.contains(corner), "missing {corner}: {text}");
         }
-        assert!(!text.contains('┼'), "corners must not be crosses: {text}");
-        let (_, cursor) = render_frame(&app, "", 70, 20, &theme());
-        assert!(cursor.is_none(), "the dialog must not move the cursor");
+        let (_, cursor) = render_frame(&app, "", 100, 30, &theme());
+        assert!(cursor.is_none(), "the hub must not move the cursor");
     }
 
     /// Two configured servers for list-pane tests.
@@ -1687,61 +1780,65 @@ channels = ["#three"]
     }
 
     #[test]
-    fn the_wizard_list_and_form_panes_carry_their_own_cursors() {
-        // Arrange: an 80x24 terminal puts the panel at (2,1) sized 76x22,
-        // so the list rows start under the header at row 5 and the form
-        // pane begins at column 30 (26-column list + separator).
+    fn the_hub_list_and_field_cursors_follow_their_panes() {
+        // Arrange: an 80x24 hub with two short-named servers, so the
+        // sidebar sits at columns 2..19 (18-column floor) and the body
+        // starts at column 23; sidebar rows are alpha y=1, beta y=2,
+        // the separator y=3, the new-server row y=4.
         let mut app = App::new(80, 24);
         app.open_config_dialog(&two_server_config());
 
         // Act
         let buffer = render_sized(&app, "", 80, 24);
 
-        // Assert: the sidebar's chevron marks the selected list row and
-        // the second row's lane stays blank, while the form pane shows
-        // no field cursor while the list holds focus.
-        assert!(buffer_line(&buffer, 5).contains("alpha"));
-        assert_eq!(buffer.cell((3, 5)).unwrap().symbol(), "\u{f054}");
-        assert!(buffer_line(&buffer, 6).contains("beta"));
-        assert_eq!(buffer.cell((3, 6)).unwrap().symbol(), " ");
-        for y in 4..21u16 {
+        // Assert: the accent `❯` marks the selected sidebar row and the
+        // second row's lane stays blank, while the body shows no field
+        // cursor while the list holds focus.
+        assert!(buffer_line(&buffer, 1).contains("alpha"));
+        assert_eq!(buffer.cell((2, 1)).unwrap().symbol(), "❯");
+        assert_eq!(buffer.cell((2, 1)).unwrap().fg, theme().accent);
+        assert!(buffer_line(&buffer, 2).contains("beta"));
+        assert_eq!(buffer.cell((2, 2)).unwrap().symbol(), " ");
+        for y in 1..21u16 {
             assert_ne!(
-                buffer.cell((30, y)).unwrap().symbol(),
-                "┃",
-                "form cursor leaked at row {y}"
+                buffer.cell((23, y)).unwrap().symbol(),
+                "❯",
+                "field cursor leaked at row {y}"
             );
         }
 
-        // Focusing the form moves its `┃` cursor onto the first field
-        // row (below the tab row and its blank) and frees the list lane.
+        // Focusing the form moves its `❯` prefix onto the first field
+        // row (below the page track and its blank) and frees the list
+        // lane.
         app.dialog.as_mut().unwrap().pane = crate::tui::dialog::Pane::Form;
         let buffer = render_sized(&app, "", 80, 24);
-        assert_eq!(buffer.cell((30, 6)).unwrap().symbol(), "┃");
-        assert_eq!(buffer.cell((3, 5)).unwrap().symbol(), " ");
+        assert_eq!(buffer.cell((23, 3)).unwrap().symbol(), "❯");
+        assert_eq!(buffer.cell((2, 1)).unwrap().symbol(), " ");
     }
 
     #[test]
-    fn a_failed_wizard_save_paints_its_reason_above_the_footer() {
+    fn a_failed_hub_save_paints_its_reason_below_the_helper_row() {
         // Arrange: a validation error left on the dialog.
-        let mut app = App::new(70, 20);
+        let mut app = App::new(80, 24);
         app.open_config_dialog(&crate::config::Config::default());
         app.dialog.as_mut().unwrap().error = Some("dlg.err_host");
 
         // Act
-        let buffer = render_sized(&app, "", 70, 20);
+        let buffer = render_sized(&app, "", 80, 24);
 
-        // Assert: the translated reason sits on its own row in the
-        // status-error color — the footer stays below it.
-        let row = buffer_line(&buffer, 12);
+        // Assert: the translated reason sits on its own row (page
+        // track, blank, four fields, blank, helper, error) in the
+        // status-error color — the hub footer stays below it.
+        let row = buffer_line(&buffer, 9);
         assert!(row.contains(crate::i18n::t("dlg.err_host")), "{row}");
-        let x = (30..buffer.area.width)
-            .find(|&x| buffer.cell((x, 12)).unwrap().symbol() != " ")
+        let x = (23..buffer.area.width)
+            .find(|&x| buffer.cell((x, 9)).unwrap().symbol() != " ")
             .unwrap();
-        assert_eq!(buffer.cell((x, 12)).unwrap().fg, theme().status_err);
+        assert_eq!(buffer.cell((x, 9)).unwrap().fg, theme().status_err);
     }
 
     #[test]
-    fn the_wizard_list_marks_the_entry_with_unsaved_edits() {
+    fn the_hub_list_marks_the_entry_with_unsaved_edits() {
         // Arrange: two servers with the first one carrying unsaved edits.
         let mut app = App::new(80, 24);
         app.open_config_dialog(&two_server_config());
@@ -1751,50 +1848,93 @@ channels = ["#three"]
         let buffer = render_sized(&app, "", 80, 24);
 
         // Assert: a trailing accent `*` sits on the marked row only —
-        // the marker is the one place the wizard admits edits were
-        // dropped when the list cursor moved.
+        // the marker is the one place the hub admits edits were dropped
+        // when the list cursor moved.
         assert!(
-            buffer_line(&buffer, 5).contains("alpha *"),
+            buffer_line(&buffer, 1).contains("alpha *"),
             "{:?}",
-            buffer_line(&buffer, 5)
+            buffer_line(&buffer, 1)
         );
         assert!(
-            !buffer_line(&buffer, 6).contains('*'),
+            !buffer_line(&buffer, 2).contains('*'),
             "{}",
-            buffer_line(&buffer, 6)
+            buffer_line(&buffer, 2)
         );
     }
 
     #[test]
-    fn the_wizard_selection_band_spans_the_full_list_row() {
-        // Arrange: 80x24 puts the panel at x=2 with a 26-column list
-        // pane starting at column 3; the header sits at y=4, alpha at
-        // y=5, beta at y=6, the pseudo-row at y=7.
+    fn the_hub_sidebar_paints_its_band_separator_and_action_row() {
+        // Arrange: 80x24 with two short-named servers, so the sidebar
+        // spans columns 2..=19 (18-column floor): alpha y=1, beta y=2,
+        // the separator rule y=3, the accent new-server row y=4.
         let mut app = App::new(80, 24);
         app.open_config_dialog(&two_server_config());
 
         // Act
         let buffer = render_sized(&app, "", 80, 24);
 
-        // Assert: the selected row's background covers its first and
-        // last interior column, like the sidebar's row band — and an
-        // unselected row stays on the panel background at its edge.
-        let first = 3; // list pane's first column
-        let last = 3 + 26 - 1; // list pane's last column, before the rule
-        assert_eq!(buffer.cell((first, 5)).unwrap().bg, theme().accent_dim);
-        assert_eq!(buffer.cell((last, 5)).unwrap().bg, theme().accent_dim);
+        // Assert: the selected row's background band covers the
+        // sidebar's full width (omp's `selectedBg`), an unselected row
+        // stays on the page background, the separator rule is a full
+        // row of border-colored dashes, and the new-server row carries
+        // the accent color.
+        let first = 2;
+        let last = 2 + 18 - 1;
+        assert_eq!(buffer.cell((first, 1)).unwrap().bg, theme().hover_bg);
+        assert_eq!(buffer.cell((last, 1)).unwrap().bg, theme().hover_bg);
         assert_ne!(
-            buffer.cell((last, 6)).unwrap().bg,
-            theme().accent_dim,
+            buffer.cell((last, 2)).unwrap().bg,
+            theme().hover_bg,
             "beta row must not carry the band"
         );
+        for x in first..=last {
+            assert_eq!(buffer.cell((x, 3)).unwrap().symbol(), "─");
+            assert_eq!(buffer.cell((x, 3)).unwrap().fg, theme().separator);
+        }
+        assert!(buffer_line(&buffer, 4).contains("new server"));
+        let new_x = 4; // the label starts after the cursor lane
+        assert_eq!(buffer.cell((new_x, 4)).unwrap().fg, theme().accent);
 
-        // The "＋ new server" pseudo-row gets the same full-width band
-        // while the cursor sits on it.
+        // The band follows the cursor onto the new-server row.
         app.dialog.as_mut().unwrap().list_cursor = 2;
         let buffer = render_sized(&app, "", 80, 24);
-        assert_eq!(buffer.cell((first, 7)).unwrap().bg, theme().accent_dim);
-        assert_eq!(buffer.cell((last, 7)).unwrap().bg, theme().accent_dim);
+        assert_eq!(buffer.cell((first, 4)).unwrap().bg, theme().hover_bg);
+        assert_eq!(buffer.cell((last, 4)).unwrap().bg, theme().hover_bg);
+    }
+
+    #[test]
+    fn the_hub_body_paints_its_page_track_field_prefix_and_toggle() {
+        // Arrange: the form focused on alpha's connection page (alpha
+        // connects in cleartext, so the TLS toggle shows "off").
+        let mut app = App::new(80, 24);
+        app.open_config_dialog(&two_server_config());
+        let dialog = app.dialog.as_mut().unwrap();
+        dialog.pane = crate::tui::dialog::Pane::Form;
+        dialog.fields[crate::tui::dialog::F_TLS].flag = false;
+
+        // Act
+        let buffer = render_sized(&app, "", 80, 24);
+
+        // Assert: the page track reads ` Page: connection · identity ·
+        // channels` with the active page accented and the others dim —
+        // omp's ` Kind:` tab-track idiom.
+        let track = buffer_line(&buffer, 1);
+        let active = track.find("connection").unwrap();
+        let idle = track.find("identity").unwrap();
+        assert_eq!(buffer.cell((active as u16, 1)).unwrap().fg, theme().accent);
+        assert_eq!(buffer.cell((idle as u16, 1)).unwrap().fg, theme().dim);
+
+        // Field rows: the focused field carries the accent `❯ ` prefix,
+        // the others two spaces; the 16-column label column keeps the
+        // values aligned, and the toggle reads on/off in place of text.
+        assert_eq!(buffer.cell((23, 3)).unwrap().symbol(), "❯");
+        assert_eq!(buffer.cell((23, 3)).unwrap().fg, theme().accent);
+        assert_eq!(buffer.cell((23, 4)).unwrap().symbol(), " ");
+        assert_eq!(buffer.cell((24, 4)).unwrap().symbol(), " ");
+        assert_eq!(buffer.cell((41, 3)).unwrap().symbol(), "a"); // "alpha"
+        assert_eq!(buffer.cell((41, 4)).unwrap().symbol(), "i"); // "irc.alpha.org"
+        let tls_row = buffer_line(&buffer, 6);
+        assert!(tls_row.contains(crate::i18n::t("dlg.off")), "{tls_row}");
     }
 
     #[test]
