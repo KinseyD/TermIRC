@@ -1125,6 +1125,12 @@ const DIALOG_LABEL_WIDTH: usize = 16;
 /// Width of the wizard's left server-list pane, before the separator.
 const DIALOG_LIST_WIDTH: u16 = 26;
 
+/// Minimum width kept for the wizard's right form pane: the footer row
+/// (` Save Enter · Cancel Esc · <page hint>`) needs this many columns in
+/// the widest locale, so on narrow terminals the list pane yields
+/// columns before the footer starts clipping.
+const DIALOG_FORM_MIN_WIDTH: u16 = 42;
+
 /// Render the modal setup wizard, centered over the whole screen: a
 /// wide panel with the server list on the left, the selected entry's
 /// paged detail form on the right, and the Save/Cancel actions in the
@@ -1208,7 +1214,7 @@ pub fn render_config_dialog(
     if body.width < 30 || body.height < 10 {
         return;
     }
-    let list_width = DIALOG_LIST_WIDTH.min(body.width - 8);
+    let list_width = DIALOG_LIST_WIDTH.min(body.width.saturating_sub(DIALOG_FORM_MIN_WIDTH + 1));
     // Vertical rule between the panes, in the same separator color as
     // the border.
     for y in body.y..body.y + body.height {
