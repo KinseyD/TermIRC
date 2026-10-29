@@ -1293,6 +1293,28 @@ fn render_dialog_list(
         Span::styled(format!("＋ {}", i18n::t("dlg.new_server")), style),
     ]));
     frame.render_widget(Paragraph::new(rows), area);
+    // The selected row's band spans the pane's full width — the same
+    // idiom as the sidebar's row rect — so the highlight does not stop
+    // mid-row where the name ends.
+    if focused {
+        let row = if dialog.on_new_row() {
+            dialog.entries.len()
+        } else {
+            dialog.list_cursor
+        };
+        let y = area.y + 1 + row as u16;
+        if y < area.y + area.height {
+            frame.buffer_mut().set_style(
+                Rect {
+                    x: area.x,
+                    y,
+                    width: area.width,
+                    height: 1,
+                },
+                Style::new().bg(theme.accent_dim),
+            );
+        }
+    }
 }
 
 /// The wizard's right pane: the page tabs, the current page's fields,
@@ -1735,6 +1757,38 @@ channels = ["#three"]
             "{}",
             buffer_line(&buffer, 6)
         );
+    }
+
+    #[test]
+    fn the_wizard_selection_band_spans_the_full_list_row() {
+        // Arrange: 80x24 puts the panel at x=2 with a 26-column list
+        // pane starting at column 3; the header sits at y=4, alpha at
+        // y=5, beta at y=6, the pseudo-row at y=7.
+        let mut app = App::new(80, 24);
+        app.open_config_dialog(&two_server_config());
+
+        // Act
+        let buffer = render_sized(&app, "", 80, 24);
+
+        // Assert: the selected row's background covers its first and
+        // last interior column, like the sidebar's row band — and an
+        // unselected row stays on the panel background at its edge.
+        let first = 3; // list pane's first column
+        let last = 3 + 26 - 1; // list pane's last column, before the rule
+        assert_eq!(buffer.cell((first, 5)).unwrap().bg, theme().accent_dim);
+        assert_eq!(buffer.cell((last, 5)).unwrap().bg, theme().accent_dim);
+        assert_ne!(
+            buffer.cell((last, 6)).unwrap().bg,
+            theme().accent_dim,
+            "beta row must not carry the band"
+        );
+
+        // The "＋ new server" pseudo-row gets the same full-width band
+        // while the cursor sits on it.
+        app.dialog.as_mut().unwrap().list_cursor = 2;
+        let buffer = render_sized(&app, "", 80, 24);
+        assert_eq!(buffer.cell((first, 7)).unwrap().bg, theme().accent_dim);
+        assert_eq!(buffer.cell((last, 7)).unwrap().bg, theme().accent_dim);
     }
 
     #[test]
