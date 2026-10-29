@@ -26,12 +26,13 @@ channels = ["#a"]
     // Act
     app.open_config_dialog(&config);
 
-    // Assert: the form carries the first server's values and the view
+    // Assert: the form previews the first server's values and the view
     // behind it is untouched, so closing restores the same buffer.
     let dialog = app.dialog.as_ref().unwrap();
-    assert_eq!(dialog.fields[1].text.text(), "irc.example.org");
-    assert_eq!(dialog.fields[2].text.text(), "7000");
-    assert_eq!(dialog.fields[3].text.text(), "mynick");
+    assert_eq!(dialog.selected.as_deref(), Some("srv"));
+    assert_eq!(dialog.field_text("dlg.field_host"), "irc.example.org");
+    assert_eq!(dialog.field_text("dlg.field_port"), "7000");
+    assert_eq!(dialog.field_text("dlg.field_nickname"), "mynick");
     assert_eq!(app.active_buffer().unwrap().kind.channel(), Some("#a"));
     app.close_dialog();
     assert!(app.dialog.is_none());
@@ -48,10 +49,15 @@ fn an_open_config_empty_starts_the_wizard_on_defaults() {
 
     // Assert: sensible defaults so Save only needs host and nickname.
     let dialog = app.dialog.as_ref().unwrap();
-    assert_eq!(dialog.fields[0].text.text(), "libera");
-    assert_eq!(dialog.fields[2].text.text(), "6697");
-    assert!(dialog.fields[5].flag, "TLS is on by default");
-    assert!(dialog.editing.is_none());
+    assert_eq!(dialog.selected, None);
+    assert_eq!(dialog.field_text("dlg.field_label"), "libera");
+    assert_eq!(dialog.field_text("dlg.field_port"), "6697");
+    let tls = dialog
+        .fields
+        .iter()
+        .find(|field| field.label_key == "dlg.field_tls")
+        .unwrap();
+    assert!(tls.flag, "TLS is on by default");
 }
 
 #[test]

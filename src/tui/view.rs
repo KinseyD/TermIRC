@@ -195,9 +195,11 @@ impl App {
         }
     }
 
-    /// Open the configuration wizard prefilled from the config's first
-    /// server. `App` deliberately does not hold the configuration, so
-    /// the event loop passes it in (from `tui::events::run`).
+    /// Open the configuration wizard over the config's servers: the
+    /// left pane lists them (plus a "new server" row), the right pane
+    /// edits the selection page by page. `App` deliberately does not
+    /// hold the configuration, so the event loop passes it in (from
+    /// `tui::events::run`).
     pub fn open_config_dialog(&mut self, config: &crate::config::Config) {
         self.dialog = Some(super::dialog::ConfigDialog::from_config(config));
     }

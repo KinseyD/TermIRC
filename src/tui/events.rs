@@ -274,14 +274,10 @@ fn save_dialog(app: &mut App, ctx: &mut KeyContext<'_>) {
             return;
         }
     };
-    // The form does not model `password`, `queries`, or `proxy`, while
-    // the config writer preserves them from the existing section. Carry
-    // the previous entry's values across before spawning so the worker
-    // started below sees the same credentials and startup targets the
-    // file keeps, instead of silently dropping them.
+    // The form owns every key its pages show — password and queries
+    // included — so only `proxy`, which no wizard page models, is
+    // carried across from the existing entry before the worker spawns.
     if let Some(previous) = ctx.config.servers.get(&name) {
-        server.password = previous.password.clone();
-        server.queries = previous.queries.clone();
         server.proxy = previous.proxy.clone();
     }
     if let Err(error) = config::save_server(ctx.config_path, &name, &server) {
@@ -661,11 +657,12 @@ mod tests {
         app.restore_input("draft text".into());
         app.open_config_dialog(&crate::config::Config::default());
 
-        // Act: typing lands in the focused dialog field, not the composer.
+        // Act: typing lands in the focused dialog field (an empty config
+        // opens the form directly), not the composer.
         press(&mut app, KeyCode::Char('x'));
         assert_eq!(app.input(), "draft text");
         assert_eq!(
-            app.dialog.as_ref().unwrap().fields[0].text.text(),
+            app.dialog.as_ref().unwrap().field_text("dlg.field_label"),
             "liberax"
         );
 
@@ -723,11 +720,11 @@ mod tests {
         app.open_config_dialog(&crate::config::Config::default());
         {
             let dialog = app.dialog.as_mut().unwrap();
-            dialog.fields[1].text.restore("127.0.0.1".into(), 9);
-            dialog.fields[2].text.restore("1".into(), 1);
-            dialog.fields[3].text.restore("tester".into(), 6);
-            dialog.fields[6].text.restore("#a".into(), 2);
-            dialog.cursor = crate::tui::dialog::SAVE_ROW;
+            dialog.set_field_text("dlg.field_host", "127.0.0.1");
+            dialog.set_field_text("dlg.field_port", "1");
+            dialog.set_field_text("dlg.field_nickname", "tester");
+            dialog.set_field_text("dlg.field_channels", "#a");
+            dialog.pane = crate::tui::dialog::Pane::Actions;
         }
         let mut config = crate::config::Config::default();
         let mut outgoing = std::collections::HashMap::new();
@@ -764,10 +761,10 @@ mod tests {
     }
 
     #[test]
-    fn saving_an_edited_server_keeps_the_unmodeled_keys_and_replaces_its_worker() {
-        // Arrange: a config file whose entry carries keys the form does
-        // not model (password, queries, proxy), a live worker handle for
-        // it, and a viewed channel.
+    fn saving_an_edited_server_takes_password_and_queries_from_the_form_and_keeps_proxy() {
+        // Arrange: a config file whose entry carries keys some wizard
+        // pages model (password, queries) and one no page models
+        // (proxy), a live worker handle for it, and a viewed channel.
         let path =
             std::env::temp_dir().join(format!("termirc-wizard-edit-{}.toml", std::process::id()));
         let _ = std::fs::remove_file(&path);
@@ -785,10 +782,14 @@ mod tests {
         app.open_config_dialog(&config);
         {
             let dialog = app.dialog.as_mut().unwrap();
-            // Point the edited entry at a port that refuses immediately.
-            dialog.fields[1].text.restore("127.0.0.1".into(), 9);
-            dialog.fields[2].text.restore("1".into(), 1);
-            dialog.cursor = crate::tui::dialog::SAVE_ROW;
+            // The form owns password and queries: clear the password and
+            // retarget the queries from inside the form, and point the
+            // edited entry at a port that refuses immediately.
+            dialog.set_field_text("dlg.field_host", "127.0.0.1");
+            dialog.set_field_text("dlg.field_port", "1");
+            dialog.set_field_text("dlg.field_password", "");
+            dialog.set_field_text("dlg.field_queries", "bob");
+            dialog.pane = crate::tui::dialog::Pane::Actions;
         }
         // A handle standing in for the worker started at boot. Keeping a
         // clone of its outgoing sender lets the test tell the channels
@@ -837,20 +838,21 @@ mod tests {
         // the console.
         assert_eq!(app.active_buffer().unwrap().id, channel);
 
-        // File and memory agree: the new connection details plus the keys
-        // the form does not model.
+        // Memory agrees with the form: the new connection details, the
+        // form's password and queries, and the proxy carried over from
+        // the entry the wizard does not model.
+        let memory = &config.servers["libera"];
+        assert_eq!(memory.server, "127.0.0.1");
+        assert_eq!(memory.port, 1);
+        assert_eq!(memory.password, "");
+        assert_eq!(memory.queries, vec!["bob".to_string()]);
+        assert_eq!(memory.proxy.as_ref().map(|proxy| proxy.port), Some(9050));
+        // The file gains the new connection details and keeps the proxy.
         let saved = crate::config::Config::load(&path).unwrap();
         let entry = &saved.servers["libera"];
         assert_eq!(entry.server, "127.0.0.1");
         assert_eq!(entry.port, 1);
-        assert_eq!(entry.password, "keepme");
-        assert_eq!(entry.queries, vec!["alice".to_string()]);
         assert_eq!(entry.proxy.as_ref().map(|proxy| proxy.port), Some(9050));
-        let memory = &config.servers["libera"];
-        assert_eq!(memory.server, "127.0.0.1");
-        assert_eq!(memory.password, "keepme");
-        assert_eq!(memory.queries, vec!["alice".to_string()]);
-        assert_eq!(memory.proxy.as_ref().map(|proxy| proxy.port), Some(9050));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -861,8 +863,8 @@ mod tests {
         app.open_config_dialog(&crate::config::Config::default());
         {
             let dialog = app.dialog.as_mut().unwrap();
-            dialog.fields[1].text.restore(String::new(), 0);
-            dialog.cursor = crate::tui::dialog::SAVE_ROW;
+            dialog.set_field_text("dlg.field_host", "");
+            dialog.pane = crate::tui::dialog::Pane::Actions;
         }
         let path = std::env::temp_dir().join("termirc-wizard-invalid.toml");
         let _ = std::fs::remove_file(&path);

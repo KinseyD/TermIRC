@@ -1,23 +1,119 @@
-//! The in-TUI server configuration wizard: a modal form opened on first
-//! run (no `config.toml` yet, or one without servers) and by `/config`.
+//! The in-TUI server configuration wizard: a modal opened on first run
+//! (no `config.toml` yet, or one without servers) and by `/config`.
 //!
-//! The dialog owns only form state — plain `Draft` fields plus a cursor —
-//! and stays free of terminal I/O: `key` maps a crossterm key code to a
-//! state change, the renderer reads the fields, and `collect` turns them
-//! into a `ServerConfig` (validating with the same rules `Config::parse`
-//! enforces). Saving is orchestrated by `tui::events`, which knows the
-//! config path and the connection map.
+//! The wizard is a two-pane master-detail form: the left pane lists every
+//! configured server plus a "new server" pseudo-row, the right pane edits
+//! the selection across three sequential pages (connection, identity,
+//! channels). The dialog owns only form state and stays free of terminal
+//! I/O: `key` maps a crossterm key code to a state change, the renderer
+//! reads the fields, and `collect` turns them into a `ServerConfig`
+//! (validating with the same rules `Config::parse` enforces). Saving is
+//! orchestrated by `tui::events`, which knows the config path and the
+//! connection map.
 
 use crate::config::{Config, ServerConfig};
 use crate::core::Draft;
 use ratatui::crossterm::event::KeyCode;
 
-/// Index of the pseudo-row below the last field: the Save action.
-pub const SAVE_ROW: usize = 9;
+/// Which pane of the two-column wizard holds the keyboard focus. Tab
+/// cycles List → Form → Actions → List; BackTab unwinds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pane {
+    /// The left server list.
+    List,
+    /// The right, paged detail form.
+    Form,
+    /// The footer's Save/Cancel actions.
+    Actions,
+}
+
+/// One of the three sequential pages of the detail form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Page {
+    /// Label, host, port, TLS.
+    Connection,
+    /// Nickname, username, server password, SASL pair.
+    Identity,
+    /// Pre-join channels and query nicknames.
+    Channels,
+}
+
+impl Page {
+    /// All pages in display order, for the tab row.
+    pub const ALL: [Page; 3] = [Page::Connection, Page::Identity, Page::Channels];
+
+    /// The slice of `fields` this page shows.
+    pub fn fields(self) -> std::ops::Range<usize> {
+        match self {
+            Page::Connection => F_LABEL..F_NICKNAME,
+            Page::Identity => F_NICKNAME..F_CHANNELS,
+            Page::Channels => F_CHANNELS..F_QUERIES + 1,
+        }
+    }
+
+    /// The i18n key of the page's name in the tab row.
+    pub fn tab_key(self) -> &'static str {
+        match self {
+            Page::Connection => "dlg.page_connection",
+            Page::Identity => "dlg.page_identity",
+            Page::Channels => "dlg.page_channels",
+        }
+    }
+
+    /// The i18n key of the dim helper row shown under the fields.
+    pub fn help_key(self) -> &'static str {
+        match self {
+            Page::Connection => "dlg.help_connection",
+            Page::Identity => "dlg.help_identity",
+            Page::Channels => "dlg.help_channels",
+        }
+    }
+
+    fn next(self) -> Option<Page> {
+        match self {
+            Page::Connection => Some(Page::Identity),
+            Page::Identity => Some(Page::Channels),
+            Page::Channels => None,
+        }
+    }
+
+    fn prev(self) -> Option<Page> {
+        match self {
+            Page::Connection => None,
+            Page::Identity => Some(Page::Connection),
+            Page::Channels => Some(Page::Identity),
+        }
+    }
+}
+
+// Field indices inside `fields`, in display order across the pages. The
+// per-page slices are expressed through these so the layout has one home.
+/// Page::Connection: the sidebar label of the entry.
+pub const F_LABEL: usize = 0;
+/// Page::Connection: the IRC server host.
+pub const F_HOST: usize = 1;
+/// Page::Connection: the TCP port.
+pub const F_PORT: usize = 2;
+/// Page::Connection: the TLS toggle.
+pub const F_TLS: usize = 3;
+/// Page::Identity: the nickname.
+pub const F_NICKNAME: usize = 4;
+/// Page::Identity: the username (blank defaults to the nickname).
+pub const F_USERNAME: usize = 5;
+/// Page::Identity: the server (PASS) password.
+pub const F_PASSWORD: usize = 6;
+/// Page::Identity: the SASL username, paired with the SASL password.
+pub const F_SASL_USER: usize = 7;
+/// Page::Identity: the SASL password.
+pub const F_SASL_PASS: usize = 8;
+/// Page::Channels: comma-separated channels to join at startup.
+pub const F_CHANNELS: usize = 9;
+/// Page::Channels: comma-separated nicknames to query at startup.
+pub const F_QUERIES: usize = 10;
 
 /// How each field edits: typed text or a boolean toggled in place.
-/// Port and channel syntax are ordinary text here; [`ConfigDialog::collect`]
-/// validates them.
+/// Port, channel and query syntax are ordinary text here;
+/// [`ConfigDialog::collect`] validates them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldKind {
     /// Free single-line text.
@@ -48,21 +144,80 @@ impl Field {
             flag: false,
         }
     }
+
+    fn toggle(label_key: &'static str, flag: bool) -> Self {
+        Self {
+            label_key,
+            kind: FieldKind::Toggle,
+            text: Draft::default(),
+            flag,
+        }
+    }
 }
 
-/// The modal configuration form plus its cursor and validation error.
+/// A blank form with sane defaults for a first connection.
+fn default_fields() -> Vec<Field> {
+    vec![
+        Field::text("dlg.field_label", "libera"),
+        Field::text("dlg.field_host", ""),
+        Field::text("dlg.field_port", "6697"),
+        Field::toggle("dlg.field_tls", true),
+        Field::text("dlg.field_nickname", ""),
+        Field::text("dlg.field_username", ""),
+        Field::text("dlg.field_password", ""),
+        Field::text("dlg.field_sasl_user", ""),
+        Field::text("dlg.field_sasl_pass", ""),
+        Field::text("dlg.field_channels", ""),
+        Field::text("dlg.field_queries", ""),
+    ]
+}
+
+/// The form prefilled from one configured entry, every page included.
+fn fields_from(name: &str, server: &ServerConfig) -> Vec<Field> {
+    vec![
+        Field::text("dlg.field_label", name),
+        Field::text("dlg.field_host", &server.server),
+        Field::text("dlg.field_port", &server.port.to_string()),
+        Field::toggle("dlg.field_tls", server.use_tls),
+        Field::text("dlg.field_nickname", &server.nickname),
+        Field::text("dlg.field_username", &server.username),
+        Field::text("dlg.field_password", &server.password),
+        Field::text(
+            "dlg.field_sasl_user",
+            server.sasl_username.as_deref().unwrap_or_default(),
+        ),
+        Field::text(
+            "dlg.field_sasl_pass",
+            server.sasl_password.as_deref().unwrap_or_default(),
+        ),
+        Field::text("dlg.field_channels", &server.channels.join(", ")),
+        Field::text("dlg.field_queries", &server.queries.join(", ")),
+    ]
+}
+
+/// The modal wizard: the server list, the paged form for the selection,
+/// and the validation error of the last failed save.
 #[derive(Debug, Clone)]
 pub struct ConfigDialog {
-    /// Rows in display order; `SAVE_ROW` indexes the Save action.
+    /// Every configured entry in file order, snapshotted at open time:
+    /// the dialog is modal, so the config cannot change underneath it.
+    pub entries: Vec<(String, ServerConfig)>,
+    /// The selected list row; `entries.len()` is the "new server" row.
+    pub list_cursor: usize,
+    /// The focused pane.
+    pub pane: Pane,
+    /// The form page shown (and edited) on the right.
+    pub page: Page,
+    /// All fields of all pages, laid out by the `F_*` constants.
     pub fields: Vec<Field>,
-    /// The focused row: `0..fields.len()` is a field, `SAVE_ROW` is Save.
+    /// The focused field, always inside `page.fields()`.
     pub cursor: usize,
     /// The i18n key of the failed `collect` validation, if any.
     pub error: Option<&'static str>,
-    /// The configured server label this dialog was opened on, when any:
-    /// a saved dialog with a different label adds a new entry and keeps
+    /// The configured server label the form is editing, when any: a
+    /// saved dialog with a different label adds a new entry and keeps
     /// the old one untouched.
-    pub editing: Option<String>,
+    pub selected: Option<String>,
 }
 
 /// What one routed key press did to the dialog.
@@ -77,55 +232,82 @@ pub enum DialogOutcome {
 }
 
 impl ConfigDialog {
-    /// A blank form with sane defaults for a first connection.
+    /// A wizard over no servers: a blank new entry, focus in the form.
     pub fn new() -> Self {
         Self {
-            fields: vec![
-                Field::text("dlg.field_label", "libera"),
-                Field::text("dlg.field_host", ""),
-                Field::text("dlg.field_port", "6697"),
-                Field::text("dlg.field_nickname", ""),
-                Field::text("dlg.field_username", ""),
-                Field {
-                    label_key: "dlg.field_tls",
-                    kind: FieldKind::Toggle,
-                    text: Draft::default(),
-                    flag: true,
-                },
-                Field::text("dlg.field_channels", ""),
-                Field::text("dlg.field_sasl_user", ""),
-                Field::text("dlg.field_sasl_pass", ""),
-            ],
-            cursor: 0,
+            entries: Vec::new(),
+            list_cursor: 0,
+            pane: Pane::Form,
+            page: Page::Connection,
+            fields: default_fields(),
+            cursor: F_LABEL,
             error: None,
-            editing: None,
+            selected: None,
         }
     }
-    /// A form prefilled from the config's first server (the wizard edits
-    /// one entry at a time; multi-server management is out of scope).
-    /// Keys the form does not model — password, queries, proxy — are
-    /// preserved verbatim on save by the config writer.
+
+    /// A wizard over the config's servers, in file order. With at least
+    /// one entry the list is focused on the first (its form prefilled as
+    /// a preview); a serverless config lands directly in a blank form.
     pub fn from_config(config: &Config) -> Self {
         let mut dialog = Self::new();
-        if let Some((name, server)) = config.first_server() {
-            dialog.editing = Some(name.to_string());
-            dialog.fields[0] = Field::text("dlg.field_label", name);
-            dialog.fields[1] = Field::text("dlg.field_host", &server.server);
-            dialog.fields[2] = Field::text("dlg.field_port", &server.port.to_string());
-            dialog.fields[3] = Field::text("dlg.field_nickname", &server.nickname);
-            dialog.fields[4] = Field::text("dlg.field_username", &server.username);
-            dialog.fields[5].flag = server.use_tls;
-            let channels = server.channels.join(", ");
-            dialog.fields[6] = Field::text("dlg.field_channels", &channels);
-            let sasl_user = server.sasl_username.clone().unwrap_or_default();
-            dialog.fields[7] = Field::text("dlg.field_sasl_user", &sasl_user);
-            let sasl_pass = server.sasl_password.clone().unwrap_or_default();
-            dialog.fields[8] = Field::text("dlg.field_sasl_pass", &sasl_pass);
+        dialog.entries = config
+            .servers
+            .iter()
+            .map(|(name, server)| (name.clone(), server.clone()))
+            .collect();
+        if dialog.entries.is_empty() {
+            return dialog;
         }
+        dialog.pane = Pane::List;
+        dialog.load_selection();
         dialog
     }
-    fn field(&mut self) -> Option<&mut Field> {
-        self.fields.get_mut(self.cursor)
+
+    /// Whether the list cursor sits on the "new server" pseudo-row.
+    pub fn on_new_row(&self) -> bool {
+        self.list_cursor >= self.entries.len()
+    }
+
+    /// Replace the form with the entry under the list cursor: an
+    /// existing entry prefills every page, the pseudo-row starts from
+    /// defaults. The preview restarts from the first page.
+    fn load_selection(&mut self) {
+        match self.entries.get(self.list_cursor) {
+            Some((name, server)) => {
+                self.selected = Some(name.clone());
+                self.fields = fields_from(name, server);
+            }
+            None => {
+                self.selected = None;
+                self.fields = default_fields();
+            }
+        }
+        self.page = Page::Connection;
+        self.cursor = F_LABEL;
+        self.error = None;
+    }
+
+    /// The current text of the field with this label key (empty for
+    /// toggles and unknown keys).
+    pub fn field_text(&self, label_key: &str) -> &str {
+        self.fields
+            .iter()
+            .find(|field| field.label_key == label_key)
+            .map(|field| field.text.text())
+            .unwrap_or_default()
+    }
+
+    /// Replace the text of the field with this label key, placing its
+    /// cursor at the end.
+    pub fn set_field_text(&mut self, label_key: &str, value: &str) {
+        if let Some(field) = self
+            .fields
+            .iter_mut()
+            .find(|field| field.label_key == label_key)
+        {
+            field.text.restore(value.to_string(), value.chars().count());
+        }
     }
 
     /// Route one key press; the dialog consumes every key while open.
@@ -139,40 +321,82 @@ impl ConfigDialog {
                 DialogOutcome::Edited
             };
         }
+        if matches!(code, KeyCode::Esc) {
+            return DialogOutcome::Cancel;
+        }
+        match self.pane {
+            Pane::List => self.list_key(code),
+            Pane::Form => self.form_key(code),
+            Pane::Actions => self.actions_key(code),
+        }
+    }
+
+    /// Keys while the server list is focused. Typing never reaches the
+    /// form: only navigation, the new-entry shortcut, and pane cycling
+    /// are meaningful here.
+    fn list_key(&mut self, code: KeyCode) -> DialogOutcome {
         match code {
-            KeyCode::Esc => DialogOutcome::Cancel,
-            KeyCode::Tab | KeyCode::Down | KeyCode::Enter if self.cursor == SAVE_ROW => {
-                if matches!(code, KeyCode::Enter) {
-                    self.error = None;
-                    DialogOutcome::Save
-                } else {
-                    self.cursor = 0;
-                    DialogOutcome::Edited
-                }
+            KeyCode::Up => {
+                self.list_cursor = self.list_cursor.saturating_sub(1);
+                self.load_selection();
             }
-            KeyCode::Tab | KeyCode::Down => {
-                // Navigation keys always advance, even on the toggle.
-                self.cursor += 1;
-                DialogOutcome::Edited
+            KeyCode::Down if !self.on_new_row() => {
+                self.list_cursor += 1;
+                self.load_selection();
             }
+            // Enter edits the previewed entry; on the pseudo-row it
+            // starts a new one.
             KeyCode::Enter => {
-                // Enter on a toggle flips it; on other fields it steps
-                // down, matching common form behavior.
-                if let Some(field) = self.field() {
+                self.load_selection();
+                self.pane = Pane::Form;
+            }
+            // `n` jumps straight to a new entry from anywhere in the list.
+            KeyCode::Char('n') => {
+                self.list_cursor = self.entries.len();
+                self.load_selection();
+                self.pane = Pane::Form;
+            }
+            KeyCode::Tab => self.pane = Pane::Form,
+            KeyCode::BackTab => self.pane = Pane::Actions,
+            KeyCode::PageUp | KeyCode::PageDown => self.turn_page(code == KeyCode::PageDown),
+            _ => {}
+        }
+        DialogOutcome::Edited
+    }
+
+    /// Keys while the paged form is focused: field navigation and
+    /// editing, page turns at the edges.
+    fn form_key(&mut self, code: KeyCode) -> DialogOutcome {
+        let range = self.page.fields();
+        match code {
+            KeyCode::Tab => self.tab_forward(),
+            KeyCode::BackTab => self.tab_backward(),
+            // Up/Down stay within the current page: pages are turned
+            // explicitly (Tab at the edge, PageUp/PageDown).
+            KeyCode::Up => self.cursor = self.cursor.saturating_sub(1).max(range.start),
+            KeyCode::Down => self.cursor = (self.cursor + 1).min(range.end - 1),
+            KeyCode::PageUp | KeyCode::PageDown => self.turn_page(code == KeyCode::PageDown),
+            KeyCode::Enter => {
+                if let Some(field) = self.fields.get_mut(self.cursor) {
                     if field.kind == FieldKind::Toggle {
                         field.flag = !field.flag;
                     } else {
-                        self.cursor += 1;
+                        // Enter advances; off the last field of a page it
+                        // flows on, reaching the actions after the last
+                        // page so Save is one key away.
+                        match self.page.next() {
+                            Some(next) if self.cursor + 1 >= range.end => {
+                                self.page = next;
+                                self.cursor = next.fields().start;
+                            }
+                            _ if self.cursor + 1 < range.end => self.cursor += 1,
+                            _ => self.pane = Pane::Actions,
+                        }
                     }
                 }
-                DialogOutcome::Edited
-            }
-            KeyCode::BackTab | KeyCode::Up => {
-                self.cursor = self.cursor.saturating_sub(1);
-                DialogOutcome::Edited
             }
             _ => {
-                if let Some(field) = self.field() {
+                if let Some(field) = self.fields.get_mut(self.cursor) {
                     match (field.kind, code) {
                         (FieldKind::Toggle, KeyCode::Char(' ')) => field.flag = !field.flag,
                         (FieldKind::Toggle, _) => {}
@@ -188,25 +412,95 @@ impl ConfigDialog {
                         (FieldKind::Text, _) => {}
                     }
                 }
+            }
+        }
+        DialogOutcome::Edited
+    }
+    /// Keys while the footer actions are focused.
+    fn actions_key(&mut self, code: KeyCode) -> DialogOutcome {
+        match code {
+            KeyCode::Enter => {
+                self.error = None;
+                DialogOutcome::Save
+            }
+            KeyCode::Tab => {
+                self.pane = Pane::List;
                 DialogOutcome::Edited
+            }
+            KeyCode::BackTab => {
+                self.pane = Pane::Form;
+                DialogOutcome::Edited
+            }
+            _ => DialogOutcome::Edited,
+        }
+    }
+
+    /// Turn one page, keeping the field's offset within its page
+    /// (clamped) so PgUp/PgDn feel like the same field position.
+    fn turn_page(&mut self, forward: bool) {
+        let target = if forward {
+            self.page.next()
+        } else {
+            self.page.prev()
+        };
+        let Some(target) = target else {
+            return;
+        };
+        let offset = self.cursor - self.page.fields().start;
+        let range = target.fields();
+        self.page = target;
+        self.cursor = range.start + offset.min(range.len() - 1);
+    }
+
+    /// Tab off the last field of a page turns the page; off the last
+    /// field of the last page it reaches the actions.
+    fn tab_forward(&mut self) {
+        let range = self.page.fields();
+        if self.cursor + 1 < range.end {
+            self.cursor += 1;
+        } else {
+            match self.page.next() {
+                Some(next) => {
+                    self.page = next;
+                    self.cursor = next.fields().start;
+                }
+                None => self.pane = Pane::Actions,
             }
         }
     }
 
-    /// Validate the form into `(label, ServerConfig)`, or the i18n key of
-    /// the first violated rule. The returned entry carries empty password
-    /// and queries: the config writer's merge preserves those keys from
-    /// an existing section instead of erasing them.
+    /// BackTab off the first field of a page returns to the previous
+    /// page's last field; off the first page it reaches the list.
+    fn tab_backward(&mut self) {
+        let range = self.page.fields();
+        if self.cursor > range.start {
+            self.cursor -= 1;
+        } else {
+            match self.page.prev() {
+                Some(prev) => {
+                    self.page = prev;
+                    self.cursor = prev.fields().end - 1;
+                }
+                None => self.pane = Pane::List,
+            }
+        }
+    }
+    /// Validate the form into `(label, ServerConfig)`, or the i18n key
+    /// of the first violated rule. Every page is checked; `proxy` is the
+    /// one key no page models, so it comes back `None` and the save path
+    /// carries an existing entry's value across.
     pub fn collect(&self) -> Result<(String, ServerConfig), &'static str> {
-        let label = self.fields[0].text.text().trim();
-        let host = self.fields[1].text.text().trim();
-        let port = self.fields[2].text.text().trim();
-        let nickname = self.fields[3].text.text().trim();
-        let username = self.fields[4].text.text().trim();
-        let use_tls = self.fields[5].flag;
-        let channels_field = self.fields[6].text.text();
-        let sasl_user = self.fields[7].text.text().trim();
-        let sasl_pass = self.fields[8].text.text();
+        let label = self.fields[F_LABEL].text.text().trim();
+        let host = self.fields[F_HOST].text.text().trim();
+        let port = self.fields[F_PORT].text.text().trim();
+        let nickname = self.fields[F_NICKNAME].text.text().trim();
+        let username = self.fields[F_USERNAME].text.text().trim();
+        let use_tls = self.fields[F_TLS].flag;
+        let password = self.fields[F_PASSWORD].text.text();
+        let sasl_user = self.fields[F_SASL_USER].text.text().trim();
+        let sasl_pass = self.fields[F_SASL_PASS].text.text();
+        let channels_field = self.fields[F_CHANNELS].text.text();
+        let queries_field = self.fields[F_QUERIES].text.text();
 
         if label.is_empty()
             || label
@@ -230,16 +524,25 @@ impl ConfigDialog {
         } else {
             username
         };
-        let channels: Vec<String> = channels_field
-            .split([',', ' '])
-            .filter(|name| !name.is_empty())
-            .map(str::to_string)
-            .collect();
+        let list = |text: &str| {
+            text.split([',', ' '])
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        let channels = list(channels_field);
         if !channels
             .iter()
             .all(|channel| crate::core::valid_channel_name(channel))
         {
             return Err("err.cfg_channels");
+        }
+        let queries = list(queries_field);
+        if !queries
+            .iter()
+            .all(|nickname| crate::core::valid_query_nickname(nickname))
+        {
+            return Err("err.cfg_queries");
         }
         // SASL is all-or-nothing, mirroring `Config::parse`.
         let (sasl_username, sasl_password) = match (sasl_user.is_empty(), sasl_pass.is_empty()) {
@@ -264,14 +567,14 @@ impl ConfigDialog {
             ServerConfig {
                 username: username.to_string(),
                 nickname: nickname.to_string(),
-                password: String::new(),
+                password: password.to_string(),
                 server: host.to_string(),
                 use_tls,
                 port,
                 channels,
                 sasl_username,
                 sasl_password,
-                queries: Vec::new(),
+                queries,
                 proxy: None,
             },
         ))
@@ -283,163 +586,385 @@ impl Default for ConfigDialog {
         Self::new()
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn filled_dialog() -> ConfigDialog {
+    /// Two configured servers, the first carrying every optional key.
+    fn two_servers() -> Config {
+        Config::parse(
+            r##"
+[servers.alpha]
+username = "me"
+nickname = "mynick"
+password = "alpha-pass"
+server = "irc.alpha.org"
+use_tls = false
+port = 6667
+channels = ["#one", "#two"]
+queries = ["alice"]
+sasl_username = "acct"
+sasl_password = "secret"
+
+[servers.beta]
+username = "you"
+nickname = "yournick"
+server = "irc.beta.org"
+port = 7000
+channels = ["#three"]
+"##,
+        )
+        .unwrap()
+    }
+
+    /// A valid form with only the connection and identity essentials.
+    fn filled() -> ConfigDialog {
         let mut dialog = ConfigDialog::new();
-        dialog.fields[0].text.restore("libera".into(), 6);
-        dialog.fields[1].text.restore("irc.libera.chat".into(), 15);
-        dialog.fields[3].text.restore("me".into(), 2);
-        dialog.fields[6].text.restore("#a, #b".into(), 6);
+        dialog.set_field_text("dlg.field_label", "libera");
+        dialog.set_field_text("dlg.field_host", "irc.libera.chat");
+        dialog.set_field_text("dlg.field_nickname", "me");
+        dialog.set_field_text("dlg.field_channels", "#a, #b");
         dialog
     }
 
     #[test]
-    fn collect_applies_defaults_and_validates_every_rule() {
-        for (index, text, expected) in [
-            (0, "", "dlg.err_label"),
-            (0, "a b", "dlg.err_label"),
-            (0, "a.b", "dlg.err_label"),
-            (0, "a\"b", "dlg.err_label"),
-            (1, "", "dlg.err_host"),
-            (2, "", "dlg.err_port"),
-            (2, "70000", "dlg.err_port"),
-            (2, "0", "dlg.err_port"),
-            (3, "", "dlg.err_nickname"),
-            (3, "two words", "dlg.err_nickname"),
-            (6, "chan", "err.cfg_channels"),
-            (6, "#a password", "err.cfg_channels"),
-            (7, "acc", "err.cfg_sasl_pair"),
-            (8, "secret", "err.cfg_sasl_pair"),
+    fn from_config_lists_every_server_and_prefills_the_first_into_all_pages() {
+        // Arrange / Act
+        let dialog = ConfigDialog::from_config(&two_servers());
+
+        // Assert: the list holds both entries in file order, the first is
+        // selected and focused, and the form carries its values across
+        // all three pages — password, queries and SASL included.
+        assert_eq!(dialog.pane, Pane::List);
+        assert_eq!(dialog.list_cursor, 0);
+        assert_eq!(dialog.selected.as_deref(), Some("alpha"));
+        assert_eq!(dialog.field_text("dlg.field_label"), "alpha");
+        assert_eq!(dialog.field_text("dlg.field_host"), "irc.alpha.org");
+        assert_eq!(dialog.field_text("dlg.field_port"), "6667");
+        assert!(!dialog.fields[F_TLS].flag);
+        assert_eq!(dialog.field_text("dlg.field_nickname"), "mynick");
+        assert_eq!(dialog.field_text("dlg.field_username"), "me");
+        assert_eq!(dialog.field_text("dlg.field_password"), "alpha-pass");
+        assert_eq!(dialog.field_text("dlg.field_sasl_user"), "acct");
+        assert_eq!(dialog.field_text("dlg.field_sasl_pass"), "secret");
+        assert_eq!(dialog.field_text("dlg.field_channels"), "#one, #two");
+        assert_eq!(dialog.field_text("dlg.field_queries"), "alice");
+    }
+
+    #[test]
+    fn from_config_without_servers_opens_a_blank_new_entry_in_the_form() {
+        // Arrange / Act
+        let dialog = ConfigDialog::from_config(&Config::default());
+
+        // Assert: there is nothing to pick from, so focus starts in the
+        // form on new-entry defaults and the pseudo-row is selected.
+        assert_eq!(dialog.pane, Pane::Form);
+        assert_eq!(dialog.selected, None);
+        assert!(dialog.on_new_row());
+        assert_eq!(dialog.field_text("dlg.field_label"), "libera");
+        assert_eq!(dialog.field_text("dlg.field_host"), "");
+        assert_eq!(dialog.field_text("dlg.field_port"), "6697");
+        assert!(dialog.fields[F_TLS].flag, "TLS is on by default");
+    }
+
+    #[test]
+    fn moving_the_list_selection_previews_the_entry_and_enter_focuses_the_form() {
+        // Arrange
+        let mut dialog = ConfigDialog::from_config(&two_servers());
+
+        // Act / Assert: moving the cursor swaps the previewed entry and
+        // restarts it from the first page.
+        dialog.key(KeyCode::Down, false);
+        assert_eq!(dialog.selected.as_deref(), Some("beta"));
+        assert_eq!(dialog.field_text("dlg.field_host"), "irc.beta.org");
+        assert_eq!(dialog.field_text("dlg.field_password"), "");
+        assert_eq!(dialog.page, Page::Connection);
+        // Enter commits the preview and moves focus into the form.
+        assert_eq!(dialog.key(KeyCode::Enter, false), DialogOutcome::Edited);
+        assert_eq!(dialog.pane, Pane::Form);
+        // Up clamps at the first row instead of wrapping.
+        dialog.pane = Pane::List;
+        dialog.key(KeyCode::Up, false);
+        assert_eq!(dialog.list_cursor, 0);
+        assert_eq!(dialog.selected.as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn the_new_server_row_and_the_n_key_start_a_blank_entry() {
+        // Arrange: two servers, so the pseudo-row is list row 2.
+        let mut dialog = ConfigDialog::from_config(&two_servers());
+
+        // Act / Assert: walking onto the pseudo-row previews defaults.
+        dialog.key(KeyCode::Down, false);
+        dialog.key(KeyCode::Down, false);
+        assert!(dialog.on_new_row());
+        assert_eq!(dialog.selected, None);
+        assert_eq!(dialog.field_text("dlg.field_label"), "libera");
+        assert_eq!(dialog.field_text("dlg.field_host"), "");
+        // Enter there focuses the form for the new entry.
+        dialog.key(KeyCode::Enter, false);
+        assert_eq!(dialog.pane, Pane::Form);
+
+        // `n` reaches the same state from anywhere in the list.
+        let mut dialog = ConfigDialog::from_config(&two_servers());
+        dialog.key(KeyCode::Char('n'), false);
+        assert_eq!(dialog.pane, Pane::Form);
+        assert!(dialog.on_new_row());
+        assert_eq!(dialog.selected, None);
+    }
+
+    #[test]
+    fn tab_walks_fields_pages_and_panes_in_one_cycle() {
+        // Arrange
+        let mut dialog = ConfigDialog::from_config(&two_servers());
+
+        // Act / Assert: List → Form, then through every field and page.
+        dialog.key(KeyCode::Tab, false);
+        assert_eq!((dialog.pane, dialog.cursor), (Pane::Form, F_LABEL));
+        dialog.key(KeyCode::Tab, false);
+        assert_eq!(dialog.cursor, F_HOST);
+        dialog.key(KeyCode::Tab, false);
+        assert_eq!(dialog.cursor, F_PORT);
+        dialog.key(KeyCode::Tab, false);
+        assert_eq!(dialog.cursor, F_TLS);
+        // Tab off the last field of a page turns the page.
+        dialog.key(KeyCode::Tab, false);
+        assert_eq!((dialog.page, dialog.cursor), (Page::Identity, F_NICKNAME));
+        for expected in [F_USERNAME, F_PASSWORD, F_SASL_USER, F_SASL_PASS] {
+            dialog.key(KeyCode::Tab, false);
+            assert_eq!(dialog.cursor, expected);
+        }
+        dialog.key(KeyCode::Tab, false);
+        assert_eq!((dialog.page, dialog.cursor), (Page::Channels, F_CHANNELS));
+        dialog.key(KeyCode::Tab, false);
+        assert_eq!(dialog.cursor, F_QUERIES);
+        // Tab off the very last field lands on the actions, then the
+        // cycle closes back to the list.
+        dialog.key(KeyCode::Tab, false);
+        assert_eq!(dialog.pane, Pane::Actions);
+        dialog.key(KeyCode::Tab, false);
+        assert_eq!(dialog.pane, Pane::List);
+
+        // BackTab unwinds the exact same path.
+        dialog.key(KeyCode::BackTab, false);
+        assert_eq!(dialog.pane, Pane::Actions);
+        dialog.key(KeyCode::BackTab, false);
+        assert_eq!((dialog.pane, dialog.cursor), (Pane::Form, F_QUERIES));
+        dialog.key(KeyCode::BackTab, false);
+        assert_eq!((dialog.page, dialog.cursor), (Page::Channels, F_CHANNELS));
+        dialog.key(KeyCode::BackTab, false);
+        assert_eq!((dialog.page, dialog.cursor), (Page::Identity, F_SASL_PASS));
+        for expected in [F_SASL_USER, F_PASSWORD, F_USERNAME, F_NICKNAME] {
+            dialog.key(KeyCode::BackTab, false);
+            assert_eq!(dialog.cursor, expected);
+        }
+        dialog.key(KeyCode::BackTab, false);
+        assert_eq!((dialog.page, dialog.cursor), (Page::Connection, F_TLS));
+        dialog.key(KeyCode::BackTab, false);
+        assert_eq!(dialog.cursor, F_PORT);
+        dialog.key(KeyCode::BackTab, false);
+        assert_eq!(dialog.cursor, F_HOST);
+        dialog.key(KeyCode::BackTab, false);
+        assert_eq!(dialog.cursor, F_LABEL);
+        dialog.key(KeyCode::BackTab, false);
+        assert_eq!(dialog.pane, Pane::List);
+    }
+
+    #[test]
+    fn page_up_and_down_turn_pages_directly_and_clamp() {
+        // Arrange: the form focused on the first page.
+        let mut dialog = ConfigDialog::from_config(&two_servers());
+        dialog.pane = Pane::Form;
+
+        // Act / Assert: pages turn without wrapping around the ends.
+        dialog.key(KeyCode::PageDown, false);
+        assert_eq!(dialog.page, Page::Identity);
+        dialog.key(KeyCode::PageDown, false);
+        assert_eq!(dialog.page, Page::Channels);
+        dialog.key(KeyCode::PageDown, false);
+        assert_eq!(dialog.page, Page::Channels, "no wrap past the last page");
+        dialog.key(KeyCode::PageUp, false);
+        assert_eq!(dialog.page, Page::Identity);
+        dialog.key(KeyCode::PageUp, false);
+        assert_eq!(dialog.page, Page::Connection);
+        dialog.key(KeyCode::PageUp, false);
+        assert_eq!(dialog.page, Page::Connection, "no wrap before the first");
+
+        // The field offset carries into the new page, clamped to it.
+        dialog.page = Page::Identity;
+        dialog.cursor = F_SASL_PASS; // offset 4 of a 5-field page
+        dialog.key(KeyCode::PageDown, false);
+        assert_eq!((dialog.page, dialog.cursor), (Page::Channels, F_QUERIES));
+        dialog.key(KeyCode::PageUp, false);
+        assert_eq!((dialog.page, dialog.cursor), (Page::Identity, F_USERNAME));
+    }
+
+    #[test]
+    fn up_and_down_move_within_the_current_page_only() {
+        // Arrange: the form focused on the first page.
+        let mut dialog = ConfigDialog::from_config(&two_servers());
+        dialog.pane = Pane::Form;
+
+        // Act / Assert
+        for _ in 0..3 {
+            dialog.key(KeyCode::Down, false);
+        }
+        assert_eq!(dialog.cursor, F_TLS);
+        dialog.key(KeyCode::Down, false);
+        assert_eq!(dialog.cursor, F_TLS, "Down clamps at the page's last field");
+        dialog.key(KeyCode::Up, false);
+        assert_eq!(dialog.cursor, F_PORT);
+        dialog.key(KeyCode::Up, false);
+        dialog.key(KeyCode::Up, false);
+        dialog.key(KeyCode::Up, false);
+        assert_eq!(
+            dialog.cursor, F_LABEL,
+            "Up clamps at the page's first field"
+        );
+    }
+
+    #[test]
+    fn enter_flips_a_toggle_advances_a_field_and_reaches_the_actions() {
+        // Arrange
+        let mut dialog = ConfigDialog::from_config(&two_servers());
+        dialog.pane = Pane::Form;
+
+        // Act / Assert: Enter steps down a text field...
+        dialog.cursor = F_HOST;
+        dialog.key(KeyCode::Enter, false);
+        assert_eq!(dialog.cursor, F_PORT);
+        // ...flips a toggle in place...
+        dialog.cursor = F_TLS;
+        let before = dialog.fields[F_TLS].flag;
+        dialog.key(KeyCode::Enter, false);
+        assert_eq!(dialog.fields[F_TLS].flag, !before);
+        assert_eq!(dialog.cursor, F_TLS);
+        // ...and Space toggles too.
+        dialog.key(KeyCode::Char(' '), false);
+        assert_eq!(dialog.fields[F_TLS].flag, before);
+        // Enter off the last field of the last page reaches the actions.
+        dialog.page = Page::Channels;
+        dialog.cursor = F_QUERIES;
+        dialog.key(KeyCode::Enter, false);
+        assert_eq!(dialog.pane, Pane::Actions);
+    }
+
+    #[test]
+    fn typing_while_the_list_is_focused_never_leaks_into_the_form() {
+        // Arrange
+        let mut dialog = ConfigDialog::from_config(&two_servers());
+
+        // Act / Assert: ordinary typing is swallowed by the list.
+        dialog.key(KeyCode::Char('x'), false);
+        dialog.key(KeyCode::Backspace, false);
+        assert_eq!(dialog.field_text("dlg.field_label"), "alpha");
+        assert_eq!(dialog.pane, Pane::List);
+        // `n` is the list's own shortcut for a new entry.
+        dialog.key(KeyCode::Char('n'), false);
+        assert_eq!(dialog.pane, Pane::Form);
+        assert_eq!(dialog.selected, None);
+    }
+
+    #[test]
+    fn the_actions_row_saves_and_esc_or_ctrl_c_cancel_from_any_pane() {
+        // Arrange
+        let mut dialog = ConfigDialog::from_config(&two_servers());
+
+        // Act / Assert
+        dialog.pane = Pane::Actions;
+        assert_eq!(dialog.key(KeyCode::Enter, false), DialogOutcome::Save);
+        assert_eq!(dialog.key(KeyCode::Esc, false), DialogOutcome::Cancel);
+        assert_eq!(dialog.key(KeyCode::Char('c'), true), DialogOutcome::Cancel);
+        assert_eq!(dialog.key(KeyCode::Char('x'), true), DialogOutcome::Edited);
+        dialog.pane = Pane::List;
+        assert_eq!(dialog.key(KeyCode::Esc, false), DialogOutcome::Cancel);
+        dialog.pane = Pane::Form;
+        assert_eq!(dialog.key(KeyCode::Char('c'), true), DialogOutcome::Cancel);
+    }
+
+    #[test]
+    fn collect_validates_every_rule_across_the_pages() {
+        for (key, text, expected) in [
+            ("dlg.field_label", "", "dlg.err_label"),
+            ("dlg.field_label", "a b", "dlg.err_label"),
+            ("dlg.field_label", "a.b", "dlg.err_label"),
+            ("dlg.field_label", "a\"b", "dlg.err_label"),
+            ("dlg.field_host", "", "dlg.err_host"),
+            ("dlg.field_port", "", "dlg.err_port"),
+            ("dlg.field_port", "70000", "dlg.err_port"),
+            ("dlg.field_port", "0", "dlg.err_port"),
+            ("dlg.field_nickname", "", "dlg.err_nickname"),
+            ("dlg.field_nickname", "two words", "dlg.err_nickname"),
+            ("dlg.field_channels", "chan", "err.cfg_channels"),
+            ("dlg.field_channels", "#a password", "err.cfg_channels"),
+            ("dlg.field_queries", "#a", "err.cfg_queries"),
+            ("dlg.field_sasl_user", "acc", "err.cfg_sasl_pair"),
+            ("dlg.field_sasl_pass", "secret", "err.cfg_sasl_pair"),
         ] {
-            let mut dialog = filled_dialog();
-            dialog.fields[index]
-                .text
-                .restore(text.to_string(), text.chars().count());
-            assert_eq!(
-                dialog.collect().unwrap_err(),
-                expected,
-                "field {index} = {text:?}"
-            );
+            let mut dialog = filled();
+            dialog.set_field_text(key, text);
+            assert_eq!(dialog.collect().unwrap_err(), expected, "{key} = {text:?}");
         }
     }
 
     #[test]
-    fn collect_fills_username_from_nickname_and_keeps_defaults() {
-        // Arrange: nickname only; username left blank.
-        let dialog = filled_dialog();
+    fn collect_round_trips_the_form_including_password_and_queries() {
+        // Arrange: nickname only (username defaults to it), a server
+        // password, channels and queries.
+        let mut dialog = filled();
+        dialog.set_field_text("dlg.field_password", "hunter2");
+        dialog.set_field_text("dlg.field_queries", "alice, bob");
 
         // Act
         let (label, server) = dialog.collect().unwrap();
 
-        // Assert: the blank username defaults to the nickname, TLS stays
-        // on, and unmodeled keys come back empty for the merge to fill.
+        // Assert: every page's values round-trip; the blank username
+        // defaults to the nickname, and proxy stays unmodeled (the save
+        // path carries an existing entry's proxy across).
         assert_eq!(label, "libera");
         assert_eq!(server.username, "me");
         assert_eq!(server.server, "irc.libera.chat");
         assert_eq!(server.port, 6697);
         assert!(server.use_tls);
+        assert_eq!(server.password, "hunter2");
         assert_eq!(server.channels, vec!["#a".to_string(), "#b".to_string()]);
-        assert_eq!(server.password, "");
+        assert_eq!(server.queries, vec!["alice".to_string(), "bob".to_string()]);
         assert!(server.sasl_username.is_none());
+        assert!(server.proxy.is_none());
     }
 
     #[test]
     fn collect_accepts_a_full_sasl_pair_and_rejects_oversized_credentials() {
-        let mut dialog = filled_dialog();
-        dialog.fields[7].text.restore("account".into(), 7);
-        dialog.fields[8].text.restore("secret".into(), 6);
+        // Arrange / Act / Assert: the pair passes together...
+        let mut dialog = filled();
+        dialog.set_field_text("dlg.field_sasl_user", "account");
+        dialog.set_field_text("dlg.field_sasl_pass", "secret");
         let (_, server) = dialog.collect().unwrap();
         assert_eq!(server.sasl_username.as_deref(), Some("account"));
 
-        let mut oversized = filled_dialog();
-        oversized.fields[7].text.restore("u".repeat(280), 280);
-        oversized.fields[8].text.restore("p".repeat(280), 280);
+        // ...until the encoded PLAIN payload would not fit one line.
+        let mut oversized = filled();
+        oversized.set_field_text("dlg.field_sasl_user", &"u".repeat(280));
+        oversized.set_field_text("dlg.field_sasl_pass", &"p".repeat(280));
         assert_eq!(oversized.collect().unwrap_err(), "err.cfg_sasl_too_long");
     }
 
     #[test]
-    fn key_routes_navigation_edits_and_actions() {
-        // Arrange
-        let mut dialog = ConfigDialog::new();
+    fn editing_keys_touch_only_the_focused_field() {
+        // Arrange: the form focused on the host field.
+        let mut dialog = filled();
+        dialog.pane = Pane::Form;
+        dialog.cursor = F_HOST;
 
-        // Act / Assert: typing edits the first field.
-        assert_eq!(dialog.key(KeyCode::Char('x'), false), DialogOutcome::Edited);
-        assert_eq!(dialog.fields[0].text.text(), "liberax");
-        // Tab steps through the fields to the Save row.
-        for _ in 0..9 {
-            dialog.key(KeyCode::Tab, false);
-        }
-        assert_eq!(dialog.cursor, SAVE_ROW);
-        // Tab past Save wraps to the first field.
-        dialog.key(KeyCode::Tab, false);
-        assert_eq!(dialog.cursor, 0);
-        // Up at the first field stays put (movement clamps, no wrap).
-        dialog.key(KeyCode::Up, false);
-        assert_eq!(dialog.cursor, 0);
-        // The toggle flips with Space instead of typing.
-        dialog.cursor = 5;
-        dialog.key(KeyCode::Char(' '), false);
-        assert!(!dialog.fields[5].flag);
-        // Enter on Save requests a save.
-        dialog.cursor = SAVE_ROW;
-        assert_eq!(dialog.key(KeyCode::Enter, false), DialogOutcome::Save);
-        // Esc and Ctrl+C cancel; other ctrl keys are ignored.
-        assert_eq!(dialog.key(KeyCode::Esc, false), DialogOutcome::Cancel);
-        assert_eq!(dialog.key(KeyCode::Char('c'), true), DialogOutcome::Cancel);
-        assert_eq!(dialog.key(KeyCode::Char('x'), true), DialogOutcome::Edited);
-    }
-
-    #[test]
-    fn key_edits_the_focused_text_field_without_touching_the_others() {
-        let mut dialog = filled_dialog();
-        dialog.cursor = 1;
+        // Act / Assert: End + insert appends, Backspace removes the tail.
         dialog.key(KeyCode::End, false);
         dialog.key(KeyCode::Char('s'), false);
         dialog.key(KeyCode::Backspace, false);
-        assert_eq!(dialog.fields[1].text.text(), "irc.libera.chat");
+        assert_eq!(dialog.field_text("dlg.field_host"), "irc.libera.chat");
+        // Left + Delete removes the character under the cursor.
         dialog.key(KeyCode::Left, false);
         dialog.key(KeyCode::Delete, false);
-        assert_eq!(dialog.fields[1].text.text(), "irc.libera.cha");
-        assert_eq!(dialog.fields[0].text.text(), "libera");
-    }
-
-    #[test]
-    fn from_config_prefills_the_first_server_and_remembers_its_label() {
-        let config = crate::config::Config::parse(
-            r##"
-[servers.Existing]
-username = "me"
-nickname = "mynick"
-password = "keepme"
-server = "irc.example.org"
-use_tls = false
-port = 6667
-channels = ["#one", "#two"]
-queries = ["alice"]
-"##,
-        )
-        .unwrap();
-
-        let dialog = ConfigDialog::from_config(&config);
-
-        assert_eq!(dialog.editing.as_deref(), Some("Existing"));
-        assert_eq!(dialog.fields[0].text.text(), "Existing");
-        assert_eq!(dialog.fields[1].text.text(), "irc.example.org");
-        assert_eq!(dialog.fields[2].text.text(), "6667");
-        assert_eq!(dialog.fields[3].text.text(), "mynick");
-        assert!(!dialog.fields[5].flag);
-        assert_eq!(dialog.fields[6].text.text(), "#one, #two");
-        // collect round-trips what the form models.
-        let (_, server) = dialog.collect().unwrap();
-        assert_eq!(server.port, 6667);
-        assert!(!server.use_tls);
-        assert_eq!(
-            server.channels,
-            vec!["#one".to_string(), "#two".to_string()]
-        );
+        assert_eq!(dialog.field_text("dlg.field_host"), "irc.libera.cha");
+        assert_eq!(dialog.field_text("dlg.field_label"), "libera");
     }
 }

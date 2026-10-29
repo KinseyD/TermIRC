@@ -1122,21 +1122,25 @@ fn inset(area: Rect, pad: u16) -> Rect {
 /// Display columns reserved for a wizard row's label, after the cursor mark.
 const DIALOG_LABEL_WIDTH: usize = 16;
 
-/// Render the modal setup wizard, centered over the whole screen. The
-/// panel reuses composer colors: `input_bg` fill with a `separator`
-/// border, the focused row accented, and validation errors in the
-/// status-error color. The dialog's own cursor is drawn as a `┃`
-/// accent column inside the focused field instead of moving the
-/// terminal cursor, which belongs to the composer.
+/// Width of the wizard's left server-list pane, before the separator.
+const DIALOG_LIST_WIDTH: u16 = 26;
+
+/// Render the modal setup wizard, centered over the whole screen: a
+/// wide panel with the server list on the left, the selected entry's
+/// paged detail form on the right, and the Save/Cancel actions in the
+/// form's footer. The panel reuses composer colors (`input_bg` fill,
+/// `separator` border); the list borrows the sidebar's chevron pointer
+/// lane and the form keeps its per-field `┃` cursor, each idle while
+/// the other pane holds focus. Validation errors paint in the
+/// status-error color above the footer.
 pub fn render_config_dialog(
     frame: &mut Frame,
     area: Rect,
     dialog: &crate::tui::dialog::ConfigDialog,
     theme: &Theme,
 ) {
-    let width = area.width.saturating_sub(4).clamp(1, 56);
-    let height = (crate::tui::dialog::SAVE_ROW as u16) + 7; // title, blank, 9 fields, blank, actions, error, pad
-    let height = height.min(area.height.saturating_sub(2)).max(1);
+    let width = area.width.saturating_sub(4).clamp(1, 78);
+    let height = area.height.saturating_sub(2).clamp(1, 22);
     let panel = Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
         y: area.y + (area.height.saturating_sub(height)) / 2,
@@ -1180,23 +1184,148 @@ pub fn render_config_dialog(
     }
 
     let inner = inset(clip_vertical(panel, 1), 1);
-    // Interior budget: one cursor column plus the 16-column label block,
-    // leaving one column of slack so a full-width value never touches
-    // the border.
-    let value_width = (inner.width as usize).saturating_sub(DIALOG_LABEL_WIDTH + 2);
-    let mut rows: Vec<Line<'static>> = Vec::new();
+    // Title row, centered across the whole panel.
     let title = i18n::t("dlg.title");
     let pad = inner.width.saturating_sub(title.width() as u16) / 2;
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" ".repeat(pad as usize), Style::new()),
+            Span::styled(
+                title,
+                Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+            ),
+        ])),
+        Rect { height: 1, ..inner },
+    );
+    // Body: the two panes below the title row and its blank, with one
+    // padding row at the bottom. Degenerate terminals keep the panel
+    // (still cleared and bordered) without the panes.
+    let body = Rect {
+        y: inner.y + 2,
+        height: inner.height.saturating_sub(3),
+        ..inner
+    };
+    if body.width < 30 || body.height < 10 {
+        return;
+    }
+    let list_width = DIALOG_LIST_WIDTH.min(body.width - 8);
+    // Vertical rule between the panes, in the same separator color as
+    // the border.
+    for y in body.y..body.y + body.height {
+        if let Some(cell) = frame.buffer_mut().cell_mut((body.x + list_width, y)) {
+            cell.set_char('│').set_style(border);
+        }
+    }
+    render_dialog_list(
+        frame,
+        Rect {
+            width: list_width,
+            ..body
+        },
+        dialog,
+        theme,
+    );
+    render_dialog_form(
+        frame,
+        Rect {
+            x: body.x + list_width + 1,
+            width: body.width - list_width - 1,
+            ..body
+        },
+        dialog,
+        theme,
+    );
+}
+
+/// The wizard's left pane: every configured server plus the accent
+/// "new server" pseudo-row. The focused selection reuses the sidebar's
+/// pointer lane — an accent chevron on the cursor row, blank elsewhere
+/// — so rows stay column-aligned.
+fn render_dialog_list(
+    frame: &mut Frame,
+    area: Rect,
+    dialog: &crate::tui::dialog::ConfigDialog,
+    theme: &Theme,
+) {
+    let focused = dialog.pane == crate::tui::dialog::Pane::List;
+    let mut rows = vec![Line::from(Span::styled(
+        i18n::t("dlg.servers").to_string(),
+        Style::new().fg(theme.nick).add_modifier(Modifier::BOLD),
+    ))];
+    let name_width = (area.width as usize).saturating_sub(2);
+    for (index, (name, _)) in dialog.entries.iter().enumerate() {
+        let selected = focused && index == dialog.list_cursor;
+        // Nerd Font chevron-right; \u{f054} is a private-use code point,
+        // so it is written as an escape rather than a literal character.
+        let pointer = if selected {
+            Span::styled("\u{f054} ", Style::new().fg(theme.accent))
+        } else {
+            Span::raw("  ")
+        };
+        let style = if selected {
+            Style::new().bg(theme.accent_dim).fg(theme.nick)
+        } else {
+            Style::new().fg(theme.dim)
+        };
+        rows.push(Line::from(vec![
+            pointer,
+            Span::styled(clip_columns(name, name_width), style),
+        ]));
+    }
+    // The pseudo-row starts a new entry; it reads as an action, so it
+    // carries the accent color until selected.
+    let selected = focused && dialog.on_new_row();
+    let pointer = if selected {
+        Span::styled("\u{f054} ", Style::new().fg(theme.accent))
+    } else {
+        Span::raw("  ")
+    };
+    let style = if selected {
+        Style::new().bg(theme.accent_dim).fg(theme.nick)
+    } else {
+        Style::new().fg(theme.accent)
+    };
     rows.push(Line::from(vec![
-        Span::styled(" ".repeat(pad as usize), Style::new()),
-        Span::styled(
-            title,
-            Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
-        ),
+        pointer,
+        Span::styled(format!("＋ {}", i18n::t("dlg.new_server")), style),
     ]));
+    frame.render_widget(Paragraph::new(rows), area);
+}
+
+/// The wizard's right pane: the page tabs, the current page's fields,
+/// a dim helper row, the validation error, and the footer actions.
+fn render_dialog_form(
+    frame: &mut Frame,
+    area: Rect,
+    dialog: &crate::tui::dialog::ConfigDialog,
+    theme: &Theme,
+) {
+    // Interior budget: one cursor column plus the 16-column label block,
+    // leaving one column of slack so a full-width value never touches
+    // the separator or the border.
+    let value_width = (area.width as usize).saturating_sub(DIALOG_LABEL_WIDTH + 2);
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    // Page tabs: the three page names with the active one accented.
+    let mut tabs = Vec::new();
+    for (index, page) in crate::tui::dialog::Page::ALL.iter().enumerate() {
+        if index > 0 {
+            tabs.push(Span::styled(" · ", Style::new().fg(theme.separator)));
+        }
+        let style = if *page == dialog.page {
+            Style::new().fg(theme.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(theme.dim)
+        };
+        tabs.push(Span::styled(i18n::t(page.tab_key()).to_string(), style));
+    }
+    rows.push(Line::from(tabs));
     rows.push(Line::from(""));
-    for (index, field) in dialog.fields.iter().enumerate() {
-        let focused = index == dialog.cursor;
+    // Fields of the shown page; the `┃` cursor follows the focused
+    // field only while the form pane holds focus.
+    let form_focused = dialog.pane == crate::tui::dialog::Pane::Form;
+    for index in dialog.page.fields() {
+        let field = &dialog.fields[index];
+        let is_cursor = form_focused && index == dialog.cursor;
         let value = match field.kind {
             crate::tui::dialog::FieldKind::Toggle => {
                 i18n::t(if field.flag { "dlg.on" } else { "dlg.off" }).to_string()
@@ -1204,12 +1333,12 @@ pub fn render_config_dialog(
             crate::tui::dialog::FieldKind::Text => clip_columns(field.text.text(), value_width),
         };
         let label = i18n::t(field.label_key);
-        let style = if focused {
+        let style = if is_cursor {
             Style::new().bg(theme.accent_dim).fg(theme.nick)
         } else {
             Style::new().fg(theme.dim)
         };
-        let cursor_mark = if focused { "┃" } else { " " };
+        let cursor_mark = if is_cursor { "┃" } else { " " };
         rows.push(Line::from(vec![
             Span::styled(cursor_mark.to_string(), Style::new().fg(theme.accent)),
             Span::styled(pad_label(label, DIALOG_LABEL_WIDTH), style),
@@ -1217,8 +1346,22 @@ pub fn render_config_dialog(
         ]));
     }
     rows.push(Line::from(""));
-    let save_selected = dialog.cursor == crate::tui::dialog::SAVE_ROW;
-    let save_style = if save_selected {
+    rows.push(Line::from(Span::styled(
+        i18n::t(dialog.page.help_key()).to_string(),
+        Style::new().fg(theme.dim),
+    )));
+    // The error row keeps its place (blank when idle) so the footer
+    // never jumps when validation fails.
+    rows.push(match dialog.error {
+        Some(key) => Line::from(Span::styled(
+            i18n::t(key).to_string(),
+            Style::new().fg(theme.status_err),
+        )),
+        None => Line::from(""),
+    });
+    // Footer: the Save action (accented while focused) with its key
+    // hints and the page-turn hint.
+    let save_style = if dialog.pane == crate::tui::dialog::Pane::Actions {
         Style::new().bg(theme.accent).fg(theme.global_bg)
     } else {
         Style::new().fg(theme.nick)
@@ -1229,20 +1372,19 @@ pub fn render_config_dialog(
             save_style.add_modifier(Modifier::BOLD),
         ),
         Span::styled("Enter", Style::new().fg(theme.dim)),
-        Span::styled("   ", Style::new()),
+        Span::styled(" · ", Style::new().fg(theme.dim)),
         Span::styled(
-            format!(" {} ", i18n::t("dlg.cancel")),
+            i18n::t("dlg.cancel").to_string(),
             Style::new().fg(theme.dim),
         ),
-        Span::styled("Esc", Style::new().fg(theme.dim)),
+        Span::styled(" Esc", Style::new().fg(theme.dim)),
+        Span::styled(" · ", Style::new().fg(theme.dim)),
+        Span::styled(
+            i18n::t("dlg.page_hint").to_string(),
+            Style::new().fg(theme.dim),
+        ),
     ]));
-    if let Some(key) = dialog.error {
-        rows.push(Line::from(Span::styled(
-            i18n::t(key).to_string(),
-            Style::new().fg(theme.status_err),
-        )));
-    }
-    frame.render_widget(Paragraph::new(rows), inner);
+    frame.render_widget(Paragraph::new(rows), area);
 }
 
 /// Shrink a region vertically by `pad` rows on each side (horizontal
@@ -1439,27 +1581,48 @@ mod tests {
             }
         }
     }
+
     #[test]
-    fn the_config_wizard_renders_its_title_fields_and_actions_over_the_page() {
+    fn the_config_wizard_renders_both_panes_pages_and_actions_over_the_page() {
         // Arrange: an empty config (first run) so the welcome page is
-        // behind the modal, with the wizard opened on defaults.
+        // behind the modal, with the wizard opened on new-entry defaults.
         let mut app = App::new(70, 20);
         app.open_config_dialog(&crate::config::Config::default());
 
         // Act
         let buffer = render_sized(&app, "", 70, 20);
 
-        // Assert: the title, one label per field, and both actions are
-        // painted, and the composer's terminal cursor stays hidden (the
-        // dialog has no terminal cursor of its own).
+        // Assert: the two-pane layout is painted — the title, the list
+        // pane's header and new-server row, the form pane's page tabs
+        // with the first page's fields, and the footer actions — while
+        // the terminal cursor stays hidden (the dialog has none of its
+        // own).
         let text: String = (0..20)
             .map(|y| buffer_line(&buffer, y))
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains(crate::i18n::t("dlg.title")), "{text}");
+        assert!(text.contains(crate::i18n::t("dlg.servers")), "{text}");
+        assert!(text.contains(crate::i18n::t("dlg.new_server")), "{text}");
+        assert!(
+            text.contains(crate::i18n::t("dlg.page_connection")),
+            "{text}"
+        );
+        assert!(text.contains(crate::i18n::t("dlg.page_identity")), "{text}");
+        assert!(text.contains(crate::i18n::t("dlg.page_channels")), "{text}");
         assert!(text.contains(crate::i18n::t("dlg.field_host")), "{text}");
+        assert!(text.contains(crate::i18n::t("dlg.field_tls")), "{text}");
+        assert!(
+            !text.contains(crate::i18n::t("dlg.field_nickname")),
+            "the identity page must not show yet: {text}"
+        );
+        assert!(
+            text.contains(crate::i18n::t("dlg.help_connection")),
+            "{text}"
+        );
         assert!(text.contains(crate::i18n::t("dlg.save")), "{text}");
         assert!(text.contains(crate::i18n::t("dlg.cancel")), "{text}");
+        assert!(text.contains(crate::i18n::t("dlg.page_hint")), "{text}");
         // The panel's four corners are real box corners, not the `┼`
         // that made the outline read as a cross.
         for corner in ['┌', '┐', '└', '┘'] {
@@ -1468,6 +1631,82 @@ mod tests {
         assert!(!text.contains('┼'), "corners must not be crosses: {text}");
         let (_, cursor) = render_frame(&app, "", 70, 20, &theme());
         assert!(cursor.is_none(), "the dialog must not move the cursor");
+    }
+
+    /// Two configured servers for list-pane tests.
+    fn two_server_config() -> crate::config::Config {
+        crate::config::Config::parse(
+            r##"
+[servers.alpha]
+username = "me"
+nickname = "mynick"
+server = "irc.alpha.org"
+port = 6667
+channels = ["#one"]
+
+[servers.beta]
+username = "you"
+nickname = "yournick"
+server = "irc.beta.org"
+port = 7000
+channels = ["#three"]
+"##,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_wizard_list_and_form_panes_carry_their_own_cursors() {
+        // Arrange: an 80x24 terminal puts the panel at (2,1) sized 76x22,
+        // so the list rows start under the header at row 5 and the form
+        // pane begins at column 30 (26-column list + separator).
+        let mut app = App::new(80, 24);
+        app.open_config_dialog(&two_server_config());
+
+        // Act
+        let buffer = render_sized(&app, "", 80, 24);
+
+        // Assert: the sidebar's chevron marks the selected list row and
+        // the second row's lane stays blank, while the form pane shows
+        // no field cursor while the list holds focus.
+        assert!(buffer_line(&buffer, 5).contains("alpha"));
+        assert_eq!(buffer.cell((3, 5)).unwrap().symbol(), "\u{f054}");
+        assert!(buffer_line(&buffer, 6).contains("beta"));
+        assert_eq!(buffer.cell((3, 6)).unwrap().symbol(), " ");
+        for y in 4..21u16 {
+            assert_ne!(
+                buffer.cell((30, y)).unwrap().symbol(),
+                "┃",
+                "form cursor leaked at row {y}"
+            );
+        }
+
+        // Focusing the form moves its `┃` cursor onto the first field
+        // row (below the tab row and its blank) and frees the list lane.
+        app.dialog.as_mut().unwrap().pane = crate::tui::dialog::Pane::Form;
+        let buffer = render_sized(&app, "", 80, 24);
+        assert_eq!(buffer.cell((30, 6)).unwrap().symbol(), "┃");
+        assert_eq!(buffer.cell((3, 5)).unwrap().symbol(), " ");
+    }
+
+    #[test]
+    fn a_failed_wizard_save_paints_its_reason_above_the_footer() {
+        // Arrange: a validation error left on the dialog.
+        let mut app = App::new(70, 20);
+        app.open_config_dialog(&crate::config::Config::default());
+        app.dialog.as_mut().unwrap().error = Some("dlg.err_host");
+
+        // Act
+        let buffer = render_sized(&app, "", 70, 20);
+
+        // Assert: the translated reason sits on its own row in the
+        // status-error color — the footer stays below it.
+        let row = buffer_line(&buffer, 12);
+        assert!(row.contains(crate::i18n::t("dlg.err_host")), "{row}");
+        let x = (30..buffer.area.width)
+            .find(|&x| buffer.cell((x, 12)).unwrap().symbol() != " ")
+            .unwrap();
+        assert_eq!(buffer.cell((x, 12)).unwrap().fg, theme().status_err);
     }
 
     #[test]
