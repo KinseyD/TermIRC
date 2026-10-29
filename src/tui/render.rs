@@ -69,6 +69,17 @@ pub const INPUT_TEXT_INSET: u16 = INPUT_LEFT_PAD + INPUT_RIGHT_PAD;
 /// a Nerd Font the terminal shows a fallback glyph instead.
 const STATUS_BAR_ARROW: &str = "\u{e0b0}";
 
+/// The powerline left-pointing triangle (U+E0B2, Nerd Fonts) that caps the
+/// active page-track chip on its left edge; its mirror is
+/// [`STATUS_BAR_ARROW`]. Same powerline semantics as the status bar: the
+/// cap is drawn in the chip's color so it merges with the filled body.
+const TRACK_CHIP_LEFT: &str = "\u{e0b2}";
+
+/// The thin powerline separator (U+E0B3, Nerd Fonts) between two plain
+/// page-track labels; the active chip's caps already delimit it, so the
+/// track pads there instead (segment-track.ts, `renderSegmentTrack`).
+const TRACK_THIN: &str = "\u{e0b3}";
+
 /// Render-only chrome state: everything the renderer needs beyond the App.
 pub struct Chrome<'a> {
     pub status: &'a str,
@@ -1130,9 +1141,9 @@ const HUB_BODY_MIN_WIDTH: usize = 28;
 
 /// The hub's sidebar column budget, measured from its row labels and
 /// clamped to the hub bounds. Mirrors `HubFrame#sidebarWidth`: the
-/// longest label plus a 5-column margin (cursor lane plus breathing
-/// room), where our labels are the entry names, their unsaved-edits
-/// marker, and the "new server" row.
+/// longest label plus 5 columns — the 4-column `${cursor} ${icon} `
+/// lane plus one slack column — where our labels are the entry names,
+/// their unsaved-edits marker, and the "new server" row.
 fn hub_sidebar_width(dialog: &crate::tui::dialog::ConfigDialog) -> usize {
     let mut longest = i18n::t("dlg.new_server").width();
     for (name, _) in &dialog.entries {
@@ -1300,12 +1311,13 @@ pub fn render_config_dialog(
 }
 
 /// The hub's sidebar column: every configured server, a separator rule,
-/// then the accent "new server" action row. Mirrors omp's
-/// `HubFrame#renderSidebar` (hub-frame.ts): the `❯` cursor glyph
-/// (accent, only while the sidebar is focused and the row selected),
-/// the selected row's label bold accent with the others dim, separator
-/// rows as border-colored dash rules, and a full-width `selectedBg`
-/// band on the selected row.
+/// then the "new server" action row. Mirrors omp's
+/// `HubFrame#renderSidebar` (hub-frame.ts: `${cursor} ${icon} ${label}`):
+/// an `❯` cursor lane (accent, only while the sidebar is focused and the
+/// row selected), an icon lane — the ok-dot for a server, the accent
+/// plus for the action row — then the label, bold accent when selected
+/// and dim otherwise, separator rows as border-colored dash rules, and a
+/// full-width `selectedBg` band on the selected row.
 fn render_dialog_list(
     frame: &mut Frame,
     area: Rect,
@@ -1313,7 +1325,9 @@ fn render_dialog_list(
     theme: &Theme,
 ) {
     let focused = dialog.pane == crate::tui::dialog::Pane::List;
-    let name_width = (area.width as usize).saturating_sub(4);
+    // Label budget: the 4-column lane (cursor, space, icon, space) plus
+    // one column of slack, the margin omp's `sidebarWidth` adds.
+    let name_width = (area.width as usize).saturating_sub(5);
     let mut rows: Vec<Line<'static>> = Vec::new();
     for (index, (name, _)) in dialog.entries.iter().enumerate() {
         let selected = index == dialog.list_cursor;
@@ -1327,8 +1341,13 @@ fn render_dialog_list(
         } else {
             Style::new().fg(theme.dim)
         };
+        // Every configured entry gets the success dot: we have no
+        // unconnected-vs-connected distinction at config time, so the
+        // icon states "a saved server" in omp's provider color.
         let mut spans = vec![
             cursor,
+            Span::raw(" "),
+            Span::styled("●", Style::new().fg(theme.status_ok)),
             Span::raw(" "),
             Span::styled(clip_columns(name, name_width), style),
         ];
@@ -1345,8 +1364,11 @@ fn render_dialog_list(
         "─".repeat(area.width as usize),
         Style::new().fg(theme.separator),
     )));
-    // The action row starts a new entry; it reads as an action, so it
-    // carries the accent color, bold once selected.
+    // The action row starts a new entry. Its accent lives on the icon
+    // lane until the row is selected, then the label turns bold accent
+    // like any other active row. The plus is the narrow ASCII glyph:
+    // omp's icon lane is one column wide (hub-frame.ts:260), and a
+    // fullwidth `＋` would shift this row's label out of the lane.
     let selected = dialog.on_new_row();
     let cursor = if selected && focused {
         Span::styled("❯", Style::new().fg(theme.accent))
@@ -1356,10 +1378,12 @@ fn render_dialog_list(
     let style = if selected {
         Style::new().fg(theme.accent).add_modifier(Modifier::BOLD)
     } else {
-        Style::new().fg(theme.accent)
+        Style::new().fg(theme.dim)
     };
     rows.push(Line::from(vec![
         cursor,
+        Span::raw(" "),
+        Span::styled("+", Style::new().fg(theme.accent)),
         Span::raw(" "),
         Span::styled(i18n::t("dlg.new_server").to_string(), style),
     ]));
@@ -1407,23 +1431,81 @@ fn render_dialog_form(
     // never touches the frame's border.
     let value_width = (area.width as usize).saturating_sub(DIALOG_LABEL_WIDTH + 2);
     let mut rows: Vec<Line<'static>> = Vec::new();
-    // Page track: ` Page: connection · identity · channels`, the active
-    // page accented, the others dim.
-    let mut track = vec![Span::styled(
-        " Page:".to_string(),
-        Style::new().fg(theme.dim),
-    )];
+    // Status row (omp's `#statusRow`): the entry under the list cursor,
+    // or the last failed save's reason. A pending error replaces the
+    // status text in the error role, as omp's `configError` branch does.
+    let status = match dialog.error {
+        Some(key) => (i18n::t(key).to_string(), Style::new().fg(theme.status_err)),
+        None => match &dialog.selected {
+            Some(label) => (
+                format!("{label} · {}", dialog.field_text("dlg.field_host")),
+                Style::new().fg(theme.dim),
+            ),
+            None => (
+                i18n::t("dlg.status_new").to_string(),
+                Style::new().fg(theme.dim),
+            ),
+        },
+    };
+    rows.push(Line::from(Span::styled(format!(" {}", status.0), status.1)));
+    // Page track, a replica of omp's segment track (segment-track.ts:
+    // `renderSegmentTrack`): the caption, one space, then each page label
+    // in its own position color — the active one filled as a powerline
+    // chip with caps, the rest joined by a thin separator — and the
+    // alt-arrow hint two spaces after. The palette maps omp's
+    // accent/success/warning slots onto existing roles: accent →
+    // `theme.accent`, success → `theme.status_ok`, warning →
+    // `theme.status_pending` (the status palette's uncertain slot).
+    let palette = [theme.accent, theme.status_ok, theme.status_pending];
+    let active_index = crate::tui::dialog::Page::ALL
+        .iter()
+        .position(|page| *page == dialog.page)
+        .unwrap_or(0);
+    let mut track = vec![
+        Span::styled(" Page:".to_string(), Style::new().fg(theme.dim)),
+        Span::raw(" "),
+    ];
     for (index, page) in crate::tui::dialog::Page::ALL.iter().enumerate() {
         if index > 0 {
-            track.push(Span::styled(" · ".to_string(), Style::new().fg(theme.dim)));
+            // A thin separator reads cleanly only between two plain
+            // labels; the chip caps already delimit the active one, so
+            // pad around it instead.
+            if index == active_index || index - 1 == active_index {
+                track.push(Span::raw("  "));
+            } else {
+                track.push(Span::styled(
+                    format!(" {TRACK_THIN} "),
+                    Style::new().fg(theme.separator),
+                ));
+            }
         }
-        let style = if *page == dialog.page {
-            Style::new().fg(theme.accent).add_modifier(Modifier::BOLD)
+        let color = palette[index % palette.len()];
+        let label = i18n::t(page.tab_key()).to_string();
+        if index == active_index {
+            track.push(Span::styled(
+                TRACK_CHIP_LEFT.to_string(),
+                Style::new().fg(color),
+            ));
+            track.push(Span::styled(
+                format!(" {label} "),
+                Style::new()
+                    .bg(color)
+                    .fg(theme.global_bg)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            track.push(Span::styled(
+                STATUS_BAR_ARROW.to_string(),
+                Style::new().fg(color),
+            ));
         } else {
-            Style::new().fg(theme.dim)
-        };
-        track.push(Span::styled(i18n::t(page.tab_key()).to_string(), style));
+            track.push(Span::styled(label, Style::new().fg(color)));
+        }
     }
+    track.push(Span::raw("  "));
+    track.push(Span::styled(
+        "alt+←/alt+→".to_string(),
+        Style::new().fg(theme.dim),
+    ));
     rows.push(Line::from(track));
     rows.push(Line::from(""));
     // Fields of the shown page; the `❯` prefix follows the focused
@@ -1460,15 +1542,6 @@ fn render_dialog_form(
         i18n::t(dialog.page.help_key()).to_string(),
         Style::new().fg(theme.dim),
     )));
-    // The error row keeps its place (blank when idle) so the frame's
-    // footer never jumps when validation fails.
-    rows.push(match dialog.error {
-        Some(key) => Line::from(Span::styled(
-            i18n::t(key).to_string(),
-            Style::new().fg(theme.status_err),
-        )),
-        None => Line::from(""),
-    });
     frame.render_widget(Paragraph::new(rows), area);
 }
 
@@ -1605,6 +1678,20 @@ mod tests {
             .collect()
     }
 
+    /// The cell column where `needle` starts on row `y`. Unlike a byte
+    /// search over [`buffer_line`], this counts cells, so multi-byte
+    /// glyphs (the powerline caps) do not shift the result.
+    fn column_of(buffer: &Buffer, y: u16, needle: &str) -> u16 {
+        let cells: Vec<&str> = (0..buffer.area.width)
+            .map(|x| buffer.cell((x, y)).unwrap().symbol())
+            .collect();
+        let width = needle.chars().count();
+        cells
+            .windows(width)
+            .position(|window| window.concat() == needle)
+            .unwrap_or_else(|| panic!("{needle:?} not on row {y}")) as u16
+    }
+
     #[test]
     fn pad_label_pads_by_display_columns_and_never_truncates() {
         // ASCII pads by the difference in columns.
@@ -1717,6 +1804,52 @@ channels = []
         assert_eq!(buffer.cell((21, 0)).unwrap().symbol(), "┬");
     }
 
+    /// A one-server config whose label is exactly `name`.
+    fn server_named(name: &str) -> crate::config::Config {
+        crate::config::Config::parse(&format!(
+            r#"[servers.{name}]
+username = "me"
+nickname = "mynick"
+server = "irc.example.org"
+port = 6667
+channels = []
+"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn the_hub_sidebar_width_measures_the_label_plus_its_lanes() {
+        // omp measures `label + annotation + 5` and clamps to {18, 26}
+        // (`HubFrame#sidebarWidth`, hub-frame.ts:200-206); those 5
+        // columns are the 4-column cursor/icon lane plus one slack
+        // column, so the divider column is `width + 3`.
+        for (name, divider_col) in [
+            ("abcdefghijklm", 21),          // 13 + 5 = 18 (floor)
+            ("abcdefghijklmn", 22),         // 14 + 5 = 19
+            ("abcdefghijklmnopqrstu", 29),  // 21 + 5 = 26 (ceiling)
+            ("abcdefghijklmnopqrstuv", 29), // 22 + 5 clamps to 26
+        ] {
+            let mut app = App::new(100, 30);
+            app.open_config_dialog(&server_named(name));
+            let buffer = render_sized(&app, "", 100, 30);
+            assert_eq!(
+                buffer.cell((divider_col, 0)).unwrap().symbol(),
+                "┬",
+                "{name}"
+            );
+        }
+
+        // The unsaved-edits marker is the row's annotation: it counts
+        // toward the measurement, so a 12-column label with the marker
+        // measures like a 14-column one.
+        let mut app = App::new(100, 30);
+        app.open_config_dialog(&server_named("abcdefghijkl"));
+        app.dialog.as_mut().unwrap().dirty_row = Some("abcdefghijkl".into());
+        let buffer = render_sized(&app, "", 100, 30);
+        assert_eq!(buffer.cell((22, 0)).unwrap().symbol(), "┬");
+    }
+
     #[test]
     fn the_config_hub_renders_its_sidebar_pages_and_fields() {
         // Arrange: an empty config (first run) so the hub opens on
@@ -1815,33 +1948,59 @@ channels = ["#three"]
         }
 
         // Focusing the form moves its `❯` prefix onto the first field
-        // row (below the page track and its blank) and frees the list
-        // lane.
+        // row (below the status row, the page track and its blank) and
+        // frees the list lane.
         app.dialog.as_mut().unwrap().pane = crate::tui::dialog::Pane::Form;
         let buffer = render_sized(&app, "", 80, 24);
-        assert_eq!(buffer.cell((23, 3)).unwrap().symbol(), "❯");
+        assert_eq!(buffer.cell((23, 4)).unwrap().symbol(), "❯");
         assert_eq!(buffer.cell((2, 1)).unwrap().symbol(), " ");
     }
 
     #[test]
-    fn a_failed_hub_save_paints_its_reason_below_the_helper_row() {
-        // Arrange: a validation error left on the dialog.
+    fn the_hub_status_row_names_the_preview_and_carries_save_errors() {
+        // Arrange: the list previews alpha's connection page; the body's
+        // first row is omp's status row, the page track its second.
         let mut app = App::new(80, 24);
-        app.open_config_dialog(&crate::config::Config::default());
-        app.dialog.as_mut().unwrap().error = Some("dlg.err_host");
+        app.open_config_dialog(&two_server_config());
 
         // Act
         let buffer = render_sized(&app, "", 80, 24);
 
-        // Assert: the translated reason sits on its own row (page
-        // track, blank, four fields, blank, helper, error) in the
-        // status-error color — the hub footer stays below it.
-        let row = buffer_line(&buffer, 9);
+        // Assert: the status row reads ` <label> · <host>` in the muted
+        // role, indented one column like omp's `#statusRow`.
+        let row = buffer_line(&buffer, 1);
+        assert!(row.contains("alpha · irc.alpha.org"), "{row}");
+        let x = (23..buffer.area.width)
+            .find(|&x| buffer.cell((x, 1)).unwrap().symbol() != " ")
+            .unwrap();
+        assert_eq!(buffer.cell((x, 1)).unwrap().fg, theme().dim);
+
+        // A pending save error replaces the status text in the
+        // status-error color (omp's `configError` branch); no separate
+        // error row is left below the helper.
+        app.dialog.as_mut().unwrap().error = Some("dlg.err_host");
+        let buffer = render_sized(&app, "", 80, 24);
+        let row = buffer_line(&buffer, 1);
         assert!(row.contains(crate::i18n::t("dlg.err_host")), "{row}");
         let x = (23..buffer.area.width)
-            .find(|&x| buffer.cell((x, 9)).unwrap().symbol() != " ")
+            .find(|&x| buffer.cell((x, 1)).unwrap().symbol() != " ")
             .unwrap();
-        assert_eq!(buffer.cell((x, 9)).unwrap().fg, theme().status_err);
+        assert_eq!(buffer.cell((x, 1)).unwrap().fg, theme().status_err);
+        let below: String = (2..20)
+            .map(|y| buffer_line(&buffer, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!below.contains(crate::i18n::t("dlg.err_host")), "{below}");
+
+        // Fresh first-run dialog: the status row names the new entry.
+        let mut fresh = App::new(80, 24);
+        fresh.open_config_dialog(&crate::config::Config::default());
+        let buffer = render_sized(&fresh, "", 80, 24);
+        assert!(
+            buffer_line(&buffer, 1).contains(crate::i18n::t("dlg.status_new")),
+            "{}",
+            buffer_line(&buffer, 1)
+        );
     }
 
     #[test]
@@ -1867,6 +2026,42 @@ channels = ["#three"]
             "{}",
             buffer_line(&buffer, 2)
         );
+    }
+
+    #[test]
+    fn the_hub_sidebar_paints_the_cursor_icon_and_label_lanes() {
+        // Arrange: 80x24 with two short-named servers, so the sidebar
+        // spans columns 2..=19: cursor lane x=2, icon lane x=4, label
+        // from x=6 (omp's `${cursor} ${icon} ${label}`).
+        let mut app = App::new(80, 24);
+        app.open_config_dialog(&two_server_config());
+
+        // Act
+        let buffer = render_sized(&app, "", 80, 24);
+
+        // Assert: the selected entry shows the accent `❯`, its icon is
+        // the success dot, and the label starts two columns after the
+        // icon; the unselected entry keeps a blank cursor lane but the
+        // same icon and label columns.
+        assert_eq!(buffer.cell((2, 1)).unwrap().symbol(), "❯");
+        assert_eq!(buffer.cell((3, 1)).unwrap().symbol(), " ");
+        assert_eq!(buffer.cell((4, 1)).unwrap().symbol(), "●");
+        assert_eq!(buffer.cell((4, 1)).unwrap().fg, theme().status_ok);
+        assert_eq!(buffer.cell((5, 1)).unwrap().symbol(), " ");
+        assert_eq!(buffer.cell((6, 1)).unwrap().symbol(), "a");
+        assert_eq!(buffer.cell((2, 2)).unwrap().symbol(), " ");
+        assert_eq!(buffer.cell((4, 2)).unwrap().symbol(), "●");
+        assert_eq!(buffer.cell((6, 2)).unwrap().symbol(), "b");
+
+        // The action row carries the accent plus icon and its label;
+        // selected, the cursor joins it.
+        assert_eq!(buffer.cell((4, 4)).unwrap().symbol(), "+");
+        assert_eq!(buffer.cell((4, 4)).unwrap().fg, theme().accent);
+        assert_eq!(buffer.cell((6, 4)).unwrap().symbol(), "n");
+        app.dialog.as_mut().unwrap().list_cursor = 2;
+        let buffer = render_sized(&app, "", 80, 24);
+        assert_eq!(buffer.cell((2, 4)).unwrap().symbol(), "❯");
+        assert_eq!(buffer.cell((4, 4)).unwrap().symbol(), "+");
     }
 
     #[test]
@@ -1910,6 +2105,54 @@ channels = ["#three"]
     }
 
     #[test]
+    fn the_hub_page_track_renders_powerline_segments() {
+        // Arrange: alpha's connection page active, at 80x24 so the body
+        // starts at column 23 with 55 columns of width.
+        let mut app = App::new(80, 24);
+        app.open_config_dialog(&two_server_config());
+        app.dialog.as_mut().unwrap().pane = crate::tui::dialog::Pane::Form;
+
+        // Act
+        let buffer = render_sized(&app, "", 80, 24);
+
+        // Assert: the row opens ` Page:` + one space (segment-track.ts's
+        // caption), then the track — the active page filled as a
+        // powerline chip in its palette color, its caps pointing in.
+        let row = buffer_line(&buffer, 2);
+        let body: String = (23..buffer.area.width)
+            .map(|x| buffer.cell((x, 2)).unwrap().symbol())
+            .collect();
+        assert!(body.starts_with(" Page: "), "{body}");
+        assert_eq!(buffer.cell((30, 2)).unwrap().symbol(), TRACK_CHIP_LEFT);
+        assert_eq!(buffer.cell((30, 2)).unwrap().fg, theme().accent);
+        // The right cap is the shared powerline arrow (U+E0B0), the same
+        // glyph that closes every status-bar block.
+        assert_eq!(buffer.cell((43, 2)).unwrap().symbol(), STATUS_BAR_ARROW);
+        assert_eq!(buffer.cell((43, 2)).unwrap().fg, theme().accent);
+        // The chip's body carries the segment color as its background
+        // with the screen background as the contrast foreground.
+        assert_eq!(buffer.cell((31, 2)).unwrap().bg, theme().accent);
+        assert_eq!(buffer.cell((32, 2)).unwrap().symbol(), "c");
+        assert_eq!(buffer.cell((32, 2)).unwrap().fg, theme().global_bg);
+
+        // The other labels carry their own position colors, joined by
+        // the thin powerline separator; the chip is padded, not thinned.
+        assert_eq!(buffer.cell((44, 2)).unwrap().symbol(), " ");
+        assert_eq!(buffer.cell((46, 2)).unwrap().symbol(), "i");
+        assert_eq!(buffer.cell((46, 2)).unwrap().fg, theme().status_ok);
+        assert_eq!(buffer.cell((55, 2)).unwrap().symbol(), TRACK_THIN);
+        assert_eq!(buffer.cell((55, 2)).unwrap().fg, theme().separator);
+        assert_eq!(buffer.cell((57, 2)).unwrap().symbol(), "c");
+        assert_eq!(buffer.cell((57, 2)).unwrap().fg, theme().status_pending);
+
+        // The alt-arrow hint closes the row, dim and two spaces after
+        // the track.
+        assert!(row.contains("  alt+←/alt+→"), "{row}");
+        let hint = column_of(&buffer, 2, "alt+←/alt+→");
+        assert_eq!(buffer.cell((hint, 2)).unwrap().fg, theme().dim);
+    }
+
+    #[test]
     fn the_hub_body_paints_its_page_track_field_prefix_and_toggle() {
         // Arrange: the form focused on alpha's connection page (alpha
         // connects in cleartext, so the TLS toggle shows "off").
@@ -1922,25 +2165,26 @@ channels = ["#three"]
         // Act
         let buffer = render_sized(&app, "", 80, 24);
 
-        // Assert: the page track reads ` Page: connection · identity ·
-        // channels` with the active page accented and the others dim —
-        // omp's ` Kind:` tab-track idiom.
-        let track = buffer_line(&buffer, 1);
-        let active = track.find("connection").unwrap();
-        let idle = track.find("identity").unwrap();
-        assert_eq!(buffer.cell((active as u16, 1)).unwrap().fg, theme().accent);
-        assert_eq!(buffer.cell((idle as u16, 1)).unwrap().fg, theme().dim);
+        // Assert: the page track reads ` Page: …` with the active page
+        // filled as a powerline chip (contrast foreground on its own
+        // background) and the other labels in their position colors —
+        // omp's ` Kind:` segment-track idiom — under the status row.
+        let active = column_of(&buffer, 2, "connection");
+        let idle = column_of(&buffer, 2, "identity");
+        assert_eq!(buffer.cell((active, 2)).unwrap().fg, theme().global_bg);
+        assert_eq!(buffer.cell((active, 2)).unwrap().bg, theme().accent);
+        assert_eq!(buffer.cell((idle, 2)).unwrap().fg, theme().status_ok);
 
         // Field rows: the focused field carries the accent `❯ ` prefix,
         // the others two spaces; the 16-column label column keeps the
         // values aligned, and the toggle reads on/off in place of text.
-        assert_eq!(buffer.cell((23, 3)).unwrap().symbol(), "❯");
-        assert_eq!(buffer.cell((23, 3)).unwrap().fg, theme().accent);
-        assert_eq!(buffer.cell((23, 4)).unwrap().symbol(), " ");
-        assert_eq!(buffer.cell((24, 4)).unwrap().symbol(), " ");
-        assert_eq!(buffer.cell((41, 3)).unwrap().symbol(), "a"); // "alpha"
-        assert_eq!(buffer.cell((41, 4)).unwrap().symbol(), "i"); // "irc.alpha.org"
-        let tls_row = buffer_line(&buffer, 6);
+        assert_eq!(buffer.cell((23, 4)).unwrap().symbol(), "❯");
+        assert_eq!(buffer.cell((23, 4)).unwrap().fg, theme().accent);
+        assert_eq!(buffer.cell((23, 5)).unwrap().symbol(), " ");
+        assert_eq!(buffer.cell((24, 5)).unwrap().symbol(), " ");
+        assert_eq!(buffer.cell((41, 4)).unwrap().symbol(), "a"); // "alpha"
+        assert_eq!(buffer.cell((41, 5)).unwrap().symbol(), "i"); // "irc.alpha.org"
+        let tls_row = buffer_line(&buffer, 7);
         assert!(tls_row.contains(crate::i18n::t("dlg.off")), "{tls_row}");
     }
 

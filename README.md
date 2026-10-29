@@ -39,17 +39,19 @@ status bar along the bottom. `Enter` sends.
    the in-TUI setup wizard opens on the first frame. It takes over the
    whole terminal like a fullscreen hub — a `╭─ Server configuration
    ─┬─╮` frame with the server list left of the divider and a paged
-   form on the right. The sidebar lists every configured server, a
-   separator, and a `new server` row; the body edits the selection
-   across three pages: ① connection (name, host, port, TLS), ②
-   identity (nickname, username, server password, SASL pair), ③
-   channels (pre-join channels and query nicknames). `Up`/`Down` move,
-   `Tab` cycles the sidebar, the form, and the footer actions
-   (`BackTab` reverses), `Tab` off a page's last field (or
-   `PageUp`/`PageDown`, or `Alt+Left`/`Alt+Right`) turns pages,
-   `→`/`←` switch panes, and `Enter` on the actions saves — writing
-   the file and (re)connecting the server immediately. Type `/config`
-   at any time to reopen the wizard; on the welcome page (no
+   form on the right. The sidebar lists every configured server (a `●`
+   icon, `❯` on the selected row), a separator, and a `+ new server`
+   row; the body opens with a muted status line naming the entry (or
+   the last save error) over a colored page track whose active page is
+   a filled chip, then edits the selection across three pages: ①
+   connection (name, host, port, TLS), ② identity (nickname, username,
+   server password, SASL pair), ③ channels (pre-join channels and query
+   nicknames). `Up`/`Down` move, `Tab` cycles the sidebar, the form,
+   and the footer actions (`BackTab` reverses), `Tab` off a page's last
+   field (or `PageUp`/`PageDown`, or `Alt+Left`/`Alt+Right`) turns
+   pages, `→`/`←` switch panes, and `Enter` on the actions saves —
+   writing the file and (re)connecting the server immediately. Type
+   `/config` at any time to reopen the wizard; on the welcome page (no
    composer), `c` opens it instead. Saving an edit to a connected
    server reconnects it with the new settings right away; `password`
    and `queries` are part of the form, while `proxy` and non-server

@@ -42,6 +42,7 @@ config_hint = "按 c 配置服务器"
 [dlg]
 title = "服务器配置"
 new_server = "新建服务器"
+status_new = "新建服务器 · 保存前不生效"
 page_connection = "连接"
 page_identity = "身份"
 page_channels = "频道"

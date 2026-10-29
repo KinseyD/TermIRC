@@ -13,9 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/model` picker's chrome: the whole terminal becomes a
   `╭─ Server configuration ─┬─╮` frame while it is open (no chat,
   sidebar, or composer underneath), with the server list left of the
-  `│` divider — `❯` cursor, bold-accent selection, full-width band,
-  separator rule, accent `new server` row — and the paged form on the
-  right under a ` Page: connection · identity · channels` track.
+  `│` divider — `❯` cursor lane, a `●`/`+` icon lane, bold-accent
+  selection, full-width band, separator rule — and the paged form on
+  the right under a muted status row (`label · host`, or the pending
+  save error) and a powerline segment track: the active page is a
+  filled chip in its own color, the others carry their position colors
+  joined by a thin separator, with the `alt+←/alt+→` hint trailing.
   Field rows carry the `❯ ` focus prefix instead of the old `┃`
   cursor, `→`/`←` switch panes, `Alt+Left`/`Alt+Right` turn pages
   from any pane, and a dim footer hint (`enter save · ↑/↓ fields ·

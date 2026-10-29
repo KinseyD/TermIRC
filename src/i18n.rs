@@ -87,6 +87,7 @@ const REGISTRY: &[(&str, &str)] = &[
     // dlg.* — the modal setup wizard (first run and /config).
     ("dlg.title", "Server configuration"),
     ("dlg.new_server", "new server"),
+    ("dlg.status_new", "new server · unsaved until saved"),
     ("dlg.page_connection", "connection"),
     ("dlg.page_identity", "identity"),
     ("dlg.page_channels", "channels"),
@@ -531,6 +532,7 @@ mod tests {
             ("welcome.config_hint", "Press c to configure a server"),
             ("dlg.title", "Server configuration"),
             ("dlg.new_server", "new server"),
+            ("dlg.status_new", "new server · unsaved until saved"),
             ("dlg.page_connection", "connection"),
             ("dlg.page_identity", "identity"),
             ("dlg.page_channels", "channels"),
