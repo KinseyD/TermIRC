@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The setup wizard is now a fullscreen hub modeled 1:1 on the
+  `/model` picker's chrome: the whole terminal becomes a
+  `╭─ Server configuration ─┬─╮` frame while it is open (no chat,
+  sidebar, or composer underneath), with the server list left of the
+  `│` divider — `❯` cursor, bold-accent selection, full-width band,
+  separator rule, accent `new server` row — and the paged form on the
+  right under a ` Page: connection · identity · channels` track.
+  Field rows carry the `❯ ` focus prefix instead of the old `┃`
+  cursor, `→`/`←` switch panes, `Alt+Left`/`Alt+Right` turn pages
+  from any pane, and a dim footer hint (`enter save · ↑/↓ fields ·
+  ←/→ panes · pgup/pgdn page · esc cancel`) replaces the in-form
+  footer buttons.
+
 ### Added
 
 - In-TUI server configuration wizard: on first run (no

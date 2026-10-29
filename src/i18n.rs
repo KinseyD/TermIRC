@@ -86,7 +86,6 @@ const REGISTRY: &[(&str, &str)] = &[
     ("welcome.config_hint", "Press c to configure a server"),
     // dlg.* — the modal setup wizard (first run and /config).
     ("dlg.title", "Server configuration"),
-    ("dlg.servers", "Servers"),
     ("dlg.new_server", "new server"),
     ("dlg.page_connection", "connection"),
     ("dlg.page_identity", "identity"),
@@ -108,8 +107,6 @@ const REGISTRY: &[(&str, &str)] = &[
     ("dlg.field_queries", "Queries"),
     ("dlg.on", "on"),
     ("dlg.off", "off"),
-    ("dlg.save", "Save"),
-    ("dlg.cancel", "Cancel"),
     ("dlg.help_connection", "Name, host, port, and TLS"),
     ("dlg.help_identity", "Nickname, username, password, SASL"),
     ("dlg.help_channels", "Channels and queries at startup"),
@@ -533,7 +530,6 @@ mod tests {
             ("hint.tips", "Esc quit · Enter send · PgUp/PgDn scroll"),
             ("welcome.config_hint", "Press c to configure a server"),
             ("dlg.title", "Server configuration"),
-            ("dlg.servers", "Servers"),
             ("dlg.new_server", "new server"),
             ("dlg.page_connection", "connection"),
             ("dlg.page_identity", "identity"),
@@ -555,8 +551,6 @@ mod tests {
             ("dlg.field_queries", "Queries"),
             ("dlg.on", "on"),
             ("dlg.off", "off"),
-            ("dlg.save", "Save"),
-            ("dlg.cancel", "Cancel"),
             ("dlg.help_connection", "Name, host, port, and TLS"),
             ("dlg.help_identity", "Nickname, username, password, SASL"),
             ("dlg.help_channels", "Channels and queries at startup"),
@@ -675,6 +669,35 @@ mod tests {
         keys.sort_unstable();
         keys.dedup();
         assert_eq!(keys.len(), total, "duplicate registry keys");
+    }
+
+    /// The fullscreen hub retired the modal's header/footer rows; their
+    /// keys must stay gone so no dead catalog entries accumulate.
+    #[test]
+    fn the_registry_carries_no_keys_the_hub_retired() {
+        for dead in ["dlg.servers", "dlg.save", "dlg.cancel", "dlg.page_hint"] {
+            assert!(
+                REGISTRY.iter().all(|(key, _)| *key != dead),
+                "retired key {dead} is back in the registry"
+            );
+        }
+        // The hub's footer hint is pinned in both locales.
+        assert_eq!(
+            REGISTRY
+                .iter()
+                .find(|(key, _)| *key == "dlg.hub_hint")
+                .map(|(_, value)| *value),
+            Some("enter save · ↑/↓ fields · ←/→ panes · pgup/pgdn page · esc cancel")
+        );
+        let zh = BUILTIN_LOCALES
+            .iter()
+            .find(|(tag, _)| *tag == "zh-CN")
+            .unwrap()
+            .1;
+        assert!(
+            zh.contains("hub_hint = \"enter 保存 · ↑/↓ 字段 · ←/→ 切栏 · pgup/pgdn 翻页 · esc 取消\""),
+            "zh-CN hub hint literal changed"
+        );
     }
 
     /// The command table's second column must reference exactly the `cmd.*`

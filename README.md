@@ -36,20 +36,24 @@ status bar along the bottom. `Enter` sends.
    A sample (`config.example.toml`) ships in the repo root; replace its connection settings before use.
 
    Alternatively, skip this step: run TermIRC with no config file and
-   the in-TUI setup wizard opens on the first frame. It is a two-pane
-   modal — the left column lists every configured server plus a
-   `＋ new server` row, the right column edits the selection across
-   three pages: ① connection (name, host, port, TLS), ② identity
-   (nickname, username, server password, SASL pair), ③ channels
-   (pre-join channels and query nicknames). `Up`/`Down` move, `Tab`
-   cycles the list, the form, and the footer (`BackTab` reverses),
-   `Tab` off a page's last field (or `PageUp`/`PageDown`) turns pages,
-   and `Enter` on **Save** writes the file and (re)connects the server
-   immediately. Type `/config` at any time to reopen the wizard; on the
-   welcome page (no composer), `c` opens it instead. Saving an edit to
-   a connected server reconnects it with the new settings right away;
-   `password` and `queries` are part of the form, while `proxy` and
-   non-server tables (`[ui]`, `[theme]`, ...) are preserved verbatim.
+   the in-TUI setup wizard opens on the first frame. It takes over the
+   whole terminal like a fullscreen hub — a `╭─ Server configuration
+   ─┬─╮` frame with the server list left of the divider and a paged
+   form on the right. The sidebar lists every configured server, a
+   separator, and a `new server` row; the body edits the selection
+   across three pages: ① connection (name, host, port, TLS), ②
+   identity (nickname, username, server password, SASL pair), ③
+   channels (pre-join channels and query nicknames). `Up`/`Down` move,
+   `Tab` cycles the sidebar, the form, and the footer actions
+   (`BackTab` reverses), `Tab` off a page's last field (or
+   `PageUp`/`PageDown`, or `Alt+Left`/`Alt+Right`) turns pages,
+   `→`/`←` switch panes, and `Enter` on the actions saves — writing
+   the file and (re)connecting the server immediately. Type `/config`
+   at any time to reopen the wizard; on the welcome page (no
+   composer), `c` opens it instead. Saving an edit to a connected
+   server reconnects it with the new settings right away; `password`
+   and `queries` are part of the form, while `proxy` and non-server
+   tables (`[ui]`, `[theme]`, ...) are preserved verbatim.
 
 2. Run:
 
