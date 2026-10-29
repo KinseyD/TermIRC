@@ -1143,6 +1143,10 @@ pub fn render_config_dialog(
         width,
         height,
     };
+    // The modal must fully own its rectangle: reset every cell first so
+    // the page underneath (welcome logo, chat lines) cannot bleed
+    // through the panel's background tint.
+    frame.render_widget(ratatui::widgets::Clear, panel);
     frame.render_widget(
         Paragraph::new("").style(Style::new().bg(theme.input_bg)),
         panel,
@@ -1402,6 +1406,39 @@ mod tests {
         assert_eq!(pad_label(&overlong, 16), overlong);
     }
 
+    #[test]
+    fn the_wizard_panel_hides_the_welcome_logo_underneath_it() {
+        // Arrange: a first-run app (no buffers, welcome page) with the
+        // wizard opened over it.
+        let mut app = App::new(70, 20);
+        app.open_config_dialog(&crate::config::Config::default());
+
+        // Sanity: without the dialog the block-art logo fills the main
+        // column, so there is art to hide.
+        let bare = render_sized(&App::new(70, 20), "", 70, 20);
+        let bare_text: String = (0..20)
+            .map(|y| buffer_line(&bare, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(bare_text.contains('█'), "expected the logo: {bare_text}");
+
+        // Act
+        let buffer = render_sized(&app, "", 70, 20);
+
+        // Assert: the box shared by every panel size the renderer uses
+        // shows none of the art — the modal must paint over the page,
+        // not just tint it.
+        for y in 3..17u16 {
+            for x in 10..60u16 {
+                assert_ne!(
+                    buffer.cell((x, y)).unwrap().symbol(),
+                    "█",
+                    "logo art bleeds through at ({x},{y}): {}",
+                    buffer_line(&buffer, y)
+                );
+            }
+        }
+    }
     #[test]
     fn the_config_wizard_renders_its_title_fields_and_actions_over_the_page() {
         // Arrange: an empty config (first run) so the welcome page is
