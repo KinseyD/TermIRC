@@ -695,7 +695,9 @@ mod tests {
             .unwrap()
             .1;
         assert!(
-            zh.contains("hub_hint = \"enter 保存 · ↑/↓ 字段 · ←/→ 切栏 · pgup/pgdn 翻页 · esc 取消\""),
+            zh.contains(
+                "hub_hint = \"enter 保存 · ↑/↓ 字段 · ←/→ 切栏 · pgup/pgdn 翻页 · esc 取消\""
+            ),
             "zh-CN hub hint literal changed"
         );
     }

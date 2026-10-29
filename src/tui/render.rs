@@ -1162,23 +1162,6 @@ fn hub_geometry(width: usize, dialog: &crate::tui::dialog::ConfigDialog) -> (usi
     (sidebar, body_for(sidebar), sidebar + 3)
 }
 
-/// `text` cut to at most `width` display columns, without an ellipsis —
-/// the plain truncation omp's `truncateToWidth` applies to border titles
-/// and footer hints.
-fn truncate_plain(text: &str, width: usize) -> String {
-    let mut out = String::new();
-    let mut used = 0usize;
-    for ch in text.chars() {
-        let w = ch.width().unwrap_or(0);
-        if used + w > width {
-            break;
-        }
-        out.push(ch);
-        used += w;
-    }
-    out
-}
-
 /// Render the fullscreen configuration hub over the whole terminal: a
 /// 1:1 structural replica of oh-my-pi's `/model` ModelHub screen
 /// (packages/tui/src/overlays/hub-frame.ts and chrome/overlay-box.ts)
@@ -1210,68 +1193,92 @@ pub fn render_config_dialog(
     let footer_y = area.y + area.height - 2;
     let bottom = area.y + area.height - 1;
     // Paint one frame cell (0-based `x`, absolute `y`).
-    let mut put = |x: usize, y: u16, ch: char, style: Style| {
-        if let Some(cell) = frame.buffer_mut().cell_mut((area.x + x as u16, y)) {
+    fn put(
+        buf: &mut ratatui::buffer::Buffer,
+        base_x: u16,
+        x: usize,
+        y: u16,
+        ch: char,
+        style: Style,
+    ) {
+        if let Some(cell) = buf.cell_mut((base_x + x as u16, y)) {
             cell.set_char(ch).set_style(style);
         }
-    };
+    }
 
     // Top border (topBorderSplit): `╭` + one dash + ` Title ` (bold
     // accent, truncated to the left arm's budget) + dashes + `┬` +
-    // dashes + `╮`.
-    put(0, top, '╭', border);
-    put(divider_col, top, '┬', border);
-    put(last_col, top, '╮', border);
+    // dashes + `╮`. The title renders through a Paragraph so wide
+    // (CJK) glyphs lay out and truncate by display columns.
+    put(frame.buffer_mut(), area.x, 0, top, '╭', border);
+    put(frame.buffer_mut(), area.x, divider_col, top, '┬', border);
+    put(frame.buffer_mut(), area.x, last_col, top, '╮', border);
     for x in 1..divider_col {
-        put(x, top, '─', border);
+        put(frame.buffer_mut(), area.x, x, top, '─', border);
     }
     for x in divider_col + 1..last_col {
-        put(x, top, '─', border);
+        put(frame.buffer_mut(), area.x, x, top, '─', border);
     }
-    let title = truncate_plain(
-        &format!(" {} ", i18n::t("dlg.title")),
-        divider_col.saturating_sub(2),
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("─".to_string(), border),
+            Span::styled(
+                format!(" {} ", i18n::t("dlg.title")),
+                Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+            ),
+        ])),
+        Rect::new(area.x + 1, top, (divider_col - 1) as u16, 1),
     );
-    let title_style = Style::new().fg(theme.accent).add_modifier(Modifier::BOLD);
-    for (x, ch) in title.chars().enumerate() {
-        put(x + 2, top, ch, title_style);
-    }
 
     // Split rows: `│ … │ … │` walls, one column inset on every side.
     for y in top + 1..rows_bottom {
-        put(0, y, '│', border);
-        put(divider_col, y, '│', border);
-        put(last_col, y, '│', border);
+        put(frame.buffer_mut(), area.x, 0, y, '│', border);
+        put(frame.buffer_mut(), area.x, divider_col, y, '│', border);
+        put(frame.buffer_mut(), area.x, last_col, y, '│', border);
     }
 
     // Divider row (dividerSplit): `├` + dashes + `┴` under the `┬` +
     // dashes + `┤`.
-    put(0, rows_bottom, '├', border);
-    put(divider_col, rows_bottom, '┴', border);
-    put(last_col, rows_bottom, '┤', border);
+    put(frame.buffer_mut(), area.x, 0, rows_bottom, '├', border);
+    put(
+        frame.buffer_mut(),
+        area.x,
+        divider_col,
+        rows_bottom,
+        '┴',
+        border,
+    );
+    put(
+        frame.buffer_mut(),
+        area.x,
+        last_col,
+        rows_bottom,
+        '┤',
+        border,
+    );
     for x in 1..divider_col {
-        put(x, rows_bottom, '─', border);
+        put(frame.buffer_mut(), area.x, x, rows_bottom, '─', border);
     }
     for x in divider_col + 1..last_col {
-        put(x, rows_bottom, '─', border);
+        put(frame.buffer_mut(), area.x, x, rows_bottom, '─', border);
     }
 
-    // Footer row: a single full-width pane holding the dim key hint.
-    put(0, footer_y, '│', border);
-    put(last_col, footer_y, '│', border);
-    let hint_style = Style::new().fg(theme.dim);
-    for (x, ch) in truncate_plain(i18n::t("dlg.hub_hint"), width - 4)
-        .chars()
-        .enumerate()
-    {
-        put(x + 2, footer_y, ch, hint_style);
-    }
-
+    // Footer row: a single full-width pane holding the dim key hint
+    // (a Paragraph keeps wide glyphs column-exact when truncating).
+    put(frame.buffer_mut(), area.x, 0, footer_y, '│', border);
+    put(frame.buffer_mut(), area.x, last_col, footer_y, '│', border);
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            i18n::t("dlg.hub_hint").to_string(),
+            Style::new().fg(theme.dim),
+        )),
+        Rect::new(area.x + 2, footer_y, (width - 4) as u16, 1),
+    );
     // Bottom border.
-    put(0, bottom, '╰', border);
-    put(last_col, bottom, '╯', border);
+    put(frame.buffer_mut(), area.x, 0, bottom, '╰', border);
+    put(frame.buffer_mut(), area.x, last_col, bottom, '╯', border);
     for x in 1..last_col {
-        put(x, bottom, '─', border);
+        put(frame.buffer_mut(), area.x, x, bottom, '─', border);
     }
 
     // Panes: the sidebar content sits at x = 2 (one-column inset), the
