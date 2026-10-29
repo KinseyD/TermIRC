@@ -1252,7 +1252,7 @@ fn render_dialog_list(
         i18n::t("dlg.servers").to_string(),
         Style::new().fg(theme.nick).add_modifier(Modifier::BOLD),
     ))];
-    let name_width = (area.width as usize).saturating_sub(2);
+    let name_width = (area.width as usize).saturating_sub(4);
     for (index, (name, _)) in dialog.entries.iter().enumerate() {
         let selected = focused && index == dialog.list_cursor;
         // Nerd Font chevron-right; \u{f054} is a private-use code point,
@@ -1267,10 +1267,13 @@ fn render_dialog_list(
         } else {
             Style::new().fg(theme.dim)
         };
-        rows.push(Line::from(vec![
-            pointer,
-            Span::styled(clip_columns(name, name_width), style),
-        ]));
+        let mut spans = vec![pointer, Span::styled(clip_columns(name, name_width), style)];
+        // Unsaved-edits marker: the entry's preview was edited and the
+        // edits dropped when the cursor moved. Literal `*`, no i18n key.
+        if dialog.dirty_row.as_deref() == Some(name.as_str()) {
+            spans.push(Span::styled(" *", Style::new().fg(theme.accent)));
+        }
+        rows.push(Line::from(spans));
     }
     // The pseudo-row starts a new entry; it reads as an action, so it
     // carries the accent color until selected.
@@ -1707,6 +1710,31 @@ channels = ["#three"]
             .find(|&x| buffer.cell((x, 12)).unwrap().symbol() != " ")
             .unwrap();
         assert_eq!(buffer.cell((x, 12)).unwrap().fg, theme().status_err);
+    }
+
+    #[test]
+    fn the_wizard_list_marks_the_entry_with_unsaved_edits() {
+        // Arrange: two servers with the first one carrying unsaved edits.
+        let mut app = App::new(80, 24);
+        app.open_config_dialog(&two_server_config());
+        app.dialog.as_mut().unwrap().dirty_row = Some("alpha".into());
+
+        // Act
+        let buffer = render_sized(&app, "", 80, 24);
+
+        // Assert: a trailing accent `*` sits on the marked row only —
+        // the marker is the one place the wizard admits edits were
+        // dropped when the list cursor moved.
+        assert!(
+            buffer_line(&buffer, 5).contains("alpha *"),
+            "{:?}",
+            buffer_line(&buffer, 5)
+        );
+        assert!(
+            !buffer_line(&buffer, 6).contains('*'),
+            "{}",
+            buffer_line(&buffer, 6)
+        );
     }
 
     #[test]

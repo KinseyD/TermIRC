@@ -218,6 +218,11 @@ pub struct ConfigDialog {
     /// saved dialog with a different label adds a new entry and keeps
     /// the old one untouched.
     pub selected: Option<String>,
+    /// The entry whose form edits have not been saved: the list shows a
+    /// trailing `*` on that row so moving the cursor away (which
+    /// silently discards the preview's edits) stays visible. Cleared by
+    /// a save and by landing back on the row.
+    pub dirty_row: Option<String>,
 }
 
 /// What one routed key press did to the dialog.
@@ -243,6 +248,7 @@ impl ConfigDialog {
             cursor: F_LABEL,
             error: None,
             selected: None,
+            dirty_row: None,
         }
     }
 
@@ -286,6 +292,11 @@ impl ConfigDialog {
         self.page = Page::Connection;
         self.cursor = F_LABEL;
         self.error = None;
+        // Landing back on the edited row clears its marker: the user
+        // has now seen that the preview restarted from the saved values.
+        if self.dirty_row == self.selected {
+            self.dirty_row = None;
+        }
     }
 
     /// The current text of the field with this label key (empty for
@@ -380,6 +391,7 @@ impl ConfigDialog {
                 if let Some(field) = self.fields.get_mut(self.cursor) {
                     if field.kind == FieldKind::Toggle {
                         field.flag = !field.flag;
+                        self.mark_dirty();
                     } else {
                         // Enter advances; off the last field of a page it
                         // flows on, reaching the actions after the last
@@ -398,13 +410,23 @@ impl ConfigDialog {
             _ => {
                 if let Some(field) = self.fields.get_mut(self.cursor) {
                     match (field.kind, code) {
-                        (FieldKind::Toggle, KeyCode::Char(' ')) => field.flag = !field.flag,
+                        (FieldKind::Toggle, KeyCode::Char(' ')) => {
+                            field.flag = !field.flag;
+                            self.mark_dirty();
+                        }
                         (FieldKind::Toggle, _) => {}
                         (FieldKind::Text, KeyCode::Char(c)) if !c.is_control() => {
                             field.text.insert(c);
+                            self.mark_dirty();
                         }
-                        (FieldKind::Text, KeyCode::Backspace) => field.text.backspace(),
-                        (FieldKind::Text, KeyCode::Delete) => field.text.delete(),
+                        (FieldKind::Text, KeyCode::Backspace) => {
+                            field.text.backspace();
+                            self.mark_dirty();
+                        }
+                        (FieldKind::Text, KeyCode::Delete) => {
+                            field.text.delete();
+                            self.mark_dirty();
+                        }
                         (FieldKind::Text, KeyCode::Left) => field.text.left(),
                         (FieldKind::Text, KeyCode::Right) => field.text.right(),
                         (FieldKind::Text, KeyCode::Home) => field.text.home(),
@@ -421,6 +443,9 @@ impl ConfigDialog {
         match code {
             KeyCode::Enter => {
                 self.error = None;
+                // A successful save persists the form, so no row keeps
+                // an unsaved-edits marker (the dialog closes anyway).
+                self.dirty_row = None;
                 DialogOutcome::Save
             }
             KeyCode::Tab => {
@@ -483,6 +508,15 @@ impl ConfigDialog {
                 }
                 None => self.pane = Pane::List,
             }
+        }
+    }
+
+    /// Attribute the next text edit or toggle flip to the entry being
+    /// edited: the marker follows the most recently edited row, since a
+    /// new edit supersedes what the marker said about an older one.
+    fn mark_dirty(&mut self) {
+        if let Some(selected) = &self.selected {
+            self.dirty_row = Some(selected.clone());
         }
     }
     /// Validate the form into `(label, ServerConfig)`, or the i18n key
@@ -966,5 +1000,46 @@ channels = ["#three"]
         dialog.key(KeyCode::Delete, false);
         assert_eq!(dialog.field_text("dlg.field_host"), "irc.libera.cha");
         assert_eq!(dialog.field_text("dlg.field_label"), "libera");
+    }
+
+    #[test]
+    fn editing_marks_the_edited_entry_until_save_or_returning_to_it() {
+        // Arrange: the form focused on the first entry's label.
+        let mut dialog = ConfigDialog::from_config(&two_servers());
+        dialog.pane = Pane::Form;
+
+        // Act / Assert: caret moves alone do not dirty the entry...
+        dialog.key(KeyCode::End, false);
+        assert_eq!(dialog.dirty_row, None);
+        // ...but text edits and toggle flips do.
+        dialog.key(KeyCode::Char('x'), false);
+        assert_eq!(dialog.dirty_row.as_deref(), Some("alpha"));
+        dialog.cursor = F_TLS;
+        dialog.key(KeyCode::Char(' '), false);
+        assert_eq!(dialog.dirty_row.as_deref(), Some("alpha"));
+
+        // Moving the list cursor away keeps the marker on the row whose
+        // edits were just silently discarded.
+        dialog.pane = Pane::List;
+        dialog.key(KeyCode::Down, false);
+        assert_eq!(dialog.selected.as_deref(), Some("beta"));
+        assert_eq!(dialog.dirty_row.as_deref(), Some("alpha"));
+
+        // A save clears it: the dialog closes on success anyway.
+        dialog.pane = Pane::Actions;
+        assert_eq!(dialog.key(KeyCode::Enter, false), DialogOutcome::Save);
+        assert_eq!(dialog.dirty_row, None);
+
+        // Re-landing on the edited row also clears it: the user has now
+        // seen that the preview restarted from the saved values.
+        let mut dialog = ConfigDialog::from_config(&two_servers());
+        dialog.pane = Pane::Form;
+        dialog.key(KeyCode::Char('x'), false);
+        assert_eq!(dialog.dirty_row.as_deref(), Some("alpha"));
+        dialog.pane = Pane::List;
+        dialog.key(KeyCode::Down, false);
+        dialog.key(KeyCode::Up, false);
+        assert_eq!(dialog.selected.as_deref(), Some("alpha"));
+        assert_eq!(dialog.dirty_row, None);
     }
 }
