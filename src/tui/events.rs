@@ -665,13 +665,31 @@ mod tests {
         app.restore_input("draft text".into());
         app.open_config_dialog(&crate::config::Config::default());
 
-        // Act: typing lands in the focused dialog field (an empty config
-        // opens the form directly), not the composer.
+        // Act: typing is swallowed (fields edit only through Enter),
+        // then Enter + typing lands in the focused field (an empty
+        // config opens the form directly), never the composer.
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.input(), "draft text");
+        assert_eq!(
+            app.dialog.as_ref().unwrap().field_text("dlg.field_label"),
+            "libera"
+        );
+        press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Char('x'));
         assert_eq!(app.input(), "draft text");
         assert_eq!(
             app.dialog.as_ref().unwrap().field_text("dlg.field_label"),
             "liberax"
+        );
+        // Esc discards the open edit instead of closing the dialog...
+        press(&mut app, KeyCode::Esc);
+        assert!(
+            app.dialog.is_some(),
+            "Esc discarded the edit, not the dialog"
+        );
+        assert_eq!(
+            app.dialog.as_ref().unwrap().field_text("dlg.field_label"),
+            "libera"
         );
 
         // Act/Assert: Esc closes the dialog instead of quitting the app.
