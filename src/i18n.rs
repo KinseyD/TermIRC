@@ -93,7 +93,7 @@ const REGISTRY: &[(&str, &str)] = &[
     ("dlg.page_channels", "channels"),
     (
         "dlg.hub_hint",
-        "enter edit/save · ↑/↓ fields · ←/→ panes · alt+←/alt+→ page · tab actions · esc cancel",
+        "enter edit · ↑/↓ fields · ←/→ panes · alt+←/→ page · esc cancel",
     ),
     ("dlg.field_label", "Name"),
     ("dlg.field_host", "Server"),
@@ -539,7 +539,7 @@ mod tests {
             ("dlg.page_channels", "channels"),
             (
                 "dlg.hub_hint",
-                "enter edit/save · ↑/↓ fields · ←/→ panes · alt+←/alt+→ page · tab actions · esc cancel",
+                "enter edit · ↑/↓ fields · ←/→ panes · alt+←/→ page · esc cancel",
             ),
             ("dlg.field_label", "Name"),
             ("dlg.field_host", "Server"),
@@ -686,15 +686,13 @@ mod tests {
             );
         }
         // The hub's footer hint is pinned in both locales: pages turn
-        // through alt+←/alt+→ only, so no pgup/pgdn wording remains.
+        // through alt+←/→ only, so no pgup/pgdn wording remains.
         assert_eq!(
             REGISTRY
                 .iter()
                 .find(|(key, _)| *key == "dlg.hub_hint")
                 .map(|(_, value)| *value),
-            Some(
-                "enter edit/save · ↑/↓ fields · ←/→ panes · alt+←/alt+→ page · tab actions · esc cancel"
-            )
+            Some("enter edit · ↑/↓ fields · ←/→ panes · alt+←/→ page · esc cancel")
         );
         let zh = BUILTIN_LOCALES
             .iter()
@@ -703,7 +701,7 @@ mod tests {
             .1;
         assert!(
             zh.contains(
-                "hub_hint = \"enter 编辑/保存 · ↑/↓ 字段 · ←/→ 切栏 · alt+←/alt+→ 翻页 · tab 动作 · esc 取消\""
+                "hub_hint = \"enter 编辑 · ↑/↓ 字段 · ←/→ 切栏 · alt+←/→ 翻页 · esc 取消\""
             ),
             "zh-CN hub hint literal changed"
         );

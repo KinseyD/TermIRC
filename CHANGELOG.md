@@ -21,8 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   joined by a thin separator. Field rows carry the `❯ ` focus prefix
   instead of the old `┃` cursor, `→`/`←` switch panes (← from the
   form always returns to the sidebar), `Alt+Left`/`Alt+Right` turn
-  pages from any pane, and a dim footer hint (`enter edit/save · ↑/↓
-  fields · ←/→ panes · alt+←/alt+→ page · tab actions · esc cancel`)
+  pages from any pane, and a dim footer hint (`enter edit · ↑/↓
+  fields · ←/→ panes · alt+←/→ page · esc cancel`)
   replaces the in-form footer buttons.
 - Fields edit through an explicit edit mode, like the chat composer:
   `Enter` opens the focused text field with the terminal's real
