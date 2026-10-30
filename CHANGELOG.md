@@ -18,12 +18,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the right under a muted status row (`label · host`, or the pending
   save error) and a powerline segment track: the active page is a
   filled chip in its own color, the others carry their position colors
-  joined by a thin separator, with the `alt+←/alt+→` hint trailing.
-  Field rows carry the `❯ ` focus prefix instead of the old `┃`
-  cursor, `→`/`←` switch panes, `Alt+Left`/`Alt+Right` turn pages
-  from any pane, and a dim footer hint (`enter save · ↑/↓ fields ·
-  ←/→ panes · pgup/pgdn page · esc cancel`) replaces the in-form
-  footer buttons.
+  joined by a thin separator. Field rows carry the `❯ ` focus prefix
+  instead of the old `┃` cursor, `→`/`←` switch panes (← from the
+  form always returns to the sidebar), `Alt+Left`/`Alt+Right` turn
+  pages from any pane, and a dim footer hint (`enter edit/save · ↑/↓
+  fields · ←/→ panes · alt+←/alt+→ page · tab actions · esc cancel`)
+  replaces the in-form footer buttons.
+- Fields edit through an explicit edit mode, like the chat composer:
+  `Enter` opens the focused text field with the terminal's real
+  cursor at the value's caret (the TLS toggle flips in place
+  instead), typing lands only while the field is open, `Enter`
+  commits, `Tab` commits and advances, and `Esc` discards — the dim
+  helper row under the fields swaps to `enter save · esc discard`
+  meanwhile. The unsaved-edits `*` marker is raised by commits and
+  toggle flips, not by keystrokes inside an open field.
 
 ### Added
 
@@ -36,8 +44,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connection (name/host/port/TLS), identity (nickname, username,
   server password, SASL pair), and channels (pre-join channels and
   query nicknames). `Tab` cycles list → form → footer actions (and
-  turns a page at a field edge), `PageUp`/`PageDown` turn pages
-  directly, `n` starts a new entry, and the panel paints over the
+  turns a page at a field edge), `Alt+Left`/`Alt+Right` turn pages
+  from any pane, `n` starts a new entry, and the panel paints over the
   content beneath it instead of letting it bleed through. Saving
   validates with the same rules `Config::parse` enforces, writes the
   file atomically, and (re)connects the saved server at runtime: an

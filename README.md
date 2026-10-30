@@ -46,10 +46,13 @@ status bar along the bottom. `Enter` sends.
    a filled chip, then edits the selection across three pages: ①
    connection (name, host, port, TLS), ② identity (nickname, username,
    server password, SASL pair), ③ channels (pre-join channels and query
-   nicknames). `Up`/`Down` move, `Tab` cycles the sidebar, the form,
-   and the footer actions (`BackTab` reverses), `Tab` off a page's last
-   field (or `PageUp`/`PageDown`, or `Alt+Left`/`Alt+Right`) turns
-   pages, `→`/`←` switch panes, and `Enter` on the actions saves —
+   nicknames). `Up`/`Down` move between fields, `Enter` opens the
+   focused field for editing — typing lands only while it is open,
+   `Enter`/`Tab` commit, `Esc` discards, and the TLS toggle flips in
+   place. `Tab` cycles the sidebar, the form, and the footer actions
+   (`BackTab` reverses) and turns a page off a page's last field,
+   `Alt+Left`/`Alt+Right` turn pages from any pane, `→`/`←` switch
+   panes, and `Enter` on the actions saves —
    writing the file and (re)connecting the server immediately. Type
    `/config` at any time to reopen the wizard; on the welcome page (no
    composer), `c` opens it instead. Saving an edit to a connected
