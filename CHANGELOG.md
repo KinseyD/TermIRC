@@ -20,9 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a filled chip in its own color, the others carry their position
   colors joined by a thin separator. Field rows carry the `❯ ` focus
   prefix instead of the old `┃` cursor, `→`/`←` switch panes (← from
-  the form always returns to the sidebar), `Alt+Left`/`Alt+Right`
+  the form always returns to the sidebar), `PageUp`/`PageDown`
   turn pages from any pane, and a dim footer hint (`Enter edit · ↑/↓
-  fields · ←/→ panes · Alt+←/→ page · Esc cancel`) replaces the
+  fields · ←/→ panes · PgUp/PgDn page · Esc cancel`) replaces the
   in-form footer buttons.
 - Editing the hub's form is WYSIWYG: what the screen shows is the
   saved configuration. Every commit (`Enter`, or `Tab` which also
@@ -60,7 +60,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   server password, SASL pair), and channels (pre-join channels and
   query nicknames). `Tab` walks the form's fields (turning a page at
   a field edge) and, with `→`/`←`, cycles the list and the form,
-  `Alt+Left`/`Alt+Right` turn pages from any pane, `n` starts a new
+  `PageUp`/`PageDown` turn pages from any pane, `n` starts a new
   entry, and the panel paints over the content beneath it instead of
   letting it bleed through. Committing validates with the same rules
   `Config::parse` enforces and writes the file atomically; only

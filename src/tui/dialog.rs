@@ -328,8 +328,8 @@ impl ConfigDialog {
     }
 
     /// Route one key press; the dialog consumes every key while open.
-    /// `alt` carries the Alt modifier, which omp's hubs use for page
-    /// cycling (`alt+left`/`alt+right`).
+    /// PageUp/PageDown cycle the form's pages; `alt` carries the Alt
+    /// modifier, whose keys are inert while the dialog is open.
     pub fn key(&mut self, code: KeyCode, ctrl: bool, alt: bool) -> DialogOutcome {
         if ctrl {
             // Ctrl+C closes the dialog instead of quitting: an accidental
@@ -350,20 +350,20 @@ impl ConfigDialog {
             return DialogOutcome::Cancel;
         }
         if alt {
-            // omp's ModelHub turns its kind tabs with alt+left/right
-            // from anywhere in the hub; ours cycles the form's pages —
-            // but never while a field is open for editing, whose only
-            // exits are Enter/Tab/Esc (a page turn would retarget the
-            // open edit at another field). Any other alt key is
-            // swallowed, not typed.
-            if !self.editing {
-                match code {
-                    KeyCode::Left => self.turn_page(false),
-                    KeyCode::Right => self.turn_page(true),
-                    _ => {}
-                }
-            }
+            // Alt-modified keys are inert: swallowed, neither typed nor
+            // routed to the panes.
             return DialogOutcome::Edited;
+        }
+        // PageUp/PageDown turn pages from either pane — but never while
+        // a field is open for editing, whose only exits are Enter/Tab/
+        // Esc (a page turn would retarget the open edit at another
+        // field).
+        if !self.editing {
+            match code {
+                KeyCode::PageUp => self.turn_page(false),
+                KeyCode::PageDown => self.turn_page(true),
+                _ => {}
+            }
         }
         match self.pane {
             Pane::List => self.list_key(code),
@@ -422,7 +422,7 @@ impl ConfigDialog {
             KeyCode::Left => self.pane = Pane::List,
             KeyCode::BackTab => self.tab_backward(),
             // Up/Down stay within the current page: pages are turned
-            // explicitly (Tab at the edge, alt+←/alt+→ from any pane).
+            // explicitly (Tab at the edge, PgUp/PgDn from any pane).
             KeyCode::Up => self.cursor = self.cursor.saturating_sub(1).max(range.start),
             KeyCode::Down => self.cursor = (self.cursor + 1).min(range.end - 1),
             KeyCode::Enter => match self.fields.get(self.cursor).map(|field| field.kind) {
@@ -521,7 +521,7 @@ impl ConfigDialog {
     }
 
     /// Turn one page, keeping the field's offset within its page
-    /// (clamped) so alt+←/alt+→ feel like the same field position.
+    /// (clamped) so PgUp/PgDn feel like the same field position.
     fn turn_page(&mut self, forward: bool) {
         let target = if forward {
             self.page.next()
@@ -850,39 +850,43 @@ channels = ["#three"]
     }
 
     #[test]
-    fn page_keys_are_inert_and_only_alt_arrows_turn_pages() {
+    fn page_keys_turn_pages_from_any_pane_and_alt_arrows_are_inert() {
         // Arrange: the list focused on the first page.
         let mut dialog = ConfigDialog::from_config(&two_servers());
 
-        // Act / Assert: PageUp/PageDown no longer turn pages in any
-        // pane — pages turn only through alt+←/alt+→ (and Tab at a
-        // field edge) — so both keys are swallowed where they land.
+        // Act / Assert: PageUp/PageDown turn the form's pages from the
+        // list pane too, without moving the focus. The ends clamp
+        // without wrapping.
         dialog.key(KeyCode::PageDown, false, false);
-        assert_eq!(dialog.page, Page::Connection, "list pane");
-        dialog.pane = Pane::Form;
+        assert_eq!(dialog.page, Page::Identity, "list pane");
+        assert_eq!(dialog.pane, Pane::List);
         dialog.key(KeyCode::PageDown, false, false);
-        assert_eq!(dialog.page, Page::Connection, "form pane");
-        dialog.key(KeyCode::PageUp, false, false);
-        assert_eq!(dialog.page, Page::Connection);
-
-        // alt+←/alt+→ still turn from the form, clamping at the ends
-        // without wrapping and carrying the field offset, clamped,
-        // into the new page.
-        dialog.key(KeyCode::Right, false, true);
-        assert_eq!(dialog.page, Page::Identity);
-        dialog.key(KeyCode::Right, false, true);
         assert_eq!(dialog.page, Page::Channels);
-        dialog.key(KeyCode::Right, false, true);
+        dialog.key(KeyCode::PageDown, false, false);
         assert_eq!(dialog.page, Page::Channels, "no wrap past the last page");
+        dialog.key(KeyCode::PageUp, false, false);
+        assert_eq!(dialog.page, Page::Identity);
+        dialog.key(KeyCode::PageUp, false, false);
+        assert_eq!(dialog.page, Page::Connection, "no wrap before the first");
+
+        // From the form the same keys turn pages and carry the field
+        // offset, clamped, into the new page — never the caret.
+        dialog.pane = Pane::Form;
         dialog.page = Page::Identity;
         dialog.cursor = F_SASL_PASS; // offset 4 of a 5-field page
-        dialog.key(KeyCode::Right, false, true);
+        dialog.key(KeyCode::PageDown, false, false);
         assert_eq!((dialog.page, dialog.cursor), (Page::Channels, F_QUERIES));
-        dialog.key(KeyCode::Left, false, true);
+        dialog.key(KeyCode::PageUp, false, false);
         assert_eq!((dialog.page, dialog.cursor), (Page::Identity, F_USERNAME));
+
+        // alt+←/alt+→ are inert everywhere: no page turn, no pane
+        // change, no caret move.
+        dialog.key(KeyCode::Right, false, true);
         dialog.key(KeyCode::Left, false, true);
-        dialog.key(KeyCode::Left, false, true);
-        assert_eq!(dialog.page, Page::Connection, "no wrap before the first");
+        assert_eq!(
+            (dialog.pane, dialog.page, dialog.cursor),
+            (Pane::Form, Page::Identity, F_USERNAME)
+        );
     }
 
     #[test]
@@ -1118,21 +1122,21 @@ channels = ["#three"]
     }
 
     #[test]
-    fn up_down_and_alt_arrows_stay_in_the_field_while_editing() {
+    fn up_down_and_page_keys_stay_in_the_field_while_editing() {
         // Arrange: the label field open for editing.
         let mut dialog = ConfigDialog::from_config(&two_servers());
         dialog.pane = Pane::Form;
         dialog.key(KeyCode::Enter, false, false);
 
         // Act / Assert: edit mode is exited only via Enter/Tab/Esc, so
-        // Up/Down do not move the field cursor and alt+←/alt+→ do not
-        // turn the page (that would retarget the open edit at another
-        // field).
+        // Up/Down do not move the field cursor and PageUp/PageDown do
+        // not turn the page (that would retarget the open edit at
+        // another field).
         dialog.key(KeyCode::Up, false, false);
         dialog.key(KeyCode::Down, false, false);
         assert_eq!(dialog.cursor, F_LABEL);
-        dialog.key(KeyCode::Right, false, true);
-        dialog.key(KeyCode::Left, false, true);
+        dialog.key(KeyCode::PageUp, false, false);
+        dialog.key(KeyCode::PageDown, false, false);
         assert_eq!(dialog.page, Page::Connection);
         // Left stays a caret key while editing — it must not steal
         // the pane focus back to the sidebar.
@@ -1142,25 +1146,22 @@ channels = ["#three"]
     }
 
     #[test]
-    fn alt_arrows_turn_pages_from_any_pane() {
+    fn alt_arrows_are_inert_from_any_pane() {
         // Arrange: the list focused (a preview on the first page).
         let mut dialog = ConfigDialog::from_config(&two_servers());
 
-        // Act / Assert: alt+→/alt+← cycle the form's pages from any
-        // pane — omp's ModelHub cycles its kind tabs the same way —
-        // without moving the pane focus or the caret.
+        // Act / Assert: alt+←/alt+→ do nothing anywhere — pages turn
+        // only with PageUp/PageDown now — and other alt keys stay
+        // swallowed, not typed.
         dialog.key(KeyCode::Right, false, true);
-        assert_eq!(dialog.page, Page::Identity);
-        assert_eq!(dialog.pane, Pane::List);
         dialog.key(KeyCode::Left, false, true);
-        assert_eq!(dialog.page, Page::Connection);
-        // From the form the same keys turn pages, never the caret.
+        assert_eq!((dialog.pane, dialog.page), (Pane::List, Page::Connection));
+        // From the form the same keys leave pane, page, and caret put.
         dialog.pane = Pane::Form;
         dialog.cursor = F_LABEL;
         dialog.key(KeyCode::Right, false, true);
-        assert_eq!(dialog.page, Page::Identity);
-        assert_eq!(dialog.cursor, F_NICKNAME);
-        // Alt with any other key is swallowed, not typed.
+        dialog.key(KeyCode::Left, false, true);
+        assert_eq!((dialog.page, dialog.cursor), (Page::Connection, F_LABEL));
         dialog.key(KeyCode::Char('x'), false, true);
         assert_eq!(dialog.field_text("dlg.field_label"), "alpha");
     }

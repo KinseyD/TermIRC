@@ -92,7 +92,7 @@ const REGISTRY: &[(&str, &str)] = &[
     ("dlg.page_channels", "channels"),
     (
         "dlg.hub_hint",
-        "Enter edit · ↑/↓ fields · ←/→ panes · Alt+←/→ page · Esc cancel",
+        "Enter edit · ↑/↓ fields · ←/→ panes · PgUp/PgDn page · Esc cancel",
     ),
     ("dlg.field_label", "Name"),
     ("dlg.field_host", "Server"),
@@ -536,7 +536,7 @@ mod tests {
             ("dlg.page_channels", "channels"),
             (
                 "dlg.hub_hint",
-                "Enter edit · ↑/↓ fields · ←/→ panes · Alt+←/→ page · Esc cancel",
+                "Enter edit · ↑/↓ fields · ←/→ panes · PgUp/PgDn page · Esc cancel",
             ),
             ("dlg.field_label", "Name"),
             ("dlg.field_host", "Server"),
@@ -692,13 +692,13 @@ mod tests {
             );
         }
         // The hub's footer hint is pinned in both locales: pages turn
-        // through alt+←/→ only, so no pgup/pgdn wording remains.
+        // through PgUp/PgDn.
         assert_eq!(
             REGISTRY
                 .iter()
                 .find(|(key, _)| *key == "dlg.hub_hint")
                 .map(|(_, value)| *value),
-            Some("Enter edit · ↑/↓ fields · ←/→ panes · Alt+←/→ page · Esc cancel")
+            Some("Enter edit · ↑/↓ fields · ←/→ panes · PgUp/PgDn page · Esc cancel")
         );
         let zh = BUILTIN_LOCALES
             .iter()
@@ -707,14 +707,50 @@ mod tests {
             .1;
         assert!(
             zh.contains(
-                "hub_hint = \"Enter 编辑 · ↑/↓ 字段 · ←/→ 切栏 · Alt+←/→ 翻页 · Esc 取消\""
+                "hub_hint = \"Enter 编辑 · ↑/↓ 字段 · ←/→ 切栏 · PgUp/PgDn 翻页 · Esc 取消\""
             ),
             "zh-CN hub hint literal changed"
         );
-        assert!(
-            !zh.contains("pgup") && !zh.contains("pgdn"),
-            "zh locale: {zh}"
-        );
+    }
+
+    /// The hub's footer paragraph receives `width - 4` columns — 76 at
+    /// the 80x24 reference size. Both locales' hints must fit that
+    /// budget untruncated (zh-CN is the widest: wide CJK glyphs plus
+    /// `PgUp/PgDn`, which is ~2 columns wider than the old `Alt+←/→`).
+    #[test]
+    fn the_hub_footer_hints_fit_the_80_column_footer_budget() {
+        let display_width = |s: &str| -> usize {
+            s.chars()
+                .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))
+                .sum()
+        };
+        // Arrange / Act: the pinned hint strings from both locales.
+        let en = REGISTRY
+            .iter()
+            .find(|(key, _)| *key == "dlg.hub_hint")
+            .map(|(_, value)| *value)
+            .unwrap();
+        let zh_line = BUILTIN_LOCALES
+            .iter()
+            .find(|(tag, _)| *tag == "zh-CN")
+            .unwrap()
+            .1
+            .lines()
+            .find(|line| line.starts_with("hub_hint"))
+            .unwrap();
+        let zh = zh_line
+            .split_once('"')
+            .unwrap()
+            .1
+            .rsplit_once('"')
+            .unwrap()
+            .0;
+
+        // Assert: both fit 76 display columns, so the footer's last
+        // glyph (`消` of 取消) stays visible at 80 columns.
+        let (en_w, zh_w) = (display_width(en), display_width(zh));
+        assert!(en_w <= 76, "en hint is {en_w} columns: {en}");
+        assert!(zh_w <= 76, "zh hint is {zh_w} columns: {zh}");
     }
 
     /// The command table's second column must reference exactly the `cmd.*`

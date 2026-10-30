@@ -2169,7 +2169,7 @@ channels = ["#three"]
 
         // The track row ends with the last page label: the page-turn
         // hint lives only in the hub's footer, never on the tab row.
-        assert!(!row.contains("alt+←/alt+→"), "{row}");
+        assert!(!row.contains("PgUp/PgDn"), "{row}");
         for x in 57 + "channels".len() as u16..buffer.area.width - 1 {
             assert_eq!(
                 buffer.cell((x, 2)).unwrap().symbol(),

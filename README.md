@@ -56,7 +56,7 @@ status bar along the bottom. `Enter` sends.
   `Tab` walks the fields and turns a page off a page's last field
   (`BackTab` reverses; both stop at the form's edges), and together
   with `→`/`←` it cycles the sidebar and the form.
-  `Alt+Left`/`Alt+Right` turn pages from any pane. Type `/config` at
+  `PageUp`/`PageDown` turn pages from any pane. Type `/config` at
   any time to reopen the wizard; on the welcome page (no composer),
   `c` opens it instead. Committing a change to a
   connection-affecting field (label, host, port, TLS, username,
