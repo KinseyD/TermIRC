@@ -527,22 +527,7 @@ pub fn save_server(
     name: &str,
     server: &ServerConfig,
 ) -> anyhow::Result<()> {
-    // Only a genuinely missing file means "start from scratch". Treating
-    // any other read failure (permissions, invalid UTF-8, a directory) as
-    // an empty file would rewrite it with just the wizard's section and
-    // silently lose everything else.
-    let existing = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => {
-            return Err(error).with_context(|| {
-                i18n::format(
-                    i18n::t("err.cfg_write"),
-                    &[("path", &path.display().to_string())],
-                )
-            });
-        }
-    };
+    let existing = read_existing(path)?;
     // A rename replaces in place: the new section merges into the text
     // before the old one and the tail is appended after it, so file
     // order around the entry never changes.
@@ -565,6 +550,67 @@ pub fn save_server(
         tracing::warn!(target: "termirc::config", "rejected config merge: {}", error);
         anyhow::anyhow!("{}", i18n::t("err.cfg_write"))
     })?;
+    atomic_write(path, &merged)
+}
+
+/// Drop one `[servers.<name>]` section (proxy sub-table included) from
+/// the file at `path`. Read and write semantics mirror
+/// [`save_server`]: only a genuinely missing file is tolerated (a
+/// no-op), the merged text must re-parse, and the write is atomic.
+pub fn remove_server(path: &Path, name: &str) -> anyhow::Result<()> {
+    let existing = read_existing(path)?;
+    let (before, after) = split_server_section(&existing, name);
+    // Splice the tail back onto the head with a single blank line
+    // between them, mirroring how the section was laid out; removing
+    // the last section leaves whatever non-server tables remain.
+    let mut merged = if after.trim().is_empty() {
+        format!("{}\n", before.trim_end())
+    } else {
+        format!(
+            "{}\n\n{}",
+            before.trim_end(),
+            after.trim_start_matches('\n')
+        )
+    };
+    // `Config` requires the `servers` field to be present, so removing
+    // the last entry must leave an explicit empty table for the file to
+    // reload (an empty `servers` map is exactly the state that reopens
+    // the wizard on the next start).
+    if !merged.contains("[servers.") {
+        merged.push_str("[servers]\n");
+    }
+    Config::parse(&merged).map_err(|error| {
+        // Log only the top-level context: the toml error chain can embed
+        // the offending source line, which may persist SASL passwords.
+        tracing::warn!(target: "termirc::config", "rejected config removal: {}", error);
+        anyhow::anyhow!("{}", i18n::t("err.cfg_write"))
+    })?;
+    atomic_write(path, &merged)
+}
+
+/// Read the config file at `path` for a writer pass. Only a genuinely
+/// missing file means "start from scratch". Treating any other read
+/// failure (permissions, invalid UTF-8, a directory) as an empty file
+/// would rewrite it with just the wizard's section and silently lose
+/// everything else.
+fn read_existing(path: &Path) -> anyhow::Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(error).with_context(|| {
+            i18n::format(
+                i18n::t("err.cfg_write"),
+                &[("path", &path.display().to_string())],
+            )
+        }),
+    }
+}
+
+/// Validate-then-atomically-replace is shared by every config writer:
+/// callers validate the merged text themselves, this creates missing
+/// parent directories and lands the file through a same-directory
+/// temporary plus `rename`, leaving no `.tmp` behind on failure.
+fn atomic_write(path: &Path, text: &str) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| {
             i18n::format(
@@ -574,7 +620,7 @@ pub fn save_server(
         })?;
     }
     let temp = path.with_extension("toml.tmp");
-    if let Err(error) = std::fs::write(&temp, &merged).and_then(|_| std::fs::rename(&temp, path)) {
+    if let Err(error) = std::fs::write(&temp, text).and_then(|_| std::fs::rename(&temp, path)) {
         // Do not leave a partial or misleading `*.toml.tmp` behind when
         // the atomic write never landed.
         let _ = std::fs::remove_file(&temp);
@@ -1371,5 +1417,70 @@ channels = ["#a"]
         let saved = Config::load(&path).unwrap();
         assert_eq!(saved.servers["esc"].username, "a\"b\\c\u{1}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn remove_server_drops_the_section_and_its_proxy_and_keeps_the_rest() {
+        // Arrange: two entries — the first with a proxy sub-table and a
+        // comment of its own — plus a `[history]` table and a top comment.
+        let path = temp_path("remove-one");
+        std::fs::write(
+            &path,
+            "# top comment\n[servers.alpha]\nusername = \"me\"\nnickname = \"me\"\npassword = \"\"\nserver = \"irc.alpha.org\"\nuse_tls = false\nport = 6667\nchannels = [\"#one\"]\n\n[servers.alpha.proxy]\ntype = \"socks5\"\nhost = \"127.0.0.1\"\nport = 9050\n\n[servers.beta]\nusername = \"you\"\nnickname = \"you\"\npassword = \"\"\nserver = \"irc.beta.org\"\nuse_tls = false\nport = 6667\nchannels = []\n\n[history]\npersist = true\n",
+        )
+        .unwrap();
+
+        // Act
+        remove_server(&path, "alpha").unwrap();
+
+        // Assert: the section and its proxy sub-table are gone, the
+        // sibling, the `[history]` table, and the top comment stay, and
+        // the result reloads without the entry.
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("alpha"), "{text}");
+        assert!(!text.contains("proxy"), "{text}");
+        assert!(text.contains("# top comment"), "{text}");
+        assert!(text.contains("[servers.beta]"), "{text}");
+        assert!(text.contains("[history]"), "{text}");
+        let saved = Config::load(&path).unwrap();
+        assert!(!saved.servers.contains_key("alpha"));
+        assert!(saved.servers.contains_key("beta"));
+        assert!(saved.history.persist);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn remove_server_removing_the_last_server_leaves_a_parseable_file() {
+        // Arrange
+        let path = temp_path("remove-last");
+        save_server(&path, None, "only", &wizard_server()).unwrap();
+
+        remove_server(&path, "only").unwrap();
+
+        // Assert: a serverless file is valid (the wizard reopens on it).
+        let saved = Config::load(&path).unwrap();
+        assert!(saved.servers.is_empty());
+
+        // A subsequent save merges into the bare `[servers]` header
+        // without tripping over it.
+        save_server(&path, None, "fresh", &wizard_server()).unwrap();
+        assert!(Config::load(&path).unwrap().servers.contains_key("fresh"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn remove_server_refuses_an_unreadable_config_instead_of_rewriting_it() {
+        // Arrange: a directory where the config file is expected, so the
+        // read fails with something other than NotFound.
+        let dir = std::env::temp_dir().join(format!("termirc-cfg-{}-dir", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::create_dir(&path).unwrap();
+
+        // Act / Assert: the error propagates and no temp file is left.
+        assert!(remove_server(&path, "alpha").is_err());
+        assert!(!dir.join("config.toml.tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
