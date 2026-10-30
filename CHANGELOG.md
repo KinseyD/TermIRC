@@ -16,22 +16,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `│` divider — `❯` cursor lane, a `●`/`+` icon lane, bold-accent
   selection, full-width band, separator rule — and the paged form on
   the right under a muted status row (`label · host`, or the pending
-  save error) and a powerline segment track: the active page is a
-  filled chip in its own color, the others carry their position colors
-  joined by a thin separator. Field rows carry the `❯ ` focus prefix
-  instead of the old `┃` cursor, `→`/`←` switch panes (← from the
-  form always returns to the sidebar), `Alt+Left`/`Alt+Right` turn
-  pages from any pane, and a dim footer hint (`enter edit · ↑/↓
-  fields · ←/→ panes · alt+←/→ page · esc cancel`)
-  replaces the in-form footer buttons.
+  validation error) and a powerline segment track: the active page is
+  a filled chip in its own color, the others carry their position
+  colors joined by a thin separator. Field rows carry the `❯ ` focus
+  prefix instead of the old `┃` cursor, `→`/`←` switch panes (← from
+  the form always returns to the sidebar), `Alt+Left`/`Alt+Right`
+  turn pages from any pane, and a dim footer hint (`enter edit · ↑/↓
+  fields · ←/→ panes · alt+←/→ page · esc cancel`) replaces the
+  in-form footer buttons.
+- Editing the hub's form is WYSIWYG: what the screen shows is the
+  saved configuration. Every commit (`Enter`, or `Tab` which also
+  advances) and every toggle flip writes `config.toml` immediately —
+  there is no save action and no unsaved marker anymore, and the
+  dialog stays open for further browsing/editing; only `Esc` (outside
+  an open field) closes it. A validation failure keeps the dialog and
+  the committed value in place and shows the reason on the status
+  row. The footer actions pane is gone: `Tab` walks the fields and
+  turns pages at a field edge, and together with `→`/`←` cycles the
+  sidebar and the form. A worker respawn happens only when the label
+  or a connection-affecting field (host, port, TLS, username,
+  password, SASL pair, proxy) changed — a nickname or channels edit
+  keeps the live connection. Renaming an entry replaces its
+  `[servers.<old>]` section (proxy included) in place instead of
+  appending a duplicate, preserves the file's entry order, and moves
+  the worker to the new label.
 - Fields edit through an explicit edit mode, like the chat composer:
   `Enter` opens the focused text field with the terminal's real
   cursor at the value's caret (the TLS toggle flips in place
   instead), typing lands only while the field is open, `Enter`
   commits, `Tab` commits and advances, and `Esc` discards — the dim
-  helper row under the fields swaps to `enter save · esc discard`
-  meanwhile. The unsaved-edits `*` marker is raised by commits and
-  toggle flips, not by keystrokes inside an open field.
+  helper row under the fields swaps to `enter apply · esc discard`
+  meanwhile.
 
 ### Added
 
@@ -43,15 +58,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   right column edits the selection across three sequential pages —
   connection (name/host/port/TLS), identity (nickname, username,
   server password, SASL pair), and channels (pre-join channels and
-  query nicknames). `Tab` cycles list → form → footer actions (and
-  turns a page at a field edge), `Alt+Left`/`Alt+Right` turn pages
-  from any pane, `n` starts a new entry, and the panel paints over the
-  content beneath it instead of letting it bleed through. Saving
-  validates with the same rules `Config::parse` enforces, writes the
-  file atomically, and (re)connects the saved server at runtime: an
-  edit to an already-connected server replaces its worker, so a new
-  host, port, or TLS setting takes effect immediately; only non-server
-  tables (`[theme]`, `[history]`, ...) still need a restart. The
+  query nicknames). `Tab` walks the form's fields (turning a page at
+  a field edge) and, with `→`/`←`, cycles the list and the form,
+  `Alt+Left`/`Alt+Right` turn pages from any pane, `n` starts a new
+  entry, and the panel paints over the content beneath it instead of
+  letting it bleed through. Committing validates with the same rules
+  `Config::parse` enforces and writes the file atomically; only
+  non-server tables (`[theme]`, `[history]`, ...) still need a
+  restart. The
   wizard's writer (`config::save_server`) owns every key the form
   shows — `password` and `queries` included — and preserves `proxy`
   and unrelated keys verbatim; a missing `password` key now defaults
