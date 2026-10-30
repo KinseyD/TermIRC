@@ -254,18 +254,22 @@ fn restored_messages_are_not_written_back_to_the_archive() {
 
 #[test]
 fn restoring_records_ends_with_a_system_note_naming_count_and_cutoff() {
-    // Arrange: two archived lines with fixed timestamps, newest last.
+    // Arrange: two archived lines timestamped relative to now, newest
+    // last. One day old keeps both records inside the 7-day retention
+    // window on any run date (fixed epochs would age out eventually).
     let root = temp_root("cutoff");
+    let day = std::time::Duration::from_secs(24 * 60 * 60);
+    let older_at = std::time::SystemTime::now() - day;
+    let newer_at = older_at + std::time::Duration::from_secs(83);
     {
         let mut session = Session::with_persist(
             5_000,
             HistorySink::open(&root, &history_config(&[])).unwrap(),
         );
         session.open_server("srv");
-        // Fixed but recent epochs: retention keeps the last 7 days only.
-        for (text, at) in [("older", 1_792_700_000u64), ("newer", 1_792_700_083)] {
+        for (text, at) in [("older", older_at), ("newer", newer_at)] {
             let mut message = incoming("alice", text);
-            message.content.received_at = std::time::UNIX_EPOCH + std::time::Duration::new(at, 0);
+            message.content.received_at = at;
             session.push_message(message);
         }
     }
@@ -284,7 +288,10 @@ fn restoring_records_ends_with_a_system_note_naming_count_and_cutoff() {
     assert_eq!(note.kind, MessageKind::System);
     assert_eq!(
         note.text,
-        "Restored 2 messages through 2026-10-22T20:14:43Z"
+        format!(
+            "Restored 2 messages through {}",
+            crate::persist::format_cutoff(newer_at)
+        )
     );
     assert!(session.buffer(id).is_some_and(|buffer| !buffer.unread));
     let _ = std::fs::remove_dir_all(&root);
