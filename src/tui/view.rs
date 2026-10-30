@@ -112,6 +112,9 @@ pub struct App {
     /// means a different item list, so the highlight reads back as row 0.
     hint_selection_word: String,
     hint_selected: usize,
+    /// The modal setup wizard, while open. Owned here so the renderer
+    /// can draw it last and the event loop can route every key to it.
+    pub dialog: Option<super::dialog::ConfigDialog>,
 }
 impl Deref for App {
     type Target = Session;
@@ -153,6 +156,7 @@ impl App {
             connecting_dot_visible: true,
             hint_selection_word: String::new(),
             hint_selected: 0,
+            dialog: None,
             cache_budget,
         }
     }
@@ -179,6 +183,9 @@ impl App {
         self.sync_layout(first);
         self.reveal_sidebar_row(self.active_sidebar_row());
     }
+    /// `OpenConfig` is intentionally not handled here: the dialog needs
+    /// the config, which the event loop (not `App`) holds, so that
+    /// caller reacts to the variant itself.
     pub fn apply_submission_effect(&mut self, effect: SubmissionEffect) {
         if let SubmissionEffect::Activate(id) = effect {
             self.activate_buffer(id);
@@ -186,6 +193,19 @@ impl App {
             self.sidebar_cursor = None;
             self.sidebar_cursor_id = None;
         }
+    }
+
+    /// Open the configuration wizard over the config's servers: the
+    /// left pane lists them (plus a "new server" row), the right pane
+    /// edits the selection page by page. `App` deliberately does not
+    /// hold the configuration, so the event loop passes it in (from
+    /// `tui::events::run`).
+    pub fn open_config_dialog(&mut self, config: &crate::config::Config) {
+        self.dialog = Some(super::dialog::ConfigDialog::from_config(config));
+    }
+
+    pub fn close_dialog(&mut self) {
+        self.dialog = None;
     }
     pub fn push_message(&mut self, message: RoutedMessage) {
         let was_empty = self.session.buffers.is_empty();

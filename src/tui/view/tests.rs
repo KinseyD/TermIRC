@@ -6,6 +6,61 @@ use crate::core::OutgoingMessage;
 use crate::core::{BufferKind, ChannelState, ChannelStatus, MessageContent, RoutedMessage};
 
 #[test]
+fn the_config_wizard_opens_prefilled_and_closes_without_touching_the_view() {
+    // Arrange: one configured server and a viewed channel.
+    let config = crate::config::Config::parse(
+        r##"
+[servers.srv]
+username = "me"
+nickname = "mynick"
+server = "irc.example.org"
+port = 7000
+channels = ["#a"]
+"##,
+    )
+    .unwrap();
+    let mut app = App::new(40, 10);
+    app.open_channel("srv", "#a");
+    app.select_buffer(0);
+
+    // Act
+    app.open_config_dialog(&config);
+
+    // Assert: the form previews the first server's values and the view
+    // behind it is untouched, so closing restores the same buffer.
+    let dialog = app.dialog.as_ref().unwrap();
+    assert_eq!(dialog.selected.as_deref(), Some("srv"));
+    assert_eq!(dialog.field_text("dlg.field_host"), "irc.example.org");
+    assert_eq!(dialog.field_text("dlg.field_port"), "7000");
+    assert_eq!(dialog.field_text("dlg.field_nickname"), "mynick");
+    assert_eq!(app.active_buffer().unwrap().kind.channel(), Some("#a"));
+    app.close_dialog();
+    assert!(app.dialog.is_none());
+    assert_eq!(app.active_buffer().unwrap().kind.channel(), Some("#a"));
+}
+
+#[test]
+fn an_open_config_empty_starts_the_wizard_on_defaults() {
+    // Arrange: no servers at all (first run).
+    let mut app = App::new(40, 10);
+
+    // Act
+    app.open_config_dialog(&crate::config::Config::default());
+
+    // Assert: sensible defaults so Save only needs host and nickname.
+    let dialog = app.dialog.as_ref().unwrap();
+    assert_eq!(dialog.selected, None);
+    assert_eq!(dialog.field_text("dlg.field_label"), "libera");
+    assert_eq!(dialog.field_text("dlg.field_port"), "6697");
+    let tls = dialog
+        .fields
+        .iter()
+        .find(|field| field.label_key == "dlg.field_tls")
+        .unwrap();
+    assert!(tls.flag, "TLS is on by default");
+}
+
+#[test]
 fn dynamic_channel_insertion_keeps_queries_after_channels_and_tracks_sidebar_identity() {
     let mut app = App::new(40, 3);
     app.open_server("srv");
@@ -1694,7 +1749,7 @@ fn slash_hints_activate_only_for_strict_prefixes_while_composing() {
 fn slash_hints_filter_in_table_order_and_cap_at_five_rows() {
     // Arrange/Assert: matches keep the description table's order.
     let app = hint_app("/c");
-    assert_eq!(hint_names(&app), ["close", "connect"]);
+    assert_eq!(hint_names(&app), ["close", "connect", "config"]);
 
     // Act/Assert: a list longer than the bar's capacity is truncated after
     // the first matches in table order.
@@ -1724,9 +1779,11 @@ fn hint_highlight_clamps_without_wrapping_and_resets_when_items_change() {
     // Act/Assert: movement clamps at both ends instead of wrapping.
     app.hint_down();
     app.hint_down();
-    assert_eq!(app.hint_selected(), 1, "Down must stop at the last row");
+    assert_eq!(app.hint_selected(), 2, "Down must stop at the last row");
     app.hint_up();
-    assert_eq!(app.hint_selected(), 0);
+    assert_eq!(app.hint_selected(), 1);
+    app.hint_up();
+    assert_eq!(app.hint_selected(), 0, "Up must stop at the first row");
     app.hint_up();
     assert_eq!(app.hint_selected(), 0, "Up must stop at the first row");
 
@@ -1734,14 +1791,14 @@ fn hint_highlight_clamps_without_wrapping_and_resets_when_items_change() {
     app.hint_down();
     assert_eq!(app.hint_selected(), 1);
     app.restore_input("/con".into());
-    assert_eq!(hint_names(&app), ["connect"]);
+    assert_eq!(hint_names(&app), ["connect", "config"]);
     assert_eq!(
         app.hint_selected(),
         0,
         "a new item list resets the highlight"
     );
     app.restore_input("/c".into());
-    assert_eq!(hint_names(&app), ["close", "connect"]);
+    assert_eq!(hint_names(&app), ["close", "connect", "config"]);
     assert_eq!(app.hint_selected(), 0, "widening the list also resets");
 }
 

@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::command::{
     CommandAction, CommandError, SlashCommand, SlashParseError, parse_slash_command,
 };
-use crate::config::Config;
+use crate::config::{Config, ServerConfig};
 use crate::connection::{ConnectionHandle, ConnectionState, IrcEvent};
 use crate::core::{
     BufferId, BufferKind, ChannelState, ChannelStatus, ConnectionCommand, DeliveryState, Direction,
@@ -78,6 +78,10 @@ pub enum SubmissionEffect {
     #[default]
     None,
     Activate(BufferId),
+    /// `/config` was accepted: open the setup wizard. The TUI layer owns
+    /// the dialog, so this variant is resolved there; the application
+    /// layer only reports it.
+    OpenConfig,
 }
 
 impl Default for Session {
@@ -97,20 +101,50 @@ pub enum InputSubmission {
 impl Session {
     pub fn register_config(&mut self, config: &Config) {
         for (name, server) in &config.servers {
-            self.open_server(name);
-            for channel in &server.channels {
-                self.open_channel(name, channel);
-                if let Some(index) = self.channel_index(name, channel) {
-                    self.buffers[index].channel_status.desired = true;
-                }
+            self.register_server(name, server);
+        }
+    }
+
+    /// Open the buffers for one server (console plus its channels and
+    /// queries) and mark it connecting, exactly as startup does — also
+    /// callable at runtime when the setup wizard adds a server.
+    pub fn register_server(&mut self, name: &str, server: &ServerConfig) {
+        self.open_server(name);
+        for channel in &server.channels {
+            self.open_channel(name, channel);
+            if let Some(index) = self.channel_index(name, channel) {
+                self.buffers[index].channel_status.desired = true;
             }
-            for nickname in &server.queries {
-                self.open_query(name, nickname);
-            }
-            self.apply_connection_event(&IrcEvent::Connection(
-                name.clone(),
-                ConnectionState::Connecting,
-            ));
+        }
+        for nickname in &server.queries {
+            self.open_query(name, nickname);
+        }
+        self.apply_connection_event(&IrcEvent::Connection(
+            name.to_string(),
+            ConnectionState::Connecting,
+        ));
+    }
+
+    /// Tear down one server's whole footprint: its buffers (console,
+    /// channels, queries), connection state, and per-server routing
+    /// bookkeeping. The active buffer falls back to another server's
+    /// buffer when the viewed one was closed, or to none. The label
+    /// matches ASCII-case-insensitively, like every `ServerId`
+    /// comparison. History and per-buffer view state keyed by the closed
+    /// `BufferId`s are left in place: ids are never reused, so they are
+    /// unreachable rather than stale.
+    pub fn remove_server(&mut self, label: &str) {
+        let server = ServerId::new(label);
+        self.buffers.retain(|buffer| buffer.server != server);
+        self.servers.remove(&server);
+        self.pending_whois.remove(&server);
+        self.pending_self_echoes
+            .retain(|id, _| self.buffers.iter().any(|buffer| buffer.id == *id));
+        if self
+            .active
+            .is_some_and(|active| self.buffer(active).is_none())
+        {
+            self.active = self.buffers.first().map(|buffer| buffer.id);
         }
     }
 
@@ -863,6 +897,10 @@ impl Composer<'_> {
                     .map(SubmissionEffect::Activate)
                     .ok_or("not_query");
             }
+            // /config opens the setup wizard: no connection is involved,
+            // and the dialog itself lives in the TUI layer, which reacts
+            // to the returned effect.
+            CommandAction::Config => return Ok(SubmissionEffect::OpenConfig),
             CommandAction::Msg { target, text } => {
                 let server = self
                     .session
@@ -989,7 +1027,8 @@ impl Composer<'_> {
             | CommandAction::Topic(_)
             | CommandAction::Names(_)
             | CommandAction::Mode(_)
-            | CommandAction::Whois(_) => return Err("invalid_command"),
+            | CommandAction::Whois(_)
+            | CommandAction::Config => return Err("invalid_command"),
         };
         validate_control(&command).map_err(|_| "invalid_control")?;
         handle
@@ -1145,6 +1184,43 @@ impl Composer<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn remove_server_closes_its_buffers_and_falls_back_to_a_survivor() {
+        use super::*;
+        let mut session = Session::default();
+        let gone = session.open_server("gone");
+        let channel = session.open_channel("gone", "#a");
+        let query = session.open_query("gone", "alice");
+        let other = session.open_server("other");
+        session.select_buffer_id(channel);
+
+        // Act: the label matches ASCII-case-insensitively, like every
+        // ServerId comparison.
+        session.remove_server("GONE");
+
+        // Assert: every buffer of that server is closed, the active
+        // buffer falls back to a survivor, and other servers stay.
+        assert!(session.buffer(gone).is_none());
+        assert!(session.buffer(channel).is_none());
+        assert!(session.buffer(query).is_none());
+        assert_eq!(session.buffer_count(), 1);
+        assert_eq!(session.active_buffer().map(|buffer| buffer.id), Some(other));
+    }
+
+    #[test]
+    fn remove_server_with_no_survivors_clears_the_active_buffer() {
+        use super::*;
+        let mut session = Session::default();
+        let console = session.open_server("only");
+        session.select_buffer_id(console);
+
+        // Act
+        session.remove_server("only");
+
+        // Assert: nothing is viewed anymore, like a first-run session.
+        assert!(session.active_buffer().is_none());
+        assert!(session.buffer(console).is_none());
+    }
     #[test]
     fn connection_notes_fan_out_to_all_server_buffers_without_unread() {
         use super::*;
@@ -1579,8 +1655,17 @@ mod tests {
                         warm_app.open_channel("srv", "#a");
                     }
                     warm_app.select_buffer(0);
+                    // The warmup must itself submit a rejected slash command:
+                    // interest is cached per callsite, so re-registering only
+                    // the surrounding plumbing (an empty submission never
+                    // reaches the reject callsites) leaves a `never()` cached
+                    // by a sibling test able to blank the captured pass.
+                    for c in "/unknown warmup".chars() {
+                        warm_app.type_char(c);
+                    }
                     let mut warm_status = String::new();
-                    submit_composer(&mut warm_app, &config, &outgoing, &mut warm_status);
+                    let warm_outgoing = std::collections::HashMap::new();
+                    submit_composer(&mut warm_app, &config, &warm_outgoing, &mut warm_status);
                 });
 
                 tracing::subscriber::with_default(subscriber, || {

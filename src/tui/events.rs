@@ -1,23 +1,31 @@
 //! Terminal event dispatch; application submission has no terminal dependencies.
-use super::{App, Focus, StatusZone, mouse, render as ui};
+use super::{App, Focus, StatusZone, dialog::DialogOutcome, mouse, render as ui};
 use crate::{
     application::submit_composer,
-    config::Config,
+    config::{self, Config},
     connection::{ConnectionHandle, IrcEvent},
 };
 use ratatui::crossterm::event::{
     self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use std::path::Path;
 use std::time::Duration;
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MOUSE_SCROLL_LINES: i32 = 3;
 pub fn run(
     terminal: &mut ratatui::DefaultTerminal,
-    config: &Config,
+    config: &mut Config,
     mut app: App,
-    outgoing: std::collections::HashMap<String, ConnectionHandle>,
+    outgoing: &mut std::collections::HashMap<String, ConnectionHandle>,
+    tx: std::sync::mpsc::Sender<IrcEvent>,
     rx: std::sync::mpsc::Receiver<IrcEvent>,
+    config_path: &Path,
 ) -> anyhow::Result<()> {
+    // First run (no config file, or one without servers): open the
+    // setup wizard before the first frame so the user lands in the form.
+    if config.first_server().is_none() {
+        app.open_config_dialog(config);
+    }
     let size = terminal.size()?;
     let mut term_size = (size.width, size.height);
     fit_app(&mut app, term_size);
@@ -27,6 +35,11 @@ pub fn run(
 
     while app.is_running() {
         fit_app(&mut app, term_size);
+        // The dialog owns a deadline (a pending delete): observe time
+        // here so expiry reverts the footer hint without a key press.
+        if let Some(dialog) = app.dialog.as_mut() {
+            dialog.tick(std::time::Instant::now());
+        }
         app.tick(started.elapsed());
         let chrome = ui::Chrome {
             status: &status,
@@ -40,8 +53,20 @@ pub fn run(
                 // Windows also emits Release/Repeat events - handle presses only.
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                    relayout =
-                        handle_key_press(&mut app, key.code, ctrl, config, &outgoing, &mut status);
+                    let alt = key.modifiers.contains(KeyModifiers::ALT);
+                    relayout = handle_key_press(
+                        &mut app,
+                        key.code,
+                        ctrl,
+                        alt,
+                        &mut KeyContext {
+                            config,
+                            outgoing,
+                            tx: &tx,
+                            config_path,
+                            status: &mut status,
+                        },
+                    );
                 }
                 Event::Resize(width, height) => {
                     term_size = (width, height);
@@ -84,6 +109,17 @@ fn fit_app(app: &mut App, (w, h): (u16, u16)) {
     }
 }
 
+/// The mutable surroundings one key press may reach: the pieces of the
+/// event loop's state that the setup wizard's save path needs, grouped
+/// to keep key routing within a sane argument list.
+pub(crate) struct KeyContext<'a> {
+    config: &'a mut Config,
+    outgoing: &'a mut std::collections::HashMap<String, ConnectionHandle>,
+    tx: &'a std::sync::mpsc::Sender<IrcEvent>,
+    config_path: &'a Path,
+    status: &'a mut String,
+}
+
 /// Route one key press to the app; returns whether the screen's layout may
 /// have changed (a draft edit or hint completion rewraps the composer).
 /// Extracted from `run` so key routing stays unit-testable without a
@@ -92,10 +128,32 @@ fn handle_key_press(
     app: &mut App,
     code: KeyCode,
     ctrl: bool,
-    config: &Config,
-    outgoing: &std::collections::HashMap<String, ConnectionHandle>,
-    status: &mut String,
+    alt: bool,
+    ctx: &mut KeyContext<'_>,
 ) -> bool {
+    // The setup wizard is modal: while open it consumes every key.
+    if app.dialog.is_some() {
+        let outcome = app
+            .dialog
+            .as_mut()
+            .map(|dialog| dialog.key(code, ctrl, alt))
+            .unwrap_or(DialogOutcome::Edited);
+        match outcome {
+            DialogOutcome::Cancel => app.close_dialog(),
+            DialogOutcome::Save => save_dialog(app, ctx),
+            DialogOutcome::Delete(name) => delete_server(app, ctx, &name),
+            DialogOutcome::Edited => {}
+        }
+        return false;
+    }
+    // The welcome page has no buffer, hence no composer, so `/config`
+    // cannot be typed there: a plain `c` reopens the wizard instead. With
+    // a buffer viewed, `c` is composer input and this never fires; Ctrl+C
+    // stays the quit shortcut because `ctrl` is checked.
+    if !ctrl && code == KeyCode::Char('c') && app.active_buffer().is_none() {
+        app.open_config_dialog(ctx.config);
+        return false;
+    }
     let composer_focused = app.focus() == Focus::Composer;
     match code {
         // Tab completes the highlighted hint while the hint bar is active;
@@ -164,8 +222,14 @@ fn handle_key_press(
             match app.focus() {
                 Focus::Sidebar => app.sidebar_enter(),
                 Focus::Composer => {
-                    let effect = submit_composer(&mut app.session, config, outgoing, status);
+                    let effect =
+                        submit_composer(&mut app.session, ctx.config, ctx.outgoing, ctx.status);
                     app.apply_submission_effect(effect);
+                    // The wizard needs the config, which App does not
+                    // hold, so the OpenConfig effect resolves here.
+                    if matches!(effect, crate::application::SubmissionEffect::OpenConfig) {
+                        app.open_config_dialog(ctx.config);
+                    }
                     return true; // the composer may shrink
                 }
                 Focus::Messages => {}
@@ -205,10 +269,208 @@ fn handle_key_press(
     }
 }
 
+/// Persist the wizard's form the moment a commit asks for it (WYSIWYG:
+/// what the screen shows is the saved state): write the merged config
+/// file, sync the in-memory config and the dialog's entry list, and
+/// bring the entry live. The worker is respawned only when a
+/// connection-affecting field (or the label) changed, so editing a
+/// nickname or channels keeps the live connection. The dialog stays
+/// open; failures keep it open with the reason on its status row and
+/// never discard the committed value.
+fn save_dialog(app: &mut App, ctx: &mut KeyContext<'_>) {
+    let Some(collected) = app.dialog.as_ref().map(|dialog| dialog.collect()) else {
+        return;
+    };
+    // collect's Err is the i18n key of the violated rule.
+    let (name, mut server) = match collected {
+        Ok(entry) => entry,
+        Err(key) => {
+            if let Some(dialog) = app.dialog.as_mut() {
+                dialog.error = Some(key);
+            }
+            return;
+        }
+    };
+    let selected = app
+        .dialog
+        .as_ref()
+        .and_then(|dialog| dialog.selected.clone());
+    // A changed label renames the entry: the old section is dropped
+    // from the file in the same write and everything keyed by the old
+    // label (worker, config, dialog row) moves to the new one.
+    let previous_label =
+        selected.filter(|old| *old != name && ctx.config.servers.contains_key(old.as_str()));
+    // The form owns every key its pages show — password and queries
+    // included — so only `proxy`, which no wizard page models, is
+    // carried across from the entry being replaced (the renamed old
+    // one, or the same-name entry).
+    let previous = previous_label
+        .as_ref()
+        .and_then(|old| ctx.config.servers.get(old))
+        .or_else(|| ctx.config.servers.get(&name))
+        .cloned();
+    if let Some(previous) = &previous {
+        server.proxy = previous.proxy.clone();
+    }
+    if let Err(error) =
+        config::save_server(ctx.config_path, previous_label.as_deref(), &name, &server)
+    {
+        // Log the top-level context only: the error chain can embed raw
+        // TOML source lines, which may persist SASL passwords.
+        tracing::warn!(target: "termirc::config", "{error}");
+        if let Some(dialog) = app.dialog.as_mut() {
+            dialog.error = Some("err.cfg_write");
+        }
+        return;
+    }
+    // Respawn only when the worker's own view of the server changed: it
+    // clones its `ServerConfig` at spawn, so a new host/port/TLS/auth
+    // would otherwise wait for a process restart. The label is in the
+    // list because the worker map is keyed by it. Nickname, channels
+    // and queries ride the live connection instead. Classify new
+    // connection fields here.
+    let respawn = match &previous {
+        None => true,
+        Some(previous) => {
+            previous_label.is_some()
+                || previous.server != server.server
+                || previous.port != server.port
+                || previous.use_tls != server.use_tls
+                || previous.username != server.username
+                || previous.password != server.password
+                || previous.sasl_username != server.sasl_username
+                || previous.sasl_password != server.sasl_password
+                || proxies_differ(&previous.proxy, &server.proxy)
+        }
+    };
+    let had_console = app.session.buffers.iter().any(|buffer| {
+        buffer.kind == crate::core::BufferKind::Server
+            && buffer.server == crate::core::ServerId::new(&name)
+    });
+    if respawn {
+        // Dropping the old handle closes its channels, and the worker's
+        // `control.recv()` returning `None` ends its loop.
+        if let Some(old) = &previous_label {
+            ctx.outgoing.remove(old);
+        }
+        ctx.outgoing.remove(&name);
+        let (_thread, handle) = crate::connection::spawn_irc(
+            server.clone(),
+            name.clone(),
+            server.channels.clone(),
+            ctx.tx.clone(),
+        );
+        ctx.outgoing.insert(name.clone(), handle);
+    }
+    // Registration is idempotent: an edit keeps its existing buffers
+    // and focus, while newly added channels/queries gain theirs.
+    app.session.register_server(&name, &server);
+    // Land on a respawned/new server's console (idempotent open) so the
+    // composer is usable the moment the wizard closes — a commit that
+    // kept its live worker keeps the user's focus instead.
+    if respawn && !had_console {
+        let console = app.session.open_server(&name);
+        app.activate_buffer(console);
+    }
+    // Memory sync: a rename replaces the entry at its original index so
+    // file order survives (IndexMap preserves insertion order).
+    match &previous_label {
+        Some(old) => {
+            if let Some(index) = ctx.config.servers.get_index_of(old) {
+                ctx.config.servers.shift_remove(old);
+                ctx.config
+                    .servers
+                    .shift_insert(index, name.clone(), server.clone());
+            } else {
+                ctx.config.servers.insert(name.clone(), server.clone());
+            }
+        }
+        None => {
+            ctx.config.servers.insert(name.clone(), server.clone());
+        }
+    }
+    // The dialog's list mirrors the same replacement, keeping the form
+    // coherent on the entry it just saved.
+    if let Some(dialog) = app.dialog.as_mut() {
+        if let Some(old) = &previous_label {
+            match dialog.entries.iter().position(|(label, _)| label == old) {
+                Some(index) => {
+                    dialog.entries.remove(index);
+                    dialog.entries.insert(index, (name.clone(), server.clone()));
+                }
+                None => dialog.entries.push((name.clone(), server.clone())),
+            }
+            dialog.selected = Some(name.clone());
+            dialog.list_cursor = dialog.list_cursor.min(dialog.entries.len() - 1);
+        } else if let Some(index) = dialog.entries.iter().position(|(label, _)| *label == name) {
+            dialog.entries[index] = (name.clone(), server.clone());
+        } else {
+            // A first save of the new-server row: the entry joins the
+            // list and the form now edits it.
+            dialog.entries.push((name.clone(), server.clone()));
+            dialog.selected = Some(name.clone());
+            dialog.list_cursor = dialog.entries.len() - 1;
+        }
+        dialog.error = None;
+    }
+}
+
+/// Carry out a confirmed delete (the second `d` in the hub's list):
+/// rewrite the config file without the entry, drop it from memory and
+/// the worker map (dropping the handle stops the worker), close the
+/// server's buffers, and refresh the dialog onto the surviving row.
+/// The dialog stays open — WYSIWYG continues on what is left. A failed
+/// write keeps everything and shows the reason on the status row.
+fn delete_server(app: &mut App, ctx: &mut KeyContext<'_>, name: &str) {
+    if let Err(error) = config::remove_server(ctx.config_path, name) {
+        // Log the top-level context only: the error chain can embed raw
+        // TOML source lines, which may persist SASL passwords.
+        tracing::warn!(target: "termirc::config", "{error}");
+        if let Some(dialog) = app.dialog.as_mut() {
+            dialog.error = Some("err.cfg_write");
+            dialog.delete_armed = None;
+        }
+        return;
+    }
+    ctx.config.servers.shift_remove(name);
+    // Dropping the handle closes its channels, and the worker's
+    // `control.recv()` returning `None` ends its loop.
+    ctx.outgoing.remove(name);
+    app.session.remove_server(name);
+    if let Some(dialog) = app.dialog.as_mut() {
+        dialog.remove_entry(name);
+    }
+}
+
+/// Proxy equality by value: `ProxyConfig` deliberately derives no
+/// `PartialEq` (it is a plain deserialized table), so the respawn
+/// decision compares the pieces a worker captures at spawn.
+fn proxies_differ(
+    left: &Option<crate::config::ProxyConfig>,
+    right: &Option<crate::config::ProxyConfig>,
+) -> bool {
+    match (left, right) {
+        (None, None) => false,
+        (Some(left), Some(right)) => {
+            left.r#type != right.r#type
+                || left.host != right.host
+                || left.port != right.port
+                || left.username != right.username
+                || left.password != right.password
+        }
+        _ => true,
+    }
+}
+
 /// Route one mouse event: wheel scrolling, click actions, and hover
 /// pre-selection (updated on every event - a scroll also moves content
 /// under a stationary pointer).
 fn handle_mouse(app: &mut App, mouse: MouseEvent, term_size: (u16, u16)) {
+    // The setup wizard is modal: mouse events must not reach the panes
+    // hidden underneath it.
+    if app.dialog.is_some() {
+        return;
+    }
     let g = ui::geometry(
         term_size.0,
         term_size.1,
@@ -403,13 +665,18 @@ mod tests {
 
     /// Press one key with no modifiers; returns the relayout flag.
     fn press(app: &mut App, code: KeyCode) -> bool {
-        let config = crate::config::Config {
-            servers: Default::default(),
-            history: Default::default(),
-            theme: Default::default(),
+        let mut config = crate::config::Config::default();
+        let mut outgoing = std::collections::HashMap::new();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let path = std::path::Path::new("/nonexistent/termirc/config.toml");
+        let mut ctx = KeyContext {
+            config: &mut config,
+            outgoing: &mut outgoing,
+            tx: &tx,
+            config_path: path,
+            status: &mut String::new(),
         };
-        let outgoing = std::collections::HashMap::new();
-        handle_key_press(app, code, false, &config, &outgoing, &mut String::new())
+        handle_key_press(app, code, false, false, &mut ctx)
     }
 
     #[test]
@@ -482,12 +749,14 @@ mod tests {
         press(&mut app, KeyCode::Down);
 
         // Assert: the highlight moved and clamped, messages did not scroll.
-        assert_eq!(app.hint_selected(), 1);
+        assert_eq!(app.hint_selected(), 2);
         assert_eq!(
             app.scroll_offset(),
             offset,
             "Up/Down must not scroll messages while the hint bar is active"
         );
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.hint_selected(), 1);
         press(&mut app, KeyCode::Up);
         assert_eq!(app.hint_selected(), 0);
         assert_eq!(app.scroll_offset(), offset);
@@ -496,5 +765,575 @@ mod tests {
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Up);
         assert_eq!(app.scroll_offset(), offset);
+    }
+
+    #[test]
+    fn config_command_opens_the_wizard_and_clears_the_draft() {
+        // Arrange: a viewed channel with the composer focused.
+        let mut app = App::new(40, 10);
+        app.open_channel("srv", "#a");
+        app.select_buffer(0);
+        app.focus_composer();
+        app.restore_input("/config".into());
+
+        // Act
+        press(&mut app, KeyCode::Enter);
+
+        // Assert: the dialog opened and the command left the composer.
+        assert!(app.dialog.is_some());
+        assert!(app.input().is_empty());
+    }
+
+    #[test]
+    fn the_open_wizard_consumes_keys_and_escape_closes_it_without_quitting() {
+        // Arrange: a draft typed before the wizard opened.
+        let mut app = App::new(40, 10);
+        app.open_channel("srv", "#a");
+        app.select_buffer(0);
+        app.focus_composer();
+        app.restore_input("draft text".into());
+        app.open_config_dialog(&crate::config::Config::default());
+
+        // Act: typing is swallowed (fields edit only through Enter),
+        // then Enter + typing lands in the focused field (an empty
+        // config opens the form directly), never the composer.
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.input(), "draft text");
+        assert_eq!(
+            app.dialog.as_ref().unwrap().field_text("dlg.field_label"),
+            "libera"
+        );
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.input(), "draft text");
+        assert_eq!(
+            app.dialog.as_ref().unwrap().field_text("dlg.field_label"),
+            "liberax"
+        );
+        // Esc discards the open edit instead of closing the dialog...
+        press(&mut app, KeyCode::Esc);
+        assert!(
+            app.dialog.is_some(),
+            "Esc discarded the edit, not the dialog"
+        );
+        assert_eq!(
+            app.dialog.as_ref().unwrap().field_text("dlg.field_label"),
+            "libera"
+        );
+
+        // Act/Assert: Esc closes the dialog instead of quitting the app.
+        press(&mut app, KeyCode::Esc);
+        assert!(app.dialog.is_none());
+        assert!(app.is_running(), "Esc closed the dialog, not the client");
+
+        // A cancelled first run still has an obvious way out: the same
+        // Esc that quit before the wizard existed quits now.
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.is_running(), "Esc on the page still quits");
+    }
+
+    #[test]
+    fn the_welcome_page_reopens_the_wizard_from_the_c_key() {
+        // Arrange: a first-run cancel left the welcome page with no
+        // buffer, hence no composer to type /config into.
+        let mut app = App::new(40, 10);
+        assert!(app.active_buffer().is_none());
+        assert!(app.dialog.is_none());
+
+        // Act
+        press(&mut app, KeyCode::Char('c'));
+
+        // Assert: the wizard opened and the client kept running.
+        assert!(app.dialog.is_some());
+        assert!(app.is_running());
+
+        // Ctrl+C is not intercepted by the welcome shortcut: it still
+        // quits even with the same empty state.
+        let mut bare = App::new(40, 10);
+        let mut config = crate::config::Config::default();
+        let mut outgoing = std::collections::HashMap::new();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut ctx = KeyContext {
+            config: &mut config,
+            outgoing: &mut outgoing,
+            tx: &tx,
+            config_path: std::path::Path::new("/nonexistent/termirc/config.toml"),
+            status: &mut String::new(),
+        };
+        handle_key_press(&mut bare, KeyCode::Char('c'), true, false, &mut ctx);
+        assert!(bare.dialog.is_none());
+        assert!(!bare.is_running());
+    }
+
+    /// A `KeyContext` over throwaway state, for wizard save tests.
+    fn save_context<'a>(
+        config: &'a mut crate::config::Config,
+        outgoing: &'a mut std::collections::HashMap<String, ConnectionHandle>,
+        tx: &'a std::sync::mpsc::Sender<IrcEvent>,
+        path: &'a Path,
+        status: &'a mut String,
+    ) -> KeyContext<'a> {
+        KeyContext {
+            config,
+            outgoing,
+            tx,
+            config_path: path,
+            status,
+        }
+    }
+
+    #[test]
+    fn committing_the_form_writes_the_file_registers_the_server_and_stays_open() {
+        // Arrange: a filled wizard pointed at a port that refuses
+        // immediately, and a fresh config path.
+        let path = std::env::temp_dir().join(format!("termirc-wizard-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut app = App::new(40, 10);
+        app.open_config_dialog(&crate::config::Config::default());
+        {
+            let dialog = app.dialog.as_mut().unwrap();
+            dialog.set_field_text("dlg.field_host", "127.0.0.1");
+            dialog.set_field_text("dlg.field_port", "1");
+            dialog.set_field_text("dlg.field_nickname", "tester");
+            dialog.set_field_text("dlg.field_channels", "#a");
+            dialog.pane = crate::tui::dialog::Pane::Form;
+        }
+        let mut config = crate::config::Config::default();
+        let mut outgoing = std::collections::HashMap::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut status = String::new();
+        let mut ctx = save_context(&mut config, &mut outgoing, &tx, &path, &mut status);
+
+        // Act: Enter opens the focused label field, the second Enter
+        // commits — and committing is the save.
+        handle_key_press(&mut app, KeyCode::Enter, false, false, &mut ctx);
+        handle_key_press(&mut app, KeyCode::Enter, false, false, &mut ctx);
+
+        // Assert: the file exists, the config and worker maps gained
+        // the entry, the console is viewed — and the dialog stays open
+        // with the edit closed (WYSIWYG: keep browsing/editing). Drop
+        // the receiver so the background worker's sends fail silently.
+        drop(rx);
+        assert!(app.dialog.is_some(), "the dialog stays open after a save");
+        assert!(!app.dialog.as_ref().unwrap().editing);
+        assert!(config.servers.contains_key("libera"));
+        assert!(outgoing.contains_key("libera"));
+        assert_eq!(
+            app.active_buffer().unwrap().kind,
+            crate::core::BufferKind::Server
+        );
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("server = \"127.0.0.1\""));
+        assert!(saved.contains("channels = [\"#a\"]"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn committing_an_edited_server_takes_password_and_queries_from_the_form_and_keeps_proxy() {
+        // Arrange: a config file whose entry carries keys some wizard
+        // pages model (password, queries) and one no page models
+        // (proxy), a live worker handle for it, and a viewed channel.
+        let path =
+            std::env::temp_dir().join(format!("termirc-wizard-edit-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(
+            &path,
+            "[servers.libera]\nusername = \"me\"\nnickname = \"me\"\npassword = \"keepme\"\nserver = \"old.example.org\"\nuse_tls = false\nport = 6667\nchannels = [\"#one\"]\nqueries = [\"alice\"]\n\n[servers.libera.proxy]\ntype = \"socks5\"\nhost = \"127.0.0.1\"\nport = 9050\n",
+        )
+        .unwrap();
+        let mut config = crate::config::Config::load(&path).unwrap();
+
+        let mut app = App::new(40, 10);
+        app.open_server("libera");
+        let channel = app.open_channel("libera", "#one");
+        app.activate_buffer(channel);
+        app.open_config_dialog(&config);
+        {
+            let dialog = app.dialog.as_mut().unwrap();
+            // The host field is where the edit starts; the host change
+            // forces a respawn below.
+            dialog.pane = crate::tui::dialog::Pane::Form;
+            dialog.cursor = crate::tui::dialog::F_HOST;
+        }
+        // A handle standing in for the worker started at boot. Keeping a
+        // clone of its outgoing sender lets the test tell the channels
+        // apart; nothing else holds the control receiver, so its closure
+        // is observable too.
+        let (old_outgoing, _old_outgoing_rx) = tokio::sync::mpsc::channel(8);
+        let (old_control, mut old_control_rx) = tokio::sync::mpsc::channel(8);
+        let old_sender = old_outgoing.clone();
+        let mut outgoing = std::collections::HashMap::from([(
+            "libera".to_string(),
+            ConnectionHandle {
+                outgoing: old_outgoing,
+                control: old_control,
+            },
+        )]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut status = String::new();
+        let mut ctx = save_context(&mut config, &mut outgoing, &tx, &path, &mut status);
+
+        // Act: open the host field, retype it, and commit. The port and
+        // the other pages' values are set directly (their own commits
+        // would each save just as well).
+        handle_key_press(&mut app, KeyCode::Enter, false, false, &mut ctx);
+        for _ in 0.."old.example.org".len() {
+            handle_key_press(&mut app, KeyCode::Backspace, false, false, &mut ctx);
+        }
+        for c in "127.0.0.1".chars() {
+            handle_key_press(&mut app, KeyCode::Char(c), false, false, &mut ctx);
+        }
+        {
+            let dialog = app.dialog.as_mut().unwrap();
+            dialog.set_field_text("dlg.field_port", "1");
+            dialog.set_field_text("dlg.field_password", "");
+            dialog.set_field_text("dlg.field_queries", "bob");
+        }
+        handle_key_press(&mut app, KeyCode::Enter, false, false, &mut ctx);
+
+        // Assert: the worker was replaced rather than duplicated, and
+        // the old control channel closed so its loop ends.
+        drop(rx);
+        assert!(app.dialog.is_some(), "the dialog stays open");
+        assert_eq!(outgoing.len(), 1);
+        assert!(
+            !outgoing["libera"].outgoing.same_channel(&old_sender),
+            "a host change must respawn the server's worker"
+        );
+        assert!(
+            matches!(
+                old_control_rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+            ),
+            "dropping the old handle must close its control channel"
+        );
+        // An edit keeps the user's buffer focused instead of jumping to
+        // the console.
+        assert_eq!(app.active_buffer().unwrap().id, channel);
+
+        // Memory agrees with the form: the new connection details, the
+        // form's password and queries, and the proxy carried over from
+        // the entry the wizard does not model.
+        let memory = &config.servers["libera"];
+        assert_eq!(memory.server, "127.0.0.1");
+        assert_eq!(memory.port, 1);
+        assert_eq!(memory.password, "");
+        assert_eq!(memory.queries, vec!["bob".to_string()]);
+        assert_eq!(memory.proxy.as_ref().map(|proxy| proxy.port), Some(9050));
+        // The file gains the new connection details and the form's
+        // password and queries (the wizard's writer owns both keys),
+        // and keeps the proxy no page models.
+        let saved = crate::config::Config::load(&path).unwrap();
+        let entry = &saved.servers["libera"];
+        assert_eq!(entry.server, "127.0.0.1");
+        assert_eq!(entry.port, 1);
+        assert_eq!(entry.password, "");
+        assert_eq!(entry.queries, vec!["bob".to_string()]);
+        assert_eq!(entry.proxy.as_ref().map(|proxy| proxy.port), Some(9050));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_nickname_only_commit_keeps_the_live_worker() {
+        // Arrange: one configured entry with a live fake worker and a
+        // viewed channel; only the nickname will change.
+        let path =
+            std::env::temp_dir().join(format!("termirc-wizard-nick-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(
+            &path,
+            "[servers.libera]\nusername = \"me\"\nnickname = \"old\"\nserver = \"irc.example.org\"\nuse_tls = false\nport = 6667\nchannels = [\"#one\"]\n",
+        )
+        .unwrap();
+        let mut config = crate::config::Config::load(&path).unwrap();
+        let mut app = App::new(40, 10);
+        let channel = app.open_channel("libera", "#one");
+        app.activate_buffer(channel);
+        app.open_config_dialog(&config);
+        {
+            let dialog = app.dialog.as_mut().unwrap();
+            dialog.pane = crate::tui::dialog::Pane::Form;
+            dialog.page = crate::tui::dialog::Page::Identity;
+            dialog.cursor = crate::tui::dialog::F_NICKNAME;
+        }
+        let (old_outgoing, _old_outgoing_rx) = tokio::sync::mpsc::channel(8);
+        let (old_control, _old_control_rx) = tokio::sync::mpsc::channel(8);
+        let old_sender = old_outgoing.clone();
+        let mut outgoing = std::collections::HashMap::from([(
+            "libera".to_string(),
+            ConnectionHandle {
+                outgoing: old_outgoing,
+                control: old_control,
+            },
+        )]);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut status = String::new();
+        let mut ctx = save_context(&mut config, &mut outgoing, &tx, &path, &mut status);
+
+        // Act: open the nickname field and commit a change.
+        handle_key_press(&mut app, KeyCode::Enter, false, false, &mut ctx);
+        for _ in 0..3 {
+            handle_key_press(&mut app, KeyCode::Backspace, false, false, &mut ctx);
+        }
+        for c in "new".chars() {
+            handle_key_press(&mut app, KeyCode::Char(c), false, false, &mut ctx);
+        }
+        handle_key_press(&mut app, KeyCode::Enter, false, false, &mut ctx);
+
+        // Assert: the live worker is untouched (same channel, no
+        // respawn) while memory and file still gain the new nickname,
+        // and the user's buffer keeps focus.
+        assert!(app.dialog.is_some());
+        assert_eq!(outgoing.len(), 1);
+        assert!(
+            outgoing["libera"].outgoing.same_channel(&old_sender),
+            "a nickname-only commit must keep the live worker"
+        );
+        assert_eq!(config.servers["libera"].nickname, "new");
+        assert_eq!(
+            crate::config::Config::load(&path).unwrap().servers["libera"].nickname,
+            "new"
+        );
+        assert_eq!(app.active_buffer().unwrap().id, channel);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn committing_a_renamed_label_replaces_the_entry_and_stops_the_old_worker() {
+        // Arrange: two entries, the first with a live fake worker.
+        let path =
+            std::env::temp_dir().join(format!("termirc-wizard-rename-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(
+            &path,
+            "[servers.alpha]\nusername = \"me\"\nnickname = \"me\"\nserver = \"irc.example.org\"\nuse_tls = false\nport = 6667\nchannels = [\"#one\"]\n\n[servers.beta]\nusername = \"you\"\nnickname = \"you\"\nserver = \"irc2.example.org\"\nuse_tls = false\nport = 6667\nchannels = []\n",
+        )
+        .unwrap();
+        let mut config = crate::config::Config::load(&path).unwrap();
+        let mut app = App::new(40, 10);
+        app.open_config_dialog(&config);
+        app.dialog.as_mut().unwrap().pane = crate::tui::dialog::Pane::Form;
+        let (old_outgoing, _old_outgoing_rx) = tokio::sync::mpsc::channel(8);
+        let (old_control, mut old_control_rx) = tokio::sync::mpsc::channel(8);
+        let mut outgoing = std::collections::HashMap::from([(
+            "alpha".to_string(),
+            ConnectionHandle {
+                outgoing: old_outgoing,
+                control: old_control,
+            },
+        )]);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut status = String::new();
+        let mut ctx = save_context(&mut config, &mut outgoing, &tx, &path, &mut status);
+
+        // Act: open the label field, append "2", commit the rename.
+        handle_key_press(&mut app, KeyCode::Enter, false, false, &mut ctx);
+        handle_key_press(&mut app, KeyCode::Char('2'), false, false, &mut ctx);
+        handle_key_press(&mut app, KeyCode::Enter, false, false, &mut ctx);
+
+        // Assert: the old worker is stopped and a new one runs under
+        // the new label.
+        assert!(!outgoing.contains_key("alpha"), "old label worker gone");
+        assert!(outgoing.contains_key("alpha2"), "new label worker spawned");
+        assert!(
+            matches!(
+                old_control_rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+            ),
+            "dropping the old handle must close its control channel"
+        );
+        // The file, the config map, and the dialog's list all replace
+        // the entry at its original position, and the form stays
+        // coherent on the renamed entry.
+        let saved = crate::config::Config::load(&path).unwrap();
+        assert!(!saved.servers.contains_key("alpha"));
+        assert_eq!(
+            saved.servers.keys().collect::<Vec<_>>(),
+            vec!["alpha2", "beta"]
+        );
+        assert_eq!(
+            config.servers.keys().collect::<Vec<_>>(),
+            vec!["alpha2", "beta"]
+        );
+        let dialog = app.dialog.as_ref().unwrap();
+        assert_eq!(
+            dialog
+                .entries
+                .iter()
+                .map(|(label, _)| label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha2", "beta"]
+        );
+        assert_eq!(dialog.selected.as_deref(), Some("alpha2"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_commit_with_bad_input_keeps_the_dialog_the_value_and_shows_the_reason() {
+        // Arrange: the host field of an existing entry, opened for
+        // editing and cleared.
+        let mut app = App::new(40, 10);
+        app.open_config_dialog(&two_server_config());
+        {
+            let dialog = app.dialog.as_mut().unwrap();
+            dialog.pane = crate::tui::dialog::Pane::Form;
+            dialog.cursor = crate::tui::dialog::F_HOST;
+        }
+        let path = std::env::temp_dir().join("termirc-wizard-invalid.toml");
+        let _ = std::fs::remove_file(&path);
+        let mut config = crate::config::Config::default();
+        let mut outgoing = std::collections::HashMap::new();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut status = String::new();
+        let mut ctx = save_context(&mut config, &mut outgoing, &tx, &path, &mut status);
+        handle_key_press(&mut app, KeyCode::Enter, false, false, &mut ctx);
+        for _ in 0.."irc.alpha.org".len() {
+            handle_key_press(&mut app, KeyCode::Backspace, false, false, &mut ctx);
+        }
+
+        // Act: the commit validates and fails.
+        handle_key_press(&mut app, KeyCode::Enter, false, false, &mut ctx);
+
+        // Assert: nothing was written or connected, the reason shows in
+        // the status row, and the dialog stays open with the edited
+        // value kept (the user must be able to fix it).
+        assert!(app.dialog.is_some());
+        let dialog = app.dialog.as_ref().unwrap();
+        assert_eq!(dialog.error, Some("dlg.err_host"));
+        assert!(!dialog.editing);
+        assert_eq!(dialog.field_text("dlg.field_host"), "");
+        assert!(config.servers.is_empty());
+        assert!(outgoing.is_empty());
+        assert!(!path.exists());
+    }
+
+    /// Two configured servers for wizard tests.
+    fn two_server_config() -> crate::config::Config {
+        crate::config::Config::parse(
+            r##"
+[servers.alpha]
+username = "me"
+nickname = "mynick"
+server = "irc.alpha.org"
+port = 6667
+channels = ["#one"]
+
+[servers.beta]
+username = "you"
+nickname = "yournick"
+server = "irc.beta.org"
+port = 7000
+channels = ["#three"]
+"##,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_confirmed_delete_removes_the_server_everywhere_and_previews_the_neighbor() {
+        // Arrange: two configured entries with a live fake worker for
+        // the first, its channel viewed, and the wizard on its list.
+        let path =
+            std::env::temp_dir().join(format!("termirc-wizard-delete-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(
+            &path,
+            "[servers.alpha]\nusername = \"me\"\nnickname = \"me\"\npassword = \"\"\nserver = \"irc.alpha.org\"\nuse_tls = false\nport = 6667\nchannels = [\"#one\"]\n\n[servers.beta]\nusername = \"you\"\nnickname = \"you\"\npassword = \"\"\nserver = \"irc.beta.org\"\nuse_tls = false\nport = 6667\nchannels = []\n",
+        )
+        .unwrap();
+        let mut config = crate::config::Config::load(&path).unwrap();
+        let mut app = App::new(40, 10);
+        app.session.register_server("beta", &config.servers["beta"]);
+        app.session
+            .register_server("alpha", &config.servers["alpha"]);
+        let channel = app.open_channel("alpha", "#one");
+        app.activate_buffer(channel);
+        app.open_config_dialog(&config);
+        let (old_outgoing, _old_outgoing_rx) = tokio::sync::mpsc::channel(8);
+        let (old_control, mut old_control_rx) = tokio::sync::mpsc::channel(8);
+        let mut outgoing = std::collections::HashMap::from([(
+            "alpha".to_string(),
+            ConnectionHandle {
+                outgoing: old_outgoing,
+                control: old_control,
+            },
+        )]);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut status = String::new();
+        let mut ctx = save_context(&mut config, &mut outgoing, &tx, &path, &mut status);
+
+        // Act: arm with the first `d`, confirm with the second.
+        handle_key_press(&mut app, KeyCode::Char('d'), false, false, &mut ctx);
+        handle_key_press(&mut app, KeyCode::Char('d'), false, false, &mut ctx);
+
+        // Assert: the file, memory, and worker map all dropped the
+        // entry; the worker's control channel closed; the server's
+        // buffers closed with the active buffer falling back; and the
+        // dialog stayed open previewing the surviving neighbor.
+        assert!(app.dialog.is_some(), "the dialog stays open");
+        let saved = crate::config::Config::load(&path).unwrap();
+        assert!(!saved.servers.contains_key("alpha"));
+        assert!(saved.servers.contains_key("beta"));
+        assert!(!config.servers.contains_key("alpha"));
+        assert!(outgoing.is_empty(), "the worker handle was dropped");
+        assert!(
+            matches!(
+                old_control_rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+            ),
+            "dropping the handle must close its control channel"
+        );
+        assert!(app.buffer(channel).is_none(), "the channel buffer closed");
+        assert_eq!(
+            app.active_buffer().map(|buffer| buffer.id),
+            Some(app.session.open_server("beta")),
+            "the fallback lands on a survivor's console"
+        );
+        let dialog = app.dialog.as_ref().unwrap();
+        assert_eq!(
+            dialog
+                .entries
+                .iter()
+                .map(|(label, _)| label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["beta"]
+        );
+        assert_eq!(dialog.selected.as_deref(), Some("beta"));
+        assert_eq!(dialog.field_text("dlg.field_host"), "irc.beta.org");
+        assert_eq!(dialog.error, None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_failed_delete_keeps_the_dialog_open_with_the_reason() {
+        // Arrange: a valid dialog, but a config path that cannot be
+        // written (a directory stands where the file belongs).
+        let dir =
+            std::env::temp_dir().join(format!("termirc-wizard-delete-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::create_dir(&path).unwrap();
+        let mut config = two_server_config();
+        let mut app = App::new(40, 10);
+        app.open_config_dialog(&config);
+        let mut outgoing = std::collections::HashMap::new();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut status = String::new();
+        let mut ctx = save_context(&mut config, &mut outgoing, &tx, &path, &mut status);
+
+        // Act: arm and confirm the delete of the first entry.
+        handle_key_press(&mut app, KeyCode::Char('d'), false, false, &mut ctx);
+        handle_key_press(&mut app, KeyCode::Char('d'), false, false, &mut ctx);
+
+        // Assert: nothing was removed, the reason shows on the status
+        // row, the arm is gone, and the dialog stays open.
+        assert!(app.dialog.is_some());
+        let dialog = app.dialog.as_ref().unwrap();
+        assert_eq!(dialog.error, Some("err.cfg_write"));
+        assert!(dialog.delete_armed.is_none());
+        assert_eq!(dialog.entries.len(), 2);
+        assert!(config.servers.contains_key("alpha"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

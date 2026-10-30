@@ -7,6 +7,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Servers can be deleted from the hub's list: with the sidebar
+  focused on an entry, `d` arms the delete (the footer hint switches
+  to "Press d again to delete · Esc cancels") and a second `d` within
+  three seconds removes the server — its `[servers.<name>]` section
+  from `config.toml`, its worker, and its buffers. Any other key, the
+  deadline passing, or a failed write cancels; the wizard stays open.
+
+### Changed
+
+- The setup wizard is now a fullscreen hub modeled 1:1 on the
+  `/model` picker's chrome: the whole terminal becomes a
+  `╭─ Server configuration ─┬─╮` frame while it is open (no chat,
+  sidebar, or composer underneath), with the server list left of the
+  `│` divider — `❯` cursor lane, a `●`/`+` icon lane, bold-accent
+  selection, full-width band, separator rule — and the paged form on
+  the right under a muted status row (`label · host`, or the pending
+  validation error) and a powerline segment track: the active page is
+  a filled chip in its own color, the others carry their position
+  colors joined by a thin separator. Field rows carry the `❯ ` focus
+  prefix instead of the old `┃` cursor, `→`/`←` switch panes (← from
+  the form always returns to the sidebar), `PageUp`/`PageDown`
+  turn pages from any pane, and a dim footer hint (`Enter edit · ↑/↓
+  fields · ←/→ panes · PgUp/PgDn page · Esc cancel`) replaces the
+  in-form footer buttons.
+- Editing the hub's form is WYSIWYG: what the screen shows is the
+  saved configuration. Every commit (`Enter`, or `Tab` which also
+  advances) and every toggle flip writes `config.toml` immediately —
+  there is no save action and no unsaved marker anymore, and the
+  dialog stays open for further browsing/editing; only `Esc` (outside
+  an open field) closes it. A validation failure keeps the dialog and
+  the committed value in place and shows the reason on the status
+  row. The footer actions pane is gone: `Tab` walks the fields and
+  turns pages at a field edge, and together with `→`/`←` cycles the
+  sidebar and the form. A worker respawn happens only when the label
+  or a connection-affecting field (host, port, TLS, username,
+  password, SASL pair, proxy) changed — a nickname or channels edit
+  keeps the live connection. Renaming an entry replaces its
+  `[servers.<old>]` section (proxy included) in place instead of
+  appending a duplicate, preserves the file's entry order, and moves
+  the worker to the new label.
+- Fields edit through an explicit edit mode, like the chat composer:
+  `Enter` opens the focused text field with the terminal's real
+  cursor at the value's caret (the TLS toggle flips in place
+  instead), typing lands only while the field is open, `Enter`
+  commits, `Tab` commits and advances, and `Esc` discards — the dim
+  helper row under the fields swaps to `Enter apply · Esc discard`
+  meanwhile.
+
+### Added
+
+- In-TUI server configuration wizard: on first run (no
+  `~/.config/termirc/config.toml`, or one without servers) the client
+  boots to a modal setup wizard instead of exiting. The wizard is a
+  two-pane form modeled after the `/model` picker style: the left
+  column lists every configured server plus a `＋ new server` row, the
+  right column edits the selection across three sequential pages —
+  connection (name/host/port/TLS), identity (nickname, username,
+  server password, SASL pair), and channels (pre-join channels and
+  query nicknames). `Tab` walks the form's fields (turning a page at
+  a field edge) and, with `→`/`←`, cycles the list and the form,
+  `PageUp`/`PageDown` turn pages from any pane, `n` starts a new
+  entry, and the panel paints over the content beneath it instead of
+  letting it bleed through. Committing validates with the same rules
+  `Config::parse` enforces and writes the file atomically; only
+  non-server tables (`[theme]`, `[history]`, ...) still need a
+  restart. The
+  wizard's writer (`config::save_server`) owns every key the form
+  shows — `password` and `queries` included — and preserves `proxy`
+  and unrelated keys verbatim; a missing `password` key now defaults
+  to empty instead of failing the parse. `/config` reopens the wizard,
+  and cancelling the first-run wizard keeps the client usable: the
+  welcome page shows a dim hint and `c` reopens the wizard there
+  (that page has no composer to type `/config` into), while
+  `Esc`/`Ctrl+C` still quit.
+
 ## [0.9.0] — 2026-10-28
 
 ### Changed

@@ -16,6 +16,7 @@ use crate::theme::ThemeTable;
 pub struct ServerConfig {
     pub username: String,
     pub nickname: String,
+    #[serde(default)]
     pub password: String,
     pub server: String,
     #[serde(default)]
@@ -300,6 +301,337 @@ impl Config {
             .next()
             .map(|(name, server)| (name.as_str(), server))
     }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            servers: IndexMap::new(),
+            history: HistoryConfig::default(),
+            theme: ThemeTable::default(),
+        }
+    }
+}
+
+/// The `[servers.<name>]` keys the setup wizard owns. `save_server`
+/// replaces exactly these inside the target section and leaves every
+/// other key (proxy, user comments) verbatim, so re-running the wizard
+/// can never destroy what it does not model.
+const WIZARD_KEYS: &[&str] = &[
+    "username",
+    "nickname",
+    "password",
+    "server",
+    "use_tls",
+    "port",
+    "channels",
+    "queries",
+    "sasl_username",
+    "sasl_password",
+];
+
+/// Escape a TOML basic string: backslash, quote, and control characters
+/// (as `\uXXXX`), so any user input round-trips through `Config::parse`.
+fn escape_toml_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    for character in value.chars() {
+        match character {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push_str(&format!("\\u{:04X}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Emit one `[servers.<name>]` section in the style of
+/// `config.example.toml`. Every wizard-owned key is emitted except an
+/// empty password, which is indistinguishable from an absent one (no
+/// PASS command either way) and would only add noise; `queries`, like
+/// `channels`, always emits so the array reads as one block. The
+/// wizard-unmodeled keys (proxy) are omitted here; `save_server`'s
+/// merge keeps any existing copy of them instead.
+fn emit_server_table(name: &str, server: &ServerConfig) -> String {
+    let mut out = format!("[servers.{name}]\n");
+    let string = |key: &str, value: &str| format!("{key} = \"{}\"\n", escape_toml_string(value));
+    out.push_str(&string("username", &server.username));
+    out.push_str(&string("nickname", &server.nickname));
+    if !server.password.is_empty() {
+        out.push_str(&string("password", &server.password));
+    }
+    out.push_str(&string("server", &server.server));
+    out.push_str(&format!("use_tls = {}\n", server.use_tls));
+    out.push_str(&format!("port = {}\n", server.port));
+    let list = |values: &[String]| {
+        values
+            .iter()
+            .map(|value| format!("\"{}\"", escape_toml_string(value)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    out.push_str(&format!("channels = [{}]\n", list(&server.channels)));
+    out.push_str(&format!("queries = [{}]\n", list(&server.queries)));
+    if let (Some(username), Some(password)) = (&server.sasl_username, &server.sasl_password) {
+        out.push_str(&string("sasl_username", username));
+        out.push_str(&string("sasl_password", password));
+    }
+    out
+}
+
+/// The name inside a `[servers.<name>]` header line: a bare key or a
+/// quoted basic string. `None` for any other line.
+fn section_name(header: &str) -> Option<String> {
+    let body = header.trim().strip_prefix("[servers.")?;
+    let body = body.strip_suffix(']')?;
+    let body = body.trim();
+    if let Some(quoted) = body.strip_prefix('"') {
+        let end = quoted.rfind('"')?;
+        let inner = &quoted[..end];
+        // Unescape the two escapes the emitter and TOML share.
+        return Some(inner.replace("\\\"", "\"").replace("\\\\", "\\"));
+    }
+    Some(body.to_string())
+}
+
+/// Merge one emitted server section into existing config text, or
+/// append it when no such section exists. Dotted-key spellings
+/// (`servers.name.host = ...`) are not merged: they coexist as separate
+/// keys, the post-merge re-parse then fails on the duplicated table,
+/// and `save_server` refuses to write — never a half-updated file.
+fn merge_server_section(existing: &str, name: &str, emitted: &str) -> String {
+    let lines: Vec<&str> = existing.lines().collect();
+    let mut section_start = None;
+    let mut section_end = lines.len();
+    let subtable_prefix = format!("[servers.{name}.");
+    for (index, line) in lines.iter().enumerate() {
+        let Some(found) = section_name(line) else {
+            continue;
+        };
+        if found == name {
+            section_start = Some(index);
+            // The section runs until the next header that is not one of
+            // its own sub-tables (`[servers.<name>.proxy]`, ...).
+            section_end = lines[index + 1..]
+                .iter()
+                .position(|next| {
+                    next.trim().starts_with('[') && !next.trim().starts_with(&subtable_prefix)
+                })
+                .map_or(lines.len(), |offset| index + 1 + offset);
+            break;
+        }
+    }
+    let Some(start) = section_start else {
+        // No section yet: append at the end, keeping the file's own
+        // trailing-newline shape.
+        let separator = if existing.is_empty() { "" } else { "\n" };
+        return format!("{existing}{separator}{emitted}");
+    };
+    let mut merged: Vec<String> = lines[..start].iter().map(|l| l.to_string()).collect();
+    merged.push(lines[start].to_string());
+    // The wizard-owned top-level keys live between the section header and
+    // its first sub-table (proxy, ...); from that header on everything
+    // stays verbatim, including keys that share a name with owned ones.
+    let body_end = lines[start + 1..section_end]
+        .iter()
+        .position(|line| line.trim().starts_with('['))
+        .map_or(section_end, |offset| start + 1 + offset);
+    let mut replaced = false;
+    for line in &lines[start + 1..body_end] {
+        let key = line
+            .split('=')
+            .next()
+            .map(str::trim)
+            .filter(|key| !key.is_empty() && !key.contains('.'));
+        if key.is_some_and(|key| WIZARD_KEYS.contains(&key)) {
+            // The first owned key marks where the fresh block goes.
+            if !replaced {
+                merged.extend(emitted.lines().skip(1).map(str::to_string));
+                replaced = true;
+            }
+        } else {
+            merged.push(line.to_string());
+        }
+    }
+    if !replaced {
+        // A section with no owned keys yet (only unknown keys/comments):
+        // insert the block right after the header.
+        let block: Vec<String> = emitted.lines().skip(1).map(str::to_string).collect();
+        let insert_at = merged.len();
+        merged.splice(insert_at..insert_at, block);
+    }
+    merged.extend(lines[body_end..].iter().map(|l| l.to_string()));
+    merged.join("\n") + "\n"
+}
+
+/// Split existing config text around one `[servers.<name>]` section
+/// (its sub-tables included): `(before, after)` with the section gone.
+/// A missing section returns the whole text as `before` — the caller
+/// only passes a label it read from the same file.
+fn split_server_section(existing: &str, name: &str) -> (String, String) {
+    let lines: Vec<&str> = existing.lines().collect();
+    let mut section_start = None;
+    let mut section_end = lines.len();
+    let subtable_prefix = format!("[servers.{name}.");
+    for (index, line) in lines.iter().enumerate() {
+        if section_name(line).is_some_and(|found| found == name) {
+            section_start = Some(index);
+            // The section runs until the next header that is not one of
+            // its own sub-tables (`[servers.<name>.proxy]`, ...).
+            section_end = lines[index + 1..]
+                .iter()
+                .position(|next| {
+                    next.trim().starts_with('[') && !next.trim().starts_with(&subtable_prefix)
+                })
+                .map_or(lines.len(), |offset| index + 1 + offset);
+            break;
+        }
+    }
+    if section_start.is_none() {
+        return (existing.to_string(), String::new());
+    }
+    let start = section_start.unwrap();
+    // The blank separator line before the section belongs to it, so the
+    // renamed section does not accumulate gaps; the one after stays with
+    // the tail.
+    let start = if start > 0 && lines[start - 1].trim().is_empty() {
+        start - 1
+    } else {
+        start
+    };
+    let before = lines[..start].join("\n");
+    let tail = lines[section_end..].join("\n");
+    (before, tail)
+}
+
+/// Persist one server entry at `path`, merging into any existing file.
+/// `previous` is the entry's former label when the wizard renamed it:
+/// its whole `[servers.<previous>]` section (proxy sub-table included)
+/// is dropped in the same write, so a rename replaces instead of
+/// duplicating.
+///
+/// The merged text is validated with [`Config::parse`] before anything
+/// is written, so a wizard entry that contradicts the rest of the file
+/// (a case-insensitive name clash, a broken proxy left behind, ...) is
+/// rejected instead of producing a file the next start cannot load.
+/// The write itself is atomic: a temporary file in the same directory,
+/// then `rename` over the target.
+pub fn save_server(
+    path: &Path,
+    previous: Option<&str>,
+    name: &str,
+    server: &ServerConfig,
+) -> anyhow::Result<()> {
+    let existing = read_existing(path)?;
+    // A rename replaces in place: the new section merges into the text
+    // before the old one and the tail is appended after it, so file
+    // order around the entry never changes.
+    let mut text = existing;
+    let mut tail = String::new();
+    if let Some(previous) = previous.filter(|previous| *previous != name) {
+        let (before, after) = split_server_section(&text, previous);
+        text = before.trim_end().to_string();
+        tail = after;
+    }
+    let merged = merge_server_section(&text, name, &emit_server_table(name, server));
+    let merged = if tail.is_empty() {
+        merged
+    } else {
+        format!("{merged}\n{tail}\n")
+    };
+    Config::parse(&merged).map_err(|error| {
+        // Log only the top-level context: the toml error chain can embed
+        // the offending source line, which may persist SASL passwords.
+        tracing::warn!(target: "termirc::config", "rejected config merge: {}", error);
+        anyhow::anyhow!("{}", i18n::t("err.cfg_write"))
+    })?;
+    atomic_write(path, &merged)
+}
+
+/// Drop one `[servers.<name>]` section (proxy sub-table included) from
+/// the file at `path`. Read and write semantics mirror
+/// [`save_server`]: only a genuinely missing file is tolerated (a
+/// no-op), the merged text must re-parse, and the write is atomic.
+pub fn remove_server(path: &Path, name: &str) -> anyhow::Result<()> {
+    let existing = read_existing(path)?;
+    let (before, after) = split_server_section(&existing, name);
+    // Splice the tail back onto the head with a single blank line
+    // between them, mirroring how the section was laid out; removing
+    // the last section leaves whatever non-server tables remain.
+    let mut merged = if after.trim().is_empty() {
+        format!("{}\n", before.trim_end())
+    } else {
+        format!(
+            "{}\n\n{}",
+            before.trim_end(),
+            after.trim_start_matches('\n')
+        )
+    };
+    // `Config` requires the `servers` field to be present, so removing
+    // the last entry must leave an explicit empty table for the file to
+    // reload (an empty `servers` map is exactly the state that reopens
+    // the wizard on the next start).
+    if !merged.contains("[servers.") {
+        merged.push_str("[servers]\n");
+    }
+    Config::parse(&merged).map_err(|error| {
+        // Log only the top-level context: the toml error chain can embed
+        // the offending source line, which may persist SASL passwords.
+        tracing::warn!(target: "termirc::config", "rejected config removal: {}", error);
+        anyhow::anyhow!("{}", i18n::t("err.cfg_write"))
+    })?;
+    atomic_write(path, &merged)
+}
+
+/// Read the config file at `path` for a writer pass. Only a genuinely
+/// missing file means "start from scratch". Treating any other read
+/// failure (permissions, invalid UTF-8, a directory) as an empty file
+/// would rewrite it with just the wizard's section and silently lose
+/// everything else.
+fn read_existing(path: &Path) -> anyhow::Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(error).with_context(|| {
+            i18n::format(
+                i18n::t("err.cfg_write"),
+                &[("path", &path.display().to_string())],
+            )
+        }),
+    }
+}
+
+/// Validate-then-atomically-replace is shared by every config writer:
+/// callers validate the merged text themselves, this creates missing
+/// parent directories and lands the file through a same-directory
+/// temporary plus `rename`, leaving no `.tmp` behind on failure.
+fn atomic_write(path: &Path, text: &str) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            i18n::format(
+                i18n::t("err.cfg_write"),
+                &[("path", &path.display().to_string())],
+            )
+        })?;
+    }
+    let temp = path.with_extension("toml.tmp");
+    if let Err(error) = std::fs::write(&temp, text).and_then(|_| std::fs::rename(&temp, path)) {
+        // Do not leave a partial or misleading `*.toml.tmp` behind when
+        // the atomic write never landed.
+        let _ = std::fs::remove_file(&temp);
+        return Err(error).with_context(|| {
+            i18n::format(
+                i18n::t("err.cfg_write"),
+                &[("path", &path.display().to_string())],
+            )
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -797,5 +1129,358 @@ channels = ["#chat"]
         // Assert
         assert!(!debug.contains("proxy-secret-token"), "leaked: {debug}");
         assert!(debug.contains("<redacted>"));
+    }
+
+    /// A unique, cleaned temp path for writer tests.
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("termirc-cfg-{}-{tag}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    fn wizard_server() -> ServerConfig {
+        // Parsed (not hand-built) so the entry always matches the file
+        // format exactly.
+        Config::parse(
+            r##"
+[servers.new]
+username = "me"
+nickname = "me"
+password = ""
+server = "irc.example.org"
+use_tls = true
+port = 6697
+channels = ["#a"]
+"##,
+        )
+        .unwrap()
+        .servers["new"]
+            .clone()
+    }
+
+    #[test]
+    fn the_shipped_example_configuration_parses() {
+        // The example is the documented starting point; the wizard's
+        // writer mirrors its formatting, so it must never drift into
+        // something `Config::parse` rejects.
+        let config = Config::parse(include_str!("../config.example.toml")).unwrap();
+        assert!(config.servers.contains_key("example"));
+        assert_eq!(config.servers["example"].port, 6697);
+    }
+
+    #[test]
+    fn save_server_creates_a_parseable_file_and_round_trips() {
+        // Arrange
+        let path = temp_path("fresh");
+        let server = wizard_server();
+
+        // Act
+        save_server(&path, None, "new", &server).unwrap();
+        let saved = Config::load(&path).unwrap();
+
+        // Assert
+        assert_eq!(saved.servers["new"].server, "irc.example.org");
+        assert_eq!(saved.servers["new"].port, 6697);
+        assert!(saved.servers["new"].use_tls);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_server_replaces_the_wizard_keys_and_preserves_the_rest() {
+        // Arrange: an existing file with keys the wizard owns (password,
+        // queries — cleared in the saved form) plus keys it does not
+        // model (proxy, comments) and another table.
+        let path = temp_path("merge");
+        std::fs::write(
+            &path,
+            "# my setup\n[servers.old]\nusername = \"x\"\nnickname = \"x\"\npassword = \"keep\"\nserver = \"old.example\"\nport = 6667\nchannels = []\nqueries = [\"alice\"]\n\n[servers.old.proxy]\ntype = \"socks5\"\nhost = \"127.0.0.1\"\nport = 9050\n\n[ui]\nlanguage = \"zh-CN\"\n",
+        )
+        .unwrap();
+        let mut server = wizard_server();
+        server.nickname = "renamed".into();
+        server.channels = vec!["#b".into(), "#c".into()];
+
+        // Act
+        save_server(&path, None, "old", &server).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+
+        // Assert: the wizard's keys are the new ones (its cleared
+        // password and queries erase the old values), everything it
+        // does not model survives verbatim, and the file still loads.
+        let saved = Config::load(&path).unwrap();
+        let merged = &saved.servers["old"];
+        assert_eq!(merged.nickname, "renamed");
+        assert_eq!(merged.username, "me");
+        assert_eq!(merged.server, "irc.example.org");
+        assert_eq!(merged.port, 6697);
+        assert!(merged.use_tls);
+        assert_eq!(merged.channels, vec!["#b".to_string(), "#c".to_string()]);
+        assert_eq!(merged.password, "");
+        assert!(merged.queries.is_empty());
+        assert!(merged.proxy.is_some());
+        assert_eq!(saved.servers.len(), 1);
+        assert!(text.contains("# my setup"));
+        assert!(text.contains("language = \"zh-CN\""));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_server_creates_missing_parent_directories() {
+        // Arrange: a nested path whose directories do not exist yet, so
+        // the `create_dir_all` branch (and the same-directory temp rename)
+        // is actually exercised — the other writer tests all use
+        // `std::env::temp_dir()` directly.
+        let root = std::env::temp_dir().join(format!("termirc-cfg-nested-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let path = root.join("deep").join("config.toml");
+
+        // Act
+        save_server(&path, None, "new", &wizard_server()).unwrap();
+
+        // Assert: the tree and file exist, the file reloads, and no temp
+        // file was left behind.
+        let saved = Config::load(&path).unwrap();
+        assert_eq!(saved.servers["new"].server, "irc.example.org");
+        assert!(path.exists());
+        assert!(!path.with_extension("toml.tmp").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn save_server_refuses_an_unreadable_config_instead_of_rewriting_it() {
+        // Arrange: an existing file that is not UTF-8 (the read fails with
+        // InvalidData, as a permission error would with PermissionDenied)
+        // and a directory where the config file is expected.
+        let invalid = temp_path("invalid-utf8");
+        std::fs::write(&invalid, [0xff, 0xfe, 0x00]).unwrap();
+        let as_directory =
+            std::env::temp_dir().join(format!("termirc-cfg-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&as_directory);
+        std::fs::create_dir_all(&as_directory).unwrap();
+
+        // Act
+        let invalid_result = save_server(&invalid, None, "new", &wizard_server());
+        let directory_result = save_server(&as_directory, None, "new", &wizard_server());
+
+        // Assert: both report the write failure and leave the target as it
+        // was instead of replacing it with just the wizard's section.
+        let expected = |path: &std::path::Path| {
+            i18n::format(
+                i18n::t("err.cfg_write"),
+                &[("path", &path.display().to_string())],
+            )
+        };
+        let error = invalid_result.unwrap_err().to_string();
+        assert_eq!(error, expected(&invalid));
+        assert_eq!(std::fs::read(&invalid).unwrap(), [0xff, 0xfe, 0x00]);
+        assert!(!invalid.with_extension("toml.tmp").exists());
+
+        let error = directory_result.unwrap_err().to_string();
+        assert_eq!(error, expected(&as_directory));
+        assert!(as_directory.is_dir());
+        assert!(!as_directory.with_extension("toml.tmp").exists());
+
+        let _ = std::fs::remove_file(&invalid);
+        let _ = std::fs::remove_dir_all(&as_directory);
+    }
+
+    #[test]
+    fn save_server_renaming_a_label_replaces_the_old_section_in_place() {
+        // Arrange: two entries, the first carrying a proxy sub-table, so
+        // the rename must drop the old section (proxy included) while
+        // keeping the sibling and carrying the form's values in.
+        let path = temp_path("rename");
+        std::fs::write(
+            &path,
+            "[servers.old]\nusername = \"x\"\nnickname = \"x\"\nserver = \"old.example\"\nport = 6667\nchannels = []\n\n[servers.old.proxy]\ntype = \"socks5\"\nhost = \"127.0.0.1\"\nport = 9050\n\n[servers.keeper]\nusername = \"k\"\nnickname = \"k\"\nserver = \"keep.example\"\nport = 6667\nchannels = []\n",
+        )
+        .unwrap();
+        let mut renamed = wizard_server();
+        renamed.server = "irc2.example.org".into();
+
+        // Act: the wizard committed a changed label.
+        save_server(&path, Some("old"), "second", &renamed).unwrap();
+
+        // Assert: the old section (its proxy included) is gone, the
+        // sibling stays, and the new section holds the form's values.
+        let saved = Config::load(&path).unwrap();
+        assert_eq!(saved.servers.len(), 2);
+        assert!(!saved.servers.contains_key("old"));
+        assert_eq!(saved.servers["second"].server, "irc2.example.org");
+        assert_eq!(saved.servers["second"].nickname, "me");
+        assert!(saved.servers["second"].proxy.is_none());
+        assert_eq!(saved.servers["keeper"].server, "keep.example");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("socks5"), "{text}");
+        assert!(!text.contains("old.example"), "{text}");
+        // File order is preserved: the renamed entry keeps the old
+        // section's position.
+        assert_eq!(
+            saved.servers.keys().collect::<Vec<_>>(),
+            vec!["second", "keeper"]
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_server_refuses_a_rename_onto_a_clashing_label_and_keeps_the_file() {
+        // Arrange: two entries whose labels clash ASCII-case-insensitively.
+        let path = temp_path("rename-clash");
+        save_server(&path, None, "Libera", &wizard_server()).unwrap();
+        save_server(&path, None, "other", &wizard_server()).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        // Act: rename `other` onto the clashing label.
+        let result = save_server(&path, Some("other"), "libera", &wizard_server());
+
+        // Assert: rejected, and the file on disk is untouched.
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        let _ = std::fs::remove_file(&path);
+    }
+    #[test]
+    fn save_server_replaces_the_wizard_owned_password_and_queries() {
+        // Arrange: an existing file whose entry carries a password and
+        // queries; the wizard saves with both cleared.
+        let path = temp_path("owned");
+        std::fs::write(
+            &path,
+            "[servers.old]\nusername = \"x\"\nnickname = \"x\"\npassword = \"keep\"\nserver = \"old.example\"\nport = 6667\nchannels = []\nqueries = [\"alice\"]\n",
+        )
+        .unwrap();
+        let server = wizard_server(); // password empty, queries empty
+
+        // Act
+        save_server(&path, None, "old", &server).unwrap();
+
+        // Assert: the cleared wizard keys are gone from the file —
+        // saving the form must be able to erase what the form shows.
+        let saved = Config::load(&path).unwrap();
+        assert_eq!(saved.servers["old"].password, "");
+        assert!(saved.servers["old"].queries.is_empty());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("\"keep\""), "{text}");
+        assert!(!text.contains("\"alice\""), "{text}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_server_round_trips_a_password_and_queries() {
+        // Arrange: a wizard entry carrying both.
+        let path = temp_path("credentials");
+        let mut server = wizard_server();
+        server.password = "s3cret pa55".into();
+        server.queries = vec!["alice".into(), "bob".into()];
+
+        // Act
+        save_server(&path, None, "new", &server).unwrap();
+
+        // Assert: both keys reload exactly as saved.
+        let saved = Config::load(&path).unwrap();
+        assert_eq!(saved.servers["new"].password, "s3cret pa55");
+        assert_eq!(
+            saved.servers["new"].queries,
+            vec!["alice".to_string(), "bob".to_string()]
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_server_refuses_a_merge_that_would_not_reload() {
+        // Arrange: an existing SERVER key whose ASCII-case-insensitive
+        // identity clashes with the wizard's label.
+        let path = temp_path("clash");
+        save_server(&path, None, "Libera", &wizard_server()).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        // Act
+        let result = save_server(&path, None, "libera", &wizard_server());
+
+        // Assert: rejected, and the file on disk is unchanged.
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_server_escapes_toml_specials_in_emitted_strings() {
+        // Arrange
+        let path = temp_path("escape");
+        let mut server = wizard_server();
+        server.username = "a\"b\\c\u{1}".into();
+
+        // Act
+        save_server(&path, None, "esc", &server).unwrap();
+
+        // Assert: the loaded values are the originals, byte for byte.
+        let saved = Config::load(&path).unwrap();
+        assert_eq!(saved.servers["esc"].username, "a\"b\\c\u{1}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn remove_server_drops_the_section_and_its_proxy_and_keeps_the_rest() {
+        // Arrange: two entries — the first with a proxy sub-table and a
+        // comment of its own — plus a `[history]` table and a top comment.
+        let path = temp_path("remove-one");
+        std::fs::write(
+            &path,
+            "# top comment\n[servers.alpha]\nusername = \"me\"\nnickname = \"me\"\npassword = \"\"\nserver = \"irc.alpha.org\"\nuse_tls = false\nport = 6667\nchannels = [\"#one\"]\n\n[servers.alpha.proxy]\ntype = \"socks5\"\nhost = \"127.0.0.1\"\nport = 9050\n\n[servers.beta]\nusername = \"you\"\nnickname = \"you\"\npassword = \"\"\nserver = \"irc.beta.org\"\nuse_tls = false\nport = 6667\nchannels = []\n\n[history]\npersist = true\n",
+        )
+        .unwrap();
+
+        // Act
+        remove_server(&path, "alpha").unwrap();
+
+        // Assert: the section and its proxy sub-table are gone, the
+        // sibling, the `[history]` table, and the top comment stay, and
+        // the result reloads without the entry.
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("alpha"), "{text}");
+        assert!(!text.contains("proxy"), "{text}");
+        assert!(text.contains("# top comment"), "{text}");
+        assert!(text.contains("[servers.beta]"), "{text}");
+        assert!(text.contains("[history]"), "{text}");
+        let saved = Config::load(&path).unwrap();
+        assert!(!saved.servers.contains_key("alpha"));
+        assert!(saved.servers.contains_key("beta"));
+        assert!(saved.history.persist);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn remove_server_removing_the_last_server_leaves_a_parseable_file() {
+        // Arrange
+        let path = temp_path("remove-last");
+        save_server(&path, None, "only", &wizard_server()).unwrap();
+
+        remove_server(&path, "only").unwrap();
+
+        // Assert: a serverless file is valid (the wizard reopens on it).
+        let saved = Config::load(&path).unwrap();
+        assert!(saved.servers.is_empty());
+
+        // A subsequent save merges into the bare `[servers]` header
+        // without tripping over it.
+        save_server(&path, None, "fresh", &wizard_server()).unwrap();
+        assert!(Config::load(&path).unwrap().servers.contains_key("fresh"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn remove_server_refuses_an_unreadable_config_instead_of_rewriting_it() {
+        // Arrange: a directory where the config file is expected, so the
+        // read fails with something other than NotFound.
+        let dir = std::env::temp_dir().join(format!("termirc-cfg-{}-dir", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::create_dir(&path).unwrap();
+
+        // Act / Assert: the error propagates and no temp file is left.
+        assert!(remove_server(&path, "alpha").is_err());
+        assert!(!dir.join("config.toml.tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

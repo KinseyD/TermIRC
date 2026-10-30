@@ -36,6 +36,7 @@ pub enum CommandAction {
     Connect(Option<String>),
     Reconnect(Option<String>),
     Disconnect(String),
+    Config,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,10 +114,12 @@ impl SlashCommand {
             "mode" => Ok(Mode(args.to_string())),
             "whois" if single && crate::core::valid_query_nickname(args) => Ok(Whois(args.into())),
             "whois" => Err(CommandError::InvalidArguments),
+            "config" if args.is_empty() => Ok(Config),
             "connect" if args.is_empty() || single => Ok(Connect(optional())),
             "reconnect" if args.is_empty() || single => Ok(Reconnect(optional())),
+            "connect" | "reconnect" => Err(CommandError::InvalidArguments),
             "disconnect" | "quit" => Ok(Disconnect(args.into())),
-            "nick" | "back" | "connect" | "reconnect" => Err(CommandError::InvalidArguments),
+            "nick" | "back" | "config" => Err(CommandError::InvalidArguments),
             _ => Err(CommandError::Unsupported),
         }
     }
@@ -157,7 +160,7 @@ fn channel_argument(args: &str, single: bool) -> Result<Option<String>, CommandE
 /// bar lists them. Kept beside the parser so a new command cannot gain an
 /// action without also gaining its hint text. Command names are wire tokens
 /// and stay untranslated; only the description resolves through the catalog.
-pub(crate) const COMMANDS: [(&str, &str); 17] = [
+pub(crate) const COMMANDS: [(&str, &str); 18] = [
     ("join", "cmd.join"),
     ("part", "cmd.part"),
     ("query", "cmd.query"),
@@ -175,6 +178,7 @@ pub(crate) const COMMANDS: [(&str, &str); 17] = [
     ("reconnect", "cmd.reconnect"),
     ("disconnect", "cmd.disconnect"),
     ("quit", "cmd.quit"),
+    ("config", "cmd.config"),
 ];
 
 #[cfg(test)]
@@ -418,6 +422,7 @@ mod tests {
                 CommandAction::Disconnect("bye all".into()),
             ),
             ("/quit", CommandAction::Disconnect(String::new())),
+            ("/config", CommandAction::Config),
         ] {
             assert_eq!(
                 parse_slash_command(input).unwrap().unwrap().action(),
@@ -436,6 +441,7 @@ mod tests {
             "/nick a,b",
             "/back now",
             "/connect a b",
+            "/config anything",
             "/reconnect a b",
             "/away hi\r\nQUIT",
             "/quit a\0b",
@@ -525,7 +531,8 @@ mod tests {
                 "connect",
                 "reconnect",
                 "disconnect",
-                "quit"
+                "quit",
+                "config"
             ]
         );
     }

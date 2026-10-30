@@ -78,9 +78,53 @@ const REGISTRY: &[(&str, &str)] = &[
         "cmd.quit",
         "Alias for disconnect; the application stays open",
     ),
+    ("cmd.config", "Open the server configuration wizard"),
     // hint.* — standing TUI chrome. Key names (Esc, PgUp/PgDn) stay verbatim
     // in every language.
     ("hint.tips", "Esc quit · Enter send · PgUp/PgDn scroll"),
+    // welcome.* — the empty welcome page (no buffer viewed).
+    ("welcome.config_hint", "Press c to configure a server"),
+    // dlg.* — the modal setup wizard (first run and /config).
+    ("dlg.title", "Server configuration"),
+    ("dlg.new_server", "new server"),
+    ("dlg.page_connection", "connection"),
+    ("dlg.page_identity", "identity"),
+    ("dlg.page_channels", "channels"),
+    (
+        "dlg.hub_hint",
+        "Enter edit · ↑/↓ fields · ←/→ panes · PgUp/PgDn page · Esc cancel",
+    ),
+    ("dlg.delete_hint", "Press d again to delete · Esc cancels"),
+    ("dlg.field_label", "Name"),
+    ("dlg.field_host", "Server"),
+    ("dlg.field_port", "Port"),
+    ("dlg.field_tls", "TLS"),
+    ("dlg.field_nickname", "Nickname"),
+    ("dlg.field_username", "Username"),
+    ("dlg.field_password", "Server password"),
+    ("dlg.field_sasl_user", "SASL username"),
+    ("dlg.field_sasl_pass", "SASL password"),
+    ("dlg.field_channels", "Channels"),
+    ("dlg.field_queries", "Queries"),
+    ("dlg.on", "on"),
+    ("dlg.off", "off"),
+    ("dlg.help_connection", "Name, host, port, and TLS"),
+    ("dlg.help_identity", "Nickname, username, password, SASL"),
+    ("dlg.help_channels", "Channels and queries at startup"),
+    ("dlg.editing_hint", "Enter apply · Esc discard"),
+    (
+        "dlg.err_label",
+        "the name must be non-empty without spaces or . \" ' [ ] # =",
+    ),
+    ("dlg.err_host", "the server address must not be empty"),
+    (
+        "dlg.err_port",
+        "the port must be a number between 1 and 65535",
+    ),
+    (
+        "dlg.err_nickname",
+        "the nickname must be non-empty without spaces",
+    ),
     // sys.* — system notes appended to buffers.
     ("sys.connected", "Connected to {server}"),
     (
@@ -165,13 +209,13 @@ const REGISTRY: &[(&str, &str)] = &[
     ),
     ("err.cfg_read", "failed to read {path}"),
     ("err.cfg_parse", "failed to parse {path}"),
+    ("err.cfg_write", "failed to write {path}"),
     // err.startup_* — startup failures printed before the TUI exists.
     ("err.startup_home", "could not resolve the home directory"),
     (
         "err.startup_config_load",
         "failed to load config from {path} - copy your config file there (e.g. config.example.toml)",
     ),
-    ("err.startup_no_servers", "config has no servers"),
     ("err.startup_mouse", "failed to enable mouse capture"),
 ];
 
@@ -483,7 +527,49 @@ mod tests {
                 "cmd.quit",
                 "Alias for disconnect; the application stays open",
             ),
+            ("cmd.config", "Open the server configuration wizard"),
             ("hint.tips", "Esc quit · Enter send · PgUp/PgDn scroll"),
+            ("welcome.config_hint", "Press c to configure a server"),
+            ("dlg.title", "Server configuration"),
+            ("dlg.new_server", "new server"),
+            ("dlg.page_connection", "connection"),
+            ("dlg.page_identity", "identity"),
+            ("dlg.page_channels", "channels"),
+            (
+                "dlg.hub_hint",
+                "Enter edit · ↑/↓ fields · ←/→ panes · PgUp/PgDn page · Esc cancel",
+            ),
+            ("dlg.delete_hint", "Press d again to delete · Esc cancels"),
+            ("dlg.field_label", "Name"),
+            ("dlg.field_host", "Server"),
+            ("dlg.field_port", "Port"),
+            ("dlg.field_tls", "TLS"),
+            ("dlg.field_nickname", "Nickname"),
+            ("dlg.field_username", "Username"),
+            ("dlg.field_password", "Server password"),
+            ("dlg.field_sasl_user", "SASL username"),
+            ("dlg.field_sasl_pass", "SASL password"),
+            ("dlg.field_channels", "Channels"),
+            ("dlg.field_queries", "Queries"),
+            ("dlg.on", "on"),
+            ("dlg.off", "off"),
+            ("dlg.help_connection", "Name, host, port, and TLS"),
+            ("dlg.help_identity", "Nickname, username, password, SASL"),
+            ("dlg.help_channels", "Channels and queries at startup"),
+            ("dlg.editing_hint", "Enter apply · Esc discard"),
+            (
+                "dlg.err_label",
+                "the name must be non-empty without spaces or . \" ' [ ] # =",
+            ),
+            ("dlg.err_host", "the server address must not be empty"),
+            (
+                "dlg.err_port",
+                "the port must be a number between 1 and 65535",
+            ),
+            (
+                "dlg.err_nickname",
+                "the nickname must be non-empty without spaces",
+            ),
             ("sys.connected", "Connected to {server}"),
             (
                 "sys.connection_lost",
@@ -561,12 +647,12 @@ mod tests {
             ),
             ("err.cfg_read", "failed to read {path}"),
             ("err.cfg_parse", "failed to parse {path}"),
+            ("err.cfg_write", "failed to write {path}"),
             ("err.startup_home", "could not resolve the home directory"),
             (
                 "err.startup_config_load",
                 "failed to load config from {path} - copy your config file there (e.g. config.example.toml)",
             ),
-            ("err.startup_no_servers", "config has no servers"),
             ("err.startup_mouse", "failed to enable mouse capture"),
         ];
         assert_eq!(REGISTRY.len(), pinned.len(), "registry and pin table sizes");
@@ -585,6 +671,104 @@ mod tests {
         keys.sort_unstable();
         keys.dedup();
         assert_eq!(keys.len(), total, "duplicate registry keys");
+    }
+
+    /// The fullscreen hub retired the modal's header/footer rows; their
+    /// keys must stay gone so no dead catalog entries accumulate.
+    #[test]
+    fn the_registry_carries_no_keys_the_hub_retired() {
+        for dead in [
+            "dlg.servers",
+            "dlg.save",
+            "dlg.cancel",
+            "dlg.page_hint",
+            // Retired by WYSIWYG auto-save: committing persists
+            // immediately, so there is no new-entry "unsaved" wording
+            // and no saved-path composer note anymore.
+            "dlg.status_new",
+            "status.config_saved",
+        ] {
+            assert!(
+                REGISTRY.iter().all(|(key, _)| *key != dead),
+                "retired key {dead} is back in the registry"
+            );
+        }
+        // The hub's footer hint is pinned in both locales: pages turn
+        // through PgUp/PgDn.
+        assert_eq!(
+            REGISTRY
+                .iter()
+                .find(|(key, _)| *key == "dlg.hub_hint")
+                .map(|(_, value)| *value),
+            Some("Enter edit · ↑/↓ fields · ←/→ panes · PgUp/PgDn page · Esc cancel")
+        );
+        let zh = BUILTIN_LOCALES
+            .iter()
+            .find(|(tag, _)| *tag == "zh-CN")
+            .unwrap()
+            .1;
+        assert!(
+            zh.contains(
+                "hub_hint = \"Enter 编辑 · ↑/↓ 字段 · ←/→ 切栏 · PgUp/PgDn 翻页 · Esc 取消\""
+            ),
+            "zh-CN hub hint literal changed"
+        );
+        assert!(
+            zh.contains("delete_hint = \"再按一下 d 删除 · Esc 取消\""),
+            "zh-CN delete hint literal changed"
+        );
+    }
+
+    /// The hub's footer paragraph receives `width - 4` columns — 76 at
+    /// the 80x24 reference size. Both locales' hints must fit that
+    /// budget untruncated (zh-CN is the widest: wide CJK glyphs plus
+    /// `PgUp/PgDn`, which is ~2 columns wider than the old `Alt+←/→`).
+    #[test]
+    fn the_hub_footer_hints_fit_the_80_column_footer_budget() {
+        let display_width = |s: &str| -> usize {
+            s.chars()
+                .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))
+                .sum()
+        };
+        // Arrange / Act: the pinned hint strings from both locales,
+        // hub and delete-confirm alike (both render in the footer).
+        let registry_text = |key: &str| {
+            REGISTRY
+                .iter()
+                .find(|(registry_key, _)| *registry_key == key)
+                .map(|(_, value)| *value)
+                .unwrap()
+        };
+        let zh_text = |prefix: &str| {
+            BUILTIN_LOCALES
+                .iter()
+                .find(|(tag, _)| *tag == "zh-CN")
+                .unwrap()
+                .1
+                .lines()
+                .find(|line| line.starts_with(prefix))
+                .unwrap()
+                .split_once('"')
+                .unwrap()
+                .1
+                .rsplit_once('"')
+                .unwrap()
+                .0
+                .to_string()
+        };
+        let hints = [
+            registry_text("dlg.hub_hint").to_string(),
+            registry_text("dlg.delete_hint").to_string(),
+            zh_text("hub_hint"),
+            zh_text("delete_hint"),
+        ];
+
+        // Assert: all fit 76 display columns, so the footer's last
+        // glyph stays visible at 80 columns.
+        for hint in &hints {
+            let width = display_width(hint);
+            assert!(width <= 76, "hint is {width} columns: {hint}");
+        }
     }
 
     /// The command table's second column must reference exactly the `cmd.*`

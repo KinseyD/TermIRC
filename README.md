@@ -35,6 +35,43 @@ status bar along the bottom. `Enter` sends.
 
    A sample (`config.example.toml`) ships in the repo root; replace its connection settings before use.
 
+   Alternatively, skip this step: run TermIRC with no config file and
+   the in-TUI setup wizard opens on the first frame. It takes over the
+   whole terminal like a fullscreen hub — a `╭─ Server configuration
+   ─┬─╮` frame with the server list left of the divider and a paged
+   form on the right. The sidebar lists every configured server (a `●`
+   icon, `❯` on the selected row), a separator, and a `+ new server`
+  row; the body opens with a muted status line naming the entry (or
+  the last validation error) over a colored page track whose active
+  page is a filled chip, then edits the selection across three pages:
+  ① connection (name, host, port, TLS), ② identity (nickname,
+  username, server password, SASL pair), ③ channels (pre-join channels
+  and query nicknames). `Up`/`Down` move between fields, `Enter` opens
+  the focused field for editing — typing lands only while it is open,
+  `Enter`/`Tab` commit, `Esc` discards, and the TLS toggle flips in
+  place. Editing is WYSIWYG: what you see on screen is always the
+  saved configuration — every commit or toggle flip writes
+  `config.toml` immediately, so there is no save action and no
+  unsaved marker; `Esc` (outside an open field) closes the wizard.
+  `Tab` walks the fields and turns a page off a page's last field
+  (`BackTab` reverses; both stop at the form's edges), and together
+  with `→`/`←` it cycles the sidebar and the form.
+  `PageUp`/`PageDown` turn pages from any pane. Type `/config` at
+  any time to reopen the wizard; on the welcome page (no composer),
+  `c` opens it instead. Committing a change to a
+  connection-affecting field (label, host, port, TLS, username,
+  password, SASL pair, proxy) respawns the server's worker so the new
+  settings apply immediately; nickname, channels and queries ride the
+  live connection. Renaming an entry replaces it in the file (and its
+  worker) instead of duplicating it; `password` and `queries` are part
+  of the form, while `proxy` and non-server tables (`[ui]`, `[theme]`,
+  ...) are preserved verbatim.
+   Deleting a server is a double gesture: with the hub's list focused
+   on an entry, press `d` — the footer switches to "Press d again to
+   delete" — and a second `d` within three seconds removes the server
+   from `config.toml`, stops its worker, and closes its buffers; any
+   other key (or the deadline passing) cancels.
+
 2. Run:
 
    ```bash

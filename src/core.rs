@@ -269,6 +269,14 @@ impl Draft {
         self.text = text;
     }
 
+    /// A consumable form of [`restore`]: this draft set to `text` with
+    /// the cursor at its end, for building prefilled forms.
+    pub fn restored(mut self, text: &str) -> Self {
+        self.text = text.to_string();
+        self.cursor = text.chars().count();
+        self
+    }
+
     pub fn clear(&mut self) {
         self.text.clear();
         self.cursor = 0;
