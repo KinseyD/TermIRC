@@ -469,7 +469,51 @@ fn merge_server_section(existing: &str, name: &str, emitted: &str) -> String {
     merged.join("\n") + "\n"
 }
 
+/// Split existing config text around one `[servers.<name>]` section
+/// (its sub-tables included): `(before, after)` with the section gone.
+/// A missing section returns the whole text as `before` — the caller
+/// only passes a label it read from the same file.
+fn split_server_section(existing: &str, name: &str) -> (String, String) {
+    let lines: Vec<&str> = existing.lines().collect();
+    let mut section_start = None;
+    let mut section_end = lines.len();
+    let subtable_prefix = format!("[servers.{name}.");
+    for (index, line) in lines.iter().enumerate() {
+        if section_name(line).is_some_and(|found| found == name) {
+            section_start = Some(index);
+            // The section runs until the next header that is not one of
+            // its own sub-tables (`[servers.<name>.proxy]`, ...).
+            section_end = lines[index + 1..]
+                .iter()
+                .position(|next| {
+                    next.trim().starts_with('[') && !next.trim().starts_with(&subtable_prefix)
+                })
+                .map_or(lines.len(), |offset| index + 1 + offset);
+            break;
+        }
+    }
+    if section_start.is_none() {
+        return (existing.to_string(), String::new());
+    }
+    let start = section_start.unwrap();
+    // The blank separator line before the section belongs to it, so the
+    // renamed section does not accumulate gaps; the one after stays with
+    // the tail.
+    let start = if start > 0 && lines[start - 1].trim().is_empty() {
+        start - 1
+    } else {
+        start
+    };
+    let before = lines[..start].join("\n");
+    let tail = lines[section_end..].join("\n");
+    (before, tail)
+}
+
 /// Persist one server entry at `path`, merging into any existing file.
+/// `previous` is the entry's former label when the wizard renamed it:
+/// its whole `[servers.<previous>]` section (proxy sub-table included)
+/// is dropped in the same write, so a rename replaces instead of
+/// duplicating.
 ///
 /// The merged text is validated with [`Config::parse`] before anything
 /// is written, so a wizard entry that contradicts the rest of the file
@@ -477,7 +521,12 @@ fn merge_server_section(existing: &str, name: &str, emitted: &str) -> String {
 /// rejected instead of producing a file the next start cannot load.
 /// The write itself is atomic: a temporary file in the same directory,
 /// then `rename` over the target.
-pub fn save_server(path: &Path, name: &str, server: &ServerConfig) -> anyhow::Result<()> {
+pub fn save_server(
+    path: &Path,
+    previous: Option<&str>,
+    name: &str,
+    server: &ServerConfig,
+) -> anyhow::Result<()> {
     // Only a genuinely missing file means "start from scratch". Treating
     // any other read failure (permissions, invalid UTF-8, a directory) as
     // an empty file would rewrite it with just the wizard's section and
@@ -494,7 +543,22 @@ pub fn save_server(path: &Path, name: &str, server: &ServerConfig) -> anyhow::Re
             });
         }
     };
-    let merged = merge_server_section(&existing, name, &emit_server_table(name, server));
+    // A rename replaces in place: the new section merges into the text
+    // before the old one and the tail is appended after it, so file
+    // order around the entry never changes.
+    let mut text = existing;
+    let mut tail = String::new();
+    if let Some(previous) = previous.filter(|previous| *previous != name) {
+        let (before, after) = split_server_section(&text, previous);
+        text = before.trim_end().to_string();
+        tail = after;
+    }
+    let merged = merge_server_section(&text, name, &emit_server_table(name, server));
+    let merged = if tail.is_empty() {
+        merged
+    } else {
+        format!("{merged}\n{tail}\n")
+    };
     Config::parse(&merged).map_err(|error| {
         // Log only the top-level context: the toml error chain can embed
         // the offending source line, which may persist SASL passwords.
@@ -1066,7 +1130,7 @@ channels = ["#a"]
         let server = wizard_server();
 
         // Act
-        save_server(&path, "new", &server).unwrap();
+        save_server(&path, None, "new", &server).unwrap();
         let saved = Config::load(&path).unwrap();
 
         // Assert
@@ -1092,7 +1156,7 @@ channels = ["#a"]
         server.channels = vec!["#b".into(), "#c".into()];
 
         // Act
-        save_server(&path, "old", &server).unwrap();
+        save_server(&path, None, "old", &server).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
 
         // Assert: the wizard's keys are the new ones (its cleared
@@ -1126,7 +1190,7 @@ channels = ["#a"]
         let path = root.join("deep").join("config.toml");
 
         // Act
-        save_server(&path, "new", &wizard_server()).unwrap();
+        save_server(&path, None, "new", &wizard_server()).unwrap();
 
         // Assert: the tree and file exist, the file reloads, and no temp
         // file was left behind.
@@ -1150,8 +1214,8 @@ channels = ["#a"]
         std::fs::create_dir_all(&as_directory).unwrap();
 
         // Act
-        let invalid_result = save_server(&invalid, "new", &wizard_server());
-        let directory_result = save_server(&as_directory, "new", &wizard_server());
+        let invalid_result = save_server(&invalid, None, "new", &wizard_server());
+        let directory_result = save_server(&as_directory, None, "new", &wizard_server());
 
         // Assert: both report the write failure and leave the target as it
         // was instead of replacing it with just the wizard's section.
@@ -1176,21 +1240,57 @@ channels = ["#a"]
     }
 
     #[test]
-    fn save_server_appending_a_renamed_label_keeps_the_old_entry() {
-        // Arrange
+    fn save_server_renaming_a_label_replaces_the_old_section_in_place() {
+        // Arrange: two entries, the first carrying a proxy sub-table, so
+        // the rename must drop the old section (proxy included) while
+        // keeping the sibling and carrying the form's values in.
         let path = temp_path("rename");
-        save_server(&path, "old", &wizard_server()).unwrap();
+        std::fs::write(
+            &path,
+            "[servers.old]\nusername = \"x\"\nnickname = \"x\"\nserver = \"old.example\"\nport = 6667\nchannels = []\n\n[servers.old.proxy]\ntype = \"socks5\"\nhost = \"127.0.0.1\"\nport = 9050\n\n[servers.keeper]\nusername = \"k\"\nnickname = \"k\"\nserver = \"keep.example\"\nport = 6667\nchannels = []\n",
+        )
+        .unwrap();
         let mut renamed = wizard_server();
         renamed.server = "irc2.example.org".into();
 
-        // Act: the wizard saved under a different label.
-        save_server(&path, "second", &renamed).unwrap();
+        // Act: the wizard committed a changed label.
+        save_server(&path, Some("old"), "second", &renamed).unwrap();
 
-        // Assert: both entries exist and the old one is untouched.
+        // Assert: the old section (its proxy included) is gone, the
+        // sibling stays, and the new section holds the form's values.
         let saved = Config::load(&path).unwrap();
         assert_eq!(saved.servers.len(), 2);
-        assert_eq!(saved.servers["old"].server, "irc.example.org");
+        assert!(!saved.servers.contains_key("old"));
         assert_eq!(saved.servers["second"].server, "irc2.example.org");
+        assert_eq!(saved.servers["second"].nickname, "me");
+        assert!(saved.servers["second"].proxy.is_none());
+        assert_eq!(saved.servers["keeper"].server, "keep.example");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("socks5"), "{text}");
+        assert!(!text.contains("old.example"), "{text}");
+        // File order is preserved: the renamed entry keeps the old
+        // section's position.
+        assert_eq!(
+            saved.servers.keys().collect::<Vec<_>>(),
+            vec!["second", "keeper"]
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_server_refuses_a_rename_onto_a_clashing_label_and_keeps_the_file() {
+        // Arrange: two entries whose labels clash ASCII-case-insensitively.
+        let path = temp_path("rename-clash");
+        save_server(&path, None, "Libera", &wizard_server()).unwrap();
+        save_server(&path, None, "other", &wizard_server()).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        // Act: rename `other` onto the clashing label.
+        let result = save_server(&path, Some("other"), "libera", &wizard_server());
+
+        // Assert: rejected, and the file on disk is untouched.
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
         let _ = std::fs::remove_file(&path);
     }
     #[test]
@@ -1206,7 +1306,7 @@ channels = ["#a"]
         let server = wizard_server(); // password empty, queries empty
 
         // Act
-        save_server(&path, "old", &server).unwrap();
+        save_server(&path, None, "old", &server).unwrap();
 
         // Assert: the cleared wizard keys are gone from the file —
         // saving the form must be able to erase what the form shows.
@@ -1228,7 +1328,7 @@ channels = ["#a"]
         server.queries = vec!["alice".into(), "bob".into()];
 
         // Act
-        save_server(&path, "new", &server).unwrap();
+        save_server(&path, None, "new", &server).unwrap();
 
         // Assert: both keys reload exactly as saved.
         let saved = Config::load(&path).unwrap();
@@ -1245,11 +1345,11 @@ channels = ["#a"]
         // Arrange: an existing SERVER key whose ASCII-case-insensitive
         // identity clashes with the wizard's label.
         let path = temp_path("clash");
-        save_server(&path, "Libera", &wizard_server()).unwrap();
+        save_server(&path, None, "Libera", &wizard_server()).unwrap();
         let before = std::fs::read_to_string(&path).unwrap();
 
         // Act
-        let result = save_server(&path, "libera", &wizard_server());
+        let result = save_server(&path, None, "libera", &wizard_server());
 
         // Assert: rejected, and the file on disk is unchanged.
         assert!(result.is_err());
@@ -1265,7 +1365,7 @@ channels = ["#a"]
         server.username = "a\"b\\c\u{1}".into();
 
         // Act
-        save_server(&path, "esc", &server).unwrap();
+        save_server(&path, None, "esc", &server).unwrap();
 
         // Assert: the loaded values are the originals, byte for byte.
         let saved = Config::load(&path).unwrap();

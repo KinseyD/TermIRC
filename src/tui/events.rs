@@ -288,7 +288,7 @@ fn save_dialog(app: &mut App, ctx: &mut KeyContext<'_>) {
     if let Some(previous) = ctx.config.servers.get(&name) {
         server.proxy = previous.proxy.clone();
     }
-    if let Err(error) = config::save_server(ctx.config_path, &name, &server) {
+    if let Err(error) = config::save_server(ctx.config_path, None, &name, &server) {
         // Log the top-level context only: the error chain can embed raw
         // TOML source lines, which may persist SASL passwords.
         tracing::warn!(target: "termirc::config", "{error}");
