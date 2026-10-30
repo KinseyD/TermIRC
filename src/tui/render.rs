@@ -1142,16 +1142,12 @@ const HUB_BODY_MIN_WIDTH: usize = 28;
 /// The hub's sidebar column budget, measured from its row labels and
 /// clamped to the hub bounds. Mirrors `HubFrame#sidebarWidth`: the
 /// longest label plus 5 columns — the 4-column `${cursor} ${icon} `
-/// lane plus one slack column — where our labels are the entry names,
-/// their unsaved-edits marker, and the "new server" row.
+/// lane plus one slack column — where our labels are the entry names
+/// and the "new server" row.
 fn hub_sidebar_width(dialog: &crate::tui::dialog::ConfigDialog) -> usize {
     let mut longest = i18n::t("dlg.new_server").width();
     for (name, _) in &dialog.entries {
-        let mut width = name.width();
-        if dialog.dirty_row.as_deref() == Some(name.as_str()) {
-            width += 2; // the trailing ` *` marker
-        }
-        longest = longest.max(width);
+        longest = longest.max(name.width());
     }
     (longest + 5).clamp(HUB_SIDEBAR_MIN, HUB_SIDEBAR_MAX)
 }
@@ -1386,18 +1382,13 @@ fn render_dialog_list(
         // Every configured entry gets the success dot: we have no
         // unconnected-vs-connected distinction at config time, so the
         // icon states "a saved server" in omp's provider color.
-        let mut spans = vec![
+        let spans = vec![
             cursor,
             Span::raw(" "),
             Span::styled("●", Style::new().fg(theme.status_ok)),
             Span::raw(" "),
             Span::styled(clip_columns(name, name_width), style),
         ];
-        // Unsaved-edits marker: the entry's preview was edited and the
-        // edits dropped when the cursor moved. Literal `*`, no i18n key.
-        if dialog.dirty_row.as_deref() == Some(name.as_str()) {
-            spans.push(Span::styled(" *", Style::new().fg(theme.accent)));
-        }
         rows.push(Line::from(spans));
     }
     // The separator rule closes the entry rows: omp's `kind:
@@ -1484,7 +1475,7 @@ fn render_dialog_form(
                 Style::new().fg(theme.dim),
             ),
             None => (
-                i18n::t("dlg.status_new").to_string(),
+                i18n::t("dlg.new_server").to_string(),
                 Style::new().fg(theme.dim),
             ),
         },
@@ -1883,15 +1874,6 @@ channels = []
                 "{name}"
             );
         }
-
-        // The unsaved-edits marker is the row's annotation: it counts
-        // toward the measurement, so a 12-column label with the marker
-        // measures like a 14-column one.
-        let mut app = App::new(100, 30);
-        app.open_config_dialog(&server_named("abcdefghijkl"));
-        app.dialog.as_mut().unwrap().dirty_row = Some("abcdefghijkl".into());
-        let buffer = render_sized(&app, "", 100, 30);
-        assert_eq!(buffer.cell((22, 0)).unwrap().symbol(), "┬");
     }
 
     #[test]
@@ -2041,35 +2023,31 @@ channels = ["#three"]
         fresh.open_config_dialog(&crate::config::Config::default());
         let buffer = render_sized(&fresh, "", 80, 24);
         assert!(
-            buffer_line(&buffer, 1).contains(crate::i18n::t("dlg.status_new")),
+            buffer_line(&buffer, 1).contains(crate::i18n::t("dlg.new_server")),
             "{}",
             buffer_line(&buffer, 1)
         );
     }
 
     #[test]
-    fn the_hub_list_marks_the_entry_with_unsaved_edits() {
-        // Arrange: two servers with the first one carrying unsaved edits.
+    fn the_hub_list_paints_no_unsaved_marker() {
+        // Arrange: two servers; under WYSIWYG auto-save there is no
+        // unsaved state to mark.
         let mut app = App::new(80, 24);
         app.open_config_dialog(&two_server_config());
-        app.dialog.as_mut().unwrap().dirty_row = Some("alpha".into());
 
         // Act
         let buffer = render_sized(&app, "", 80, 24);
 
-        // Assert: a trailing accent `*` sits on the marked row only —
-        // the marker is the one place the hub admits edits were dropped
-        // when the list cursor moved.
-        assert!(
-            buffer_line(&buffer, 1).contains("alpha *"),
-            "{:?}",
-            buffer_line(&buffer, 1)
-        );
-        assert!(
-            !buffer_line(&buffer, 2).contains('*'),
-            "{}",
-            buffer_line(&buffer, 2)
-        );
+        // Assert: no row carries the old `*` annotation — every shown
+        // value is the saved one.
+        for row in 1..3u16 {
+            assert!(
+                !buffer_line(&buffer, row).contains('*'),
+                "row {row}: {}",
+                buffer_line(&buffer, row)
+            );
+        }
     }
 
     #[test]
@@ -2259,7 +2237,7 @@ channels = ["#three"]
         // Assert: the dim helper row under the fields carries the
         // editing hint instead of the page's help while the field is
         // open.
-        assert!(text.contains("enter save · esc discard"), "{text}");
+        assert!(text.contains("enter apply · esc discard"), "{text}");
         assert!(
             !text.contains(crate::i18n::t("dlg.help_identity")),
             "page help must yield to the editing hint: {text}"

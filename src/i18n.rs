@@ -87,7 +87,6 @@ const REGISTRY: &[(&str, &str)] = &[
     // dlg.* — the modal setup wizard (first run and /config).
     ("dlg.title", "Server configuration"),
     ("dlg.new_server", "new server"),
-    ("dlg.status_new", "new server · unsaved until saved"),
     ("dlg.page_connection", "connection"),
     ("dlg.page_identity", "identity"),
     ("dlg.page_channels", "channels"),
@@ -111,7 +110,7 @@ const REGISTRY: &[(&str, &str)] = &[
     ("dlg.help_connection", "Name, host, port, and TLS"),
     ("dlg.help_identity", "Nickname, username, password, SASL"),
     ("dlg.help_channels", "Channels and queries at startup"),
-    ("dlg.editing_hint", "enter save · esc discard"),
+    ("dlg.editing_hint", "enter apply · esc discard"),
     (
         "dlg.err_label",
         "the name must be non-empty without spaces or . \" ' [ ] # =",
@@ -156,7 +155,6 @@ const REGISTRY: &[(&str, &str)] = &[
         "status.query_target_changed",
         "query target changed; use /query to select a nickname",
     ),
-    ("status.config_saved", "configuration saved to {path}"),
     // statusbar.* — the bottom status bar. The server and channel blocks
     // show the raw names (pure data); only the input block's standing
     // label is localized.
@@ -533,7 +531,6 @@ mod tests {
             ("welcome.config_hint", "Press c to configure a server"),
             ("dlg.title", "Server configuration"),
             ("dlg.new_server", "new server"),
-            ("dlg.status_new", "new server · unsaved until saved"),
             ("dlg.page_connection", "connection"),
             ("dlg.page_identity", "identity"),
             ("dlg.page_channels", "channels"),
@@ -557,7 +554,7 @@ mod tests {
             ("dlg.help_connection", "Name, host, port, and TLS"),
             ("dlg.help_identity", "Nickname, username, password, SASL"),
             ("dlg.help_channels", "Channels and queries at startup"),
-            ("dlg.editing_hint", "enter save · esc discard"),
+            ("dlg.editing_hint", "enter apply · esc discard"),
             (
                 "dlg.err_label",
                 "the name must be non-empty without spaces or . \" ' [ ] # =",
@@ -600,7 +597,6 @@ mod tests {
                 "status.query_target_changed",
                 "query target changed; use /query to select a nickname",
             ),
-            ("status.config_saved", "configuration saved to {path}"),
             ("statusbar.input", "type in"),
             (
                 "err.send_invalid_characters",
@@ -679,7 +675,17 @@ mod tests {
     /// keys must stay gone so no dead catalog entries accumulate.
     #[test]
     fn the_registry_carries_no_keys_the_hub_retired() {
-        for dead in ["dlg.servers", "dlg.save", "dlg.cancel", "dlg.page_hint"] {
+        for dead in [
+            "dlg.servers",
+            "dlg.save",
+            "dlg.cancel",
+            "dlg.page_hint",
+            // Retired by WYSIWYG auto-save: committing persists
+            // immediately, so there is no new-entry "unsaved" wording
+            // and no saved-path composer note anymore.
+            "dlg.status_new",
+            "status.config_saved",
+        ] {
             assert!(
                 REGISTRY.iter().all(|(key, _)| *key != dead),
                 "retired key {dead} is back in the registry"

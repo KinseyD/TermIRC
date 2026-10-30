@@ -263,11 +263,14 @@ fn handle_key_press(
     }
 }
 
-/// Persist the wizard's entry and bring it live: write the merged
-/// config file, replace the server's worker so the saved host, port and
-/// TLS settings take effect immediately, open its buffers, and close
-/// the dialog. Failures keep the dialog open with the reason on its
-/// error row.
+/// Persist the wizard's form the moment a commit asks for it (WYSIWYG:
+/// what the screen shows is the saved state): write the merged config
+/// file, sync the in-memory config and the dialog's entry list, and
+/// bring the entry live. The worker is respawned only when a
+/// connection-affecting field (or the label) changed, so editing a
+/// nickname or channels keeps the live connection. The dialog stays
+/// open; failures keep it open with the reason on its status row and
+/// never discard the committed value.
 fn save_dialog(app: &mut App, ctx: &mut KeyContext<'_>) {
     let Some(collected) = app.dialog.as_ref().map(|dialog| dialog.collect()) else {
         return;
@@ -282,13 +285,30 @@ fn save_dialog(app: &mut App, ctx: &mut KeyContext<'_>) {
             return;
         }
     };
+    let selected = app
+        .dialog
+        .as_ref()
+        .and_then(|dialog| dialog.selected.clone());
+    // A changed label renames the entry: the old section is dropped
+    // from the file in the same write and everything keyed by the old
+    // label (worker, config, dialog row) moves to the new one.
+    let previous_label =
+        selected.filter(|old| *old != name && ctx.config.servers.contains_key(old.as_str()));
     // The form owns every key its pages show — password and queries
     // included — so only `proxy`, which no wizard page models, is
-    // carried across from the existing entry before the worker spawns.
-    if let Some(previous) = ctx.config.servers.get(&name) {
+    // carried across from the entry being replaced (the renamed old
+    // one, or the same-name entry).
+    let previous = previous_label
+        .as_ref()
+        .and_then(|old| ctx.config.servers.get(old))
+        .or_else(|| ctx.config.servers.get(&name))
+        .cloned();
+    if let Some(previous) = &previous {
         server.proxy = previous.proxy.clone();
     }
-    if let Err(error) = config::save_server(ctx.config_path, None, &name, &server) {
+    if let Err(error) =
+        config::save_server(ctx.config_path, previous_label.as_deref(), &name, &server)
+    {
         // Log the top-level context only: the error chain can embed raw
         // TOML source lines, which may persist SASL passwords.
         tracing::warn!(target: "termirc::config", "{error}");
@@ -297,40 +317,116 @@ fn save_dialog(app: &mut App, ctx: &mut KeyContext<'_>) {
         }
         return;
     }
-    // Every save replaces the worker, editing an already-connected
-    // server included: the worker clones its `ServerConfig` at spawn, so
-    // a new host/port/TLS would otherwise wait for a process restart.
-    // Dropping the old handle closes its channels, and the worker's
-    // `control.recv()` returning `None` ends its loop. Only non-server
-    // tables such as `[theme]`/`[history]` still need a restart, and the
-    // wizard does not edit them.
-    ctx.outgoing.remove(&name);
-    let (_thread, handle) = crate::connection::spawn_irc(
-        server.clone(),
-        name.clone(),
-        server.channels.clone(),
-        ctx.tx.clone(),
-    );
-    ctx.outgoing.insert(name.clone(), handle);
+    // Respawn only when the worker's own view of the server changed: it
+    // clones its `ServerConfig` at spawn, so a new host/port/TLS/auth
+    // would otherwise wait for a process restart. The label is in the
+    // list because the worker map is keyed by it. Nickname, channels
+    // and queries ride the live connection instead. Classify new
+    // connection fields here.
+    let respawn = match &previous {
+        None => true,
+        Some(previous) => {
+            previous_label.is_some()
+                || previous.server != server.server
+                || previous.port != server.port
+                || previous.use_tls != server.use_tls
+                || previous.username != server.username
+                || previous.password != server.password
+                || previous.sasl_username != server.sasl_username
+                || previous.sasl_password != server.sasl_password
+                || proxies_differ(&previous.proxy, &server.proxy)
+        }
+    };
     let had_console = app.session.buffers.iter().any(|buffer| {
         buffer.kind == crate::core::BufferKind::Server
             && buffer.server == crate::core::ServerId::new(&name)
     });
-    // Registration is idempotent: an edit keeps its existing buffers and
-    // current focus, while a first save gains the console view below.
+    if respawn {
+        // Dropping the old handle closes its channels, and the worker's
+        // `control.recv()` returning `None` ends its loop.
+        if let Some(old) = &previous_label {
+            ctx.outgoing.remove(old);
+        }
+        ctx.outgoing.remove(&name);
+        let (_thread, handle) = crate::connection::spawn_irc(
+            server.clone(),
+            name.clone(),
+            server.channels.clone(),
+            ctx.tx.clone(),
+        );
+        ctx.outgoing.insert(name.clone(), handle);
+    }
+    // Registration is idempotent: an edit keeps its existing buffers
+    // and focus, while newly added channels/queries gain theirs.
     app.session.register_server(&name, &server);
-    // Land on a new server's console (idempotent open) so the composer
-    // is usable the moment the wizard closes.
-    if !had_console {
+    // Land on a respawned/new server's console (idempotent open) so the
+    // composer is usable the moment the wizard closes — a commit that
+    // kept its live worker keeps the user's focus instead.
+    if respawn && !had_console {
         let console = app.session.open_server(&name);
         app.activate_buffer(console);
     }
-    ctx.config.servers.insert(name, server);
-    app.close_dialog();
-    *ctx.status = crate::i18n::format(
-        crate::i18n::t("status.config_saved"),
-        &[("path", &ctx.config_path.display().to_string())],
-    );
+    // Memory sync: a rename replaces the entry at its original index so
+    // file order survives (IndexMap preserves insertion order).
+    match &previous_label {
+        Some(old) => {
+            if let Some(index) = ctx.config.servers.get_index_of(old) {
+                ctx.config.servers.shift_remove(old);
+                ctx.config
+                    .servers
+                    .shift_insert(index, name.clone(), server.clone());
+            } else {
+                ctx.config.servers.insert(name.clone(), server.clone());
+            }
+        }
+        None => {
+            ctx.config.servers.insert(name.clone(), server.clone());
+        }
+    }
+    // The dialog's list mirrors the same replacement, keeping the form
+    // coherent on the entry it just saved.
+    if let Some(dialog) = app.dialog.as_mut() {
+        if let Some(old) = &previous_label {
+            match dialog.entries.iter().position(|(label, _)| label == old) {
+                Some(index) => {
+                    dialog.entries.remove(index);
+                    dialog.entries.insert(index, (name.clone(), server.clone()));
+                }
+                None => dialog.entries.push((name.clone(), server.clone())),
+            }
+            dialog.selected = Some(name.clone());
+            dialog.list_cursor = dialog.list_cursor.min(dialog.entries.len() - 1);
+        } else if let Some(index) = dialog.entries.iter().position(|(label, _)| *label == name) {
+            dialog.entries[index] = (name.clone(), server.clone());
+        } else {
+            // A first save of the new-server row: the entry joins the
+            // list and the form now edits it.
+            dialog.entries.push((name.clone(), server.clone()));
+            dialog.selected = Some(name.clone());
+            dialog.list_cursor = dialog.entries.len() - 1;
+        }
+        dialog.error = None;
+    }
+}
+
+/// Proxy equality by value: `ProxyConfig` deliberately derives no
+/// `PartialEq` (it is a plain deserialized table), so the respawn
+/// decision compares the pieces a worker captures at spawn.
+fn proxies_differ(
+    left: &Option<crate::config::ProxyConfig>,
+    right: &Option<crate::config::ProxyConfig>,
+) -> bool {
+    match (left, right) {
+        (None, None) => false,
+        (Some(left), Some(right)) => {
+            left.r#type != right.r#type
+                || left.host != right.host
+                || left.port != right.port
+                || left.username != right.username
+                || left.password != right.password
+        }
+        _ => true,
+    }
 }
 
 /// Route one mouse event: wheel scrolling, click actions, and hover
@@ -736,8 +832,25 @@ mod tests {
         assert!(!bare.is_running());
     }
 
+    /// A `KeyContext` over throwaway state, for wizard save tests.
+    fn save_context<'a>(
+        config: &'a mut crate::config::Config,
+        outgoing: &'a mut std::collections::HashMap<String, ConnectionHandle>,
+        tx: &'a std::sync::mpsc::Sender<IrcEvent>,
+        path: &'a Path,
+        status: &'a mut String,
+    ) -> KeyContext<'a> {
+        KeyContext {
+            config,
+            outgoing,
+            tx,
+            config_path: path,
+            status,
+        }
+    }
+
     #[test]
-    fn saving_the_wizard_writes_the_file_and_registers_the_server() {
+    fn committing_the_form_writes_the_file_registers_the_server_and_stays_open() {
         // Arrange: a filled wizard pointed at a port that refuses
         // immediately, and a fresh config path.
         let path = std::env::temp_dir().join(format!("termirc-wizard-{}.toml", std::process::id()));
@@ -750,29 +863,26 @@ mod tests {
             dialog.set_field_text("dlg.field_port", "1");
             dialog.set_field_text("dlg.field_nickname", "tester");
             dialog.set_field_text("dlg.field_channels", "#a");
-            dialog.pane = crate::tui::dialog::Pane::Actions;
+            dialog.pane = crate::tui::dialog::Pane::Form;
         }
         let mut config = crate::config::Config::default();
         let mut outgoing = std::collections::HashMap::new();
         let (tx, rx) = std::sync::mpsc::channel();
         let mut status = String::new();
-        let mut ctx = KeyContext {
-            config: &mut config,
-            outgoing: &mut outgoing,
-            tx: &tx,
-            config_path: &path,
-            status: &mut status,
-        };
+        let mut ctx = save_context(&mut config, &mut outgoing, &tx, &path, &mut status);
 
-        // Act
+        // Act: Enter opens the focused label field, the second Enter
+        // commits — and committing is the save.
+        handle_key_press(&mut app, KeyCode::Enter, false, false, &mut ctx);
         handle_key_press(&mut app, KeyCode::Enter, false, false, &mut ctx);
 
-        // Assert: the file exists, the config and worker maps gained the
-        // entry, the console is viewed, and the dialog closed with the
-        // saved-path note. Drop the receiver so the background worker's
-        // sends fail silently instead of queueing.
+        // Assert: the file exists, the config and worker maps gained
+        // the entry, the console is viewed — and the dialog stays open
+        // with the edit closed (WYSIWYG: keep browsing/editing). Drop
+        // the receiver so the background worker's sends fail silently.
         drop(rx);
-        assert!(app.dialog.is_none());
+        assert!(app.dialog.is_some(), "the dialog stays open after a save");
+        assert!(!app.dialog.as_ref().unwrap().editing);
         assert!(config.servers.contains_key("libera"));
         assert!(outgoing.contains_key("libera"));
         assert_eq!(
@@ -782,12 +892,11 @@ mod tests {
         let saved = std::fs::read_to_string(&path).unwrap();
         assert!(saved.contains("server = \"127.0.0.1\""));
         assert!(saved.contains("channels = [\"#a\"]"));
-        assert!(status.contains(&path.display().to_string()));
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn saving_an_edited_server_takes_password_and_queries_from_the_form_and_keeps_proxy() {
+    fn committing_an_edited_server_takes_password_and_queries_from_the_form_and_keeps_proxy() {
         // Arrange: a config file whose entry carries keys some wizard
         // pages model (password, queries) and one no page models
         // (proxy), a live worker handle for it, and a viewed channel.
@@ -808,14 +917,10 @@ mod tests {
         app.open_config_dialog(&config);
         {
             let dialog = app.dialog.as_mut().unwrap();
-            // The form owns password and queries: clear the password and
-            // retarget the queries from inside the form, and point the
-            // edited entry at a port that refuses immediately.
-            dialog.set_field_text("dlg.field_host", "127.0.0.1");
-            dialog.set_field_text("dlg.field_port", "1");
-            dialog.set_field_text("dlg.field_password", "");
-            dialog.set_field_text("dlg.field_queries", "bob");
-            dialog.pane = crate::tui::dialog::Pane::Actions;
+            // The host field is where the edit starts; the host change
+            // forces a respawn below.
+            dialog.pane = crate::tui::dialog::Pane::Form;
+            dialog.cursor = crate::tui::dialog::F_HOST;
         }
         // A handle standing in for the worker started at boot. Keeping a
         // clone of its outgoing sender lets the test tell the channels
@@ -833,25 +938,34 @@ mod tests {
         )]);
         let (tx, rx) = std::sync::mpsc::channel();
         let mut status = String::new();
-        let mut ctx = KeyContext {
-            config: &mut config,
-            outgoing: &mut outgoing,
-            tx: &tx,
-            config_path: &path,
-            status: &mut status,
-        };
+        let mut ctx = save_context(&mut config, &mut outgoing, &tx, &path, &mut status);
 
-        // Act
+        // Act: open the host field, retype it, and commit. The port and
+        // the other pages' values are set directly (their own commits
+        // would each save just as well).
+        handle_key_press(&mut app, KeyCode::Enter, false, false, &mut ctx);
+        for _ in 0.."old.example.org".len() {
+            handle_key_press(&mut app, KeyCode::Backspace, false, false, &mut ctx);
+        }
+        for c in "127.0.0.1".chars() {
+            handle_key_press(&mut app, KeyCode::Char(c), false, false, &mut ctx);
+        }
+        {
+            let dialog = app.dialog.as_mut().unwrap();
+            dialog.set_field_text("dlg.field_port", "1");
+            dialog.set_field_text("dlg.field_password", "");
+            dialog.set_field_text("dlg.field_queries", "bob");
+        }
         handle_key_press(&mut app, KeyCode::Enter, false, false, &mut ctx);
 
-        // Assert: the worker was replaced rather than duplicated, and the
-        // old control channel closed so its loop ends.
+        // Assert: the worker was replaced rather than duplicated, and
+        // the old control channel closed so its loop ends.
         drop(rx);
-        assert!(app.dialog.is_none());
+        assert!(app.dialog.is_some(), "the dialog stays open");
         assert_eq!(outgoing.len(), 1);
         assert!(
             !outgoing["libera"].outgoing.same_channel(&old_sender),
-            "a saved edit must replace the server's worker"
+            "a host change must respawn the server's worker"
         );
         assert!(
             matches!(
@@ -887,36 +1001,198 @@ mod tests {
     }
 
     #[test]
-    fn a_wizard_save_with_bad_input_keeps_the_dialog_open_with_the_reason() {
-        // Arrange: an empty host fails before the port is even read.
+    fn a_nickname_only_commit_keeps_the_live_worker() {
+        // Arrange: one configured entry with a live fake worker and a
+        // viewed channel; only the nickname will change.
+        let path =
+            std::env::temp_dir().join(format!("termirc-wizard-nick-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(
+            &path,
+            "[servers.libera]\nusername = \"me\"\nnickname = \"old\"\nserver = \"irc.example.org\"\nuse_tls = false\nport = 6667\nchannels = [\"#one\"]\n",
+        )
+        .unwrap();
+        let mut config = crate::config::Config::load(&path).unwrap();
         let mut app = App::new(40, 10);
-        app.open_config_dialog(&crate::config::Config::default());
+        let channel = app.open_channel("libera", "#one");
+        app.activate_buffer(channel);
+        app.open_config_dialog(&config);
         {
             let dialog = app.dialog.as_mut().unwrap();
-            dialog.set_field_text("dlg.field_host", "");
-            dialog.pane = crate::tui::dialog::Pane::Actions;
+            dialog.pane = crate::tui::dialog::Pane::Form;
+            dialog.page = crate::tui::dialog::Page::Identity;
+            dialog.cursor = crate::tui::dialog::F_NICKNAME;
+        }
+        let (old_outgoing, _old_outgoing_rx) = tokio::sync::mpsc::channel(8);
+        let (old_control, _old_control_rx) = tokio::sync::mpsc::channel(8);
+        let old_sender = old_outgoing.clone();
+        let mut outgoing = std::collections::HashMap::from([(
+            "libera".to_string(),
+            ConnectionHandle {
+                outgoing: old_outgoing,
+                control: old_control,
+            },
+        )]);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut status = String::new();
+        let mut ctx = save_context(&mut config, &mut outgoing, &tx, &path, &mut status);
+
+        // Act: open the nickname field and commit a change.
+        handle_key_press(&mut app, KeyCode::Enter, false, false, &mut ctx);
+        for _ in 0..3 {
+            handle_key_press(&mut app, KeyCode::Backspace, false, false, &mut ctx);
+        }
+        for c in "new".chars() {
+            handle_key_press(&mut app, KeyCode::Char(c), false, false, &mut ctx);
+        }
+        handle_key_press(&mut app, KeyCode::Enter, false, false, &mut ctx);
+
+        // Assert: the live worker is untouched (same channel, no
+        // respawn) while memory and file still gain the new nickname,
+        // and the user's buffer keeps focus.
+        assert!(app.dialog.is_some());
+        assert_eq!(outgoing.len(), 1);
+        assert!(
+            outgoing["libera"].outgoing.same_channel(&old_sender),
+            "a nickname-only commit must keep the live worker"
+        );
+        assert_eq!(config.servers["libera"].nickname, "new");
+        assert_eq!(
+            crate::config::Config::load(&path).unwrap().servers["libera"].nickname,
+            "new"
+        );
+        assert_eq!(app.active_buffer().unwrap().id, channel);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn committing_a_renamed_label_replaces_the_entry_and_stops_the_old_worker() {
+        // Arrange: two entries, the first with a live fake worker.
+        let path =
+            std::env::temp_dir().join(format!("termirc-wizard-rename-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(
+            &path,
+            "[servers.alpha]\nusername = \"me\"\nnickname = \"me\"\nserver = \"irc.example.org\"\nuse_tls = false\nport = 6667\nchannels = [\"#one\"]\n\n[servers.beta]\nusername = \"you\"\nnickname = \"you\"\nserver = \"irc2.example.org\"\nuse_tls = false\nport = 6667\nchannels = []\n",
+        )
+        .unwrap();
+        let mut config = crate::config::Config::load(&path).unwrap();
+        let mut app = App::new(40, 10);
+        app.open_config_dialog(&config);
+        app.dialog.as_mut().unwrap().pane = crate::tui::dialog::Pane::Form;
+        let (old_outgoing, _old_outgoing_rx) = tokio::sync::mpsc::channel(8);
+        let (old_control, mut old_control_rx) = tokio::sync::mpsc::channel(8);
+        let mut outgoing = std::collections::HashMap::from([(
+            "alpha".to_string(),
+            ConnectionHandle {
+                outgoing: old_outgoing,
+                control: old_control,
+            },
+        )]);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut status = String::new();
+        let mut ctx = save_context(&mut config, &mut outgoing, &tx, &path, &mut status);
+
+        // Act: open the label field, append "2", commit the rename.
+        handle_key_press(&mut app, KeyCode::Enter, false, false, &mut ctx);
+        handle_key_press(&mut app, KeyCode::Char('2'), false, false, &mut ctx);
+        handle_key_press(&mut app, KeyCode::Enter, false, false, &mut ctx);
+
+        // Assert: the old worker is stopped and a new one runs under
+        // the new label.
+        assert!(!outgoing.contains_key("alpha"), "old label worker gone");
+        assert!(outgoing.contains_key("alpha2"), "new label worker spawned");
+        assert!(
+            matches!(
+                old_control_rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+            ),
+            "dropping the old handle must close its control channel"
+        );
+        // The file, the config map, and the dialog's list all replace
+        // the entry at its original position, and the form stays
+        // coherent on the renamed entry.
+        let saved = crate::config::Config::load(&path).unwrap();
+        assert!(!saved.servers.contains_key("alpha"));
+        assert_eq!(
+            saved.servers.keys().collect::<Vec<_>>(),
+            vec!["alpha2", "beta"]
+        );
+        assert_eq!(
+            config.servers.keys().collect::<Vec<_>>(),
+            vec!["alpha2", "beta"]
+        );
+        let dialog = app.dialog.as_ref().unwrap();
+        assert_eq!(
+            dialog
+                .entries
+                .iter()
+                .map(|(label, _)| label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha2", "beta"]
+        );
+        assert_eq!(dialog.selected.as_deref(), Some("alpha2"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_commit_with_bad_input_keeps_the_dialog_the_value_and_shows_the_reason() {
+        // Arrange: the host field of an existing entry, opened for
+        // editing and cleared.
+        let mut app = App::new(40, 10);
+        app.open_config_dialog(&two_server_config());
+        {
+            let dialog = app.dialog.as_mut().unwrap();
+            dialog.pane = crate::tui::dialog::Pane::Form;
+            dialog.cursor = crate::tui::dialog::F_HOST;
         }
         let path = std::env::temp_dir().join("termirc-wizard-invalid.toml");
         let _ = std::fs::remove_file(&path);
         let mut config = crate::config::Config::default();
         let mut outgoing = std::collections::HashMap::new();
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut ctx = KeyContext {
-            config: &mut config,
-            outgoing: &mut outgoing,
-            tx: &tx,
-            config_path: &path,
-            status: &mut String::new(),
-        };
+        let mut status = String::new();
+        let mut ctx = save_context(&mut config, &mut outgoing, &tx, &path, &mut status);
+        handle_key_press(&mut app, KeyCode::Enter, false, false, &mut ctx);
+        for _ in 0.."irc.alpha.org".len() {
+            handle_key_press(&mut app, KeyCode::Backspace, false, false, &mut ctx);
+        }
 
-        // Act
+        // Act: the commit validates and fails.
         handle_key_press(&mut app, KeyCode::Enter, false, false, &mut ctx);
 
-        // Assert: nothing was written or connected and the reason shows.
+        // Assert: nothing was written or connected, the reason shows in
+        // the status row, and the dialog stays open with the edited
+        // value kept (the user must be able to fix it).
         assert!(app.dialog.is_some());
-        assert_eq!(app.dialog.as_ref().unwrap().error, Some("dlg.err_host"));
+        let dialog = app.dialog.as_ref().unwrap();
+        assert_eq!(dialog.error, Some("dlg.err_host"));
+        assert!(!dialog.editing);
+        assert_eq!(dialog.field_text("dlg.field_host"), "");
         assert!(config.servers.is_empty());
         assert!(outgoing.is_empty());
         assert!(!path.exists());
+    }
+
+    /// Two configured servers for wizard tests.
+    fn two_server_config() -> crate::config::Config {
+        crate::config::Config::parse(
+            r##"
+[servers.alpha]
+username = "me"
+nickname = "mynick"
+server = "irc.alpha.org"
+port = 6667
+channels = ["#one"]
+
+[servers.beta]
+username = "you"
+nickname = "yournick"
+server = "irc.beta.org"
+port = 7000
+channels = ["#three"]
+"##,
+        )
+        .unwrap()
     }
 }

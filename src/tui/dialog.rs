@@ -7,27 +7,27 @@
 //! channels). Fields edit through an explicit edit mode, like the chat
 //! composer: `Enter` opens the focused text field (a toggle flips in
 //! place), typing lands only while it is open, `Enter`/`Tab` commit, and
-//! `Esc` discards. The dialog owns only form state and stays free of
-//! terminal I/O: `key` maps a crossterm key code to a state change, the
-//! renderer reads the fields, and `collect` turns them into a
-//! `ServerConfig` (validating with the same rules `Config::parse`
-//! enforces). Saving is orchestrated by `tui::events`, which knows the
-//! config path and the connection map.
+//! `Esc` discards. Editing is WYSIWYG: committing or flipping asks the
+//! caller to persist immediately, so what the screen shows is always the
+//! saved configuration — there is no save action and no unsaved marker.
+//! The dialog owns only form state and stays free of terminal I/O: `key`
+//! maps a crossterm key code to a state change, the renderer reads the
+//! fields, and `collect` turns them into a `ServerConfig` (validating
+//! with the same rules `Config::parse` enforces). Saving is orchestrated
+//! by `tui::events`, which knows the config path and the connection map.
 
 use crate::config::{Config, ServerConfig};
 use crate::core::Draft;
 use ratatui::crossterm::event::KeyCode;
 
 /// Which pane of the two-column wizard holds the keyboard focus. Tab
-/// cycles List → Form → Actions → List; BackTab unwinds it.
+/// and the arrows cycle List ↔ Form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pane {
     /// The left server list.
     List,
     /// The right, paged detail form.
     Form,
-    /// The footer's Save/Cancel actions.
-    Actions,
 }
 
 /// One of the three sequential pages of the detail form.
@@ -217,9 +217,9 @@ pub struct ConfigDialog {
     pub cursor: usize,
     /// The i18n key of the failed `collect` validation, if any.
     pub error: Option<&'static str>,
-    /// The configured server label the form is editing, when any: a
-    /// saved dialog with a different label adds a new entry and keeps
-    /// the old one untouched.
+    /// The configured server label the form is editing, when any: the
+    /// save path replaces the entry (and its file section) when a
+    /// commit changes the label.
     pub selected: Option<String>,
     /// Whether the focused text field is open for editing (entered
     /// with `Enter`, left through `Enter`/`Tab`/`Esc`). Implies
@@ -228,11 +228,6 @@ pub struct ConfigDialog {
     /// The focused field's value as it was when editing began, restored
     /// by an `Esc` discard.
     edit_backup: String,
-    /// The entry whose form edits have not been saved: the list shows a
-    /// trailing `*` on that row so moving the cursor away (which
-    /// silently discards the preview's edits) stays visible. Cleared by
-    /// a save and by landing back on the row.
-    pub dirty_row: Option<String>,
 }
 
 /// What one routed key press did to the dialog.
@@ -240,9 +235,10 @@ pub struct ConfigDialog {
 pub enum DialogOutcome {
     /// Not consumed (or a pure edit): the dialog stays open.
     Edited,
-    /// Close without saving.
+    /// Close the dialog (Esc outside edit mode).
     Cancel,
-    /// Validate and persist; the caller performs the actual save.
+    /// A commit (Enter/Tab) or toggle flip: persist the form now. The
+    /// dialog stays open — what the user sees is the saved state.
     Save,
 }
 
@@ -260,7 +256,6 @@ impl ConfigDialog {
             selected: None,
             editing: false,
             edit_backup: String::new(),
-            dirty_row: None,
         }
     }
 
@@ -308,11 +303,6 @@ impl ConfigDialog {
         self.editing = false;
         self.edit_backup.clear();
         self.error = None;
-        // Landing back on the edited row clears its marker: the user
-        // has now seen that the preview restarted from the saved values.
-        if self.dirty_row == self.selected {
-            self.dirty_row = None;
-        }
     }
 
     /// The current text of the field with this label key (empty for
@@ -378,7 +368,6 @@ impl ConfigDialog {
         match self.pane {
             Pane::List => self.list_key(code),
             Pane::Form => self.form_key(code),
-            Pane::Actions => self.actions_key(code),
         }
     }
 
@@ -409,9 +398,10 @@ impl ConfigDialog {
             }
             // → focuses the form (omp's arrows switch hub panes); there
             // is no pane left of the sidebar, so ← stays a no-op.
-            KeyCode::Right => self.pane = Pane::Form,
-            KeyCode::Tab => self.pane = Pane::Form,
-            KeyCode::BackTab => self.pane = Pane::Actions,
+            KeyCode::Right | KeyCode::Tab => self.pane = Pane::Form,
+            // BackTab wraps the cycle the other way: the form again,
+            // mirroring ←/→'s two-pane semantics.
+            KeyCode::BackTab => self.pane = Pane::Form,
             _ => {}
         }
         DialogOutcome::Edited
@@ -436,20 +426,21 @@ impl ConfigDialog {
             KeyCode::Up => self.cursor = self.cursor.saturating_sub(1).max(range.start),
             KeyCode::Down => self.cursor = (self.cursor + 1).min(range.end - 1),
             KeyCode::Enter => match self.fields.get(self.cursor).map(|field| field.kind) {
-                // A toggle flips in place; a text field opens for
+                // A toggle flips in place — and a flip is a commit, so
+                // it persists immediately; a text field opens for
                 // editing instead of advancing the cursor.
                 Some(FieldKind::Toggle) => {
                     self.fields[self.cursor].flag = !self.fields[self.cursor].flag;
-                    self.mark_dirty();
+                    return DialogOutcome::Save;
                 }
                 Some(FieldKind::Text) => self.begin_edit(),
                 None => {}
             },
-            // Space still flips a toggle without opening it; every
-            // other key is inert until Enter opens the field.
+            // Space still flips (and saves) a toggle without opening
+            // it; every other key is inert until Enter opens the field.
             KeyCode::Char(' ') if self.fields[self.cursor].kind == FieldKind::Toggle => {
                 self.fields[self.cursor].flag = !self.fields[self.cursor].flag;
-                self.mark_dirty();
+                return DialogOutcome::Save;
             }
             _ => {}
         }
@@ -457,19 +448,22 @@ impl ConfigDialog {
     }
 
     /// Keys while the focused text field is open for editing. Edit mode
-    /// is exited only through `Enter` (commit), `Tab` (commit and
-    /// advance) and `Esc` (discard, routed in [`ConfigDialog::key`]);
-    /// every other key edits the value, so `Up`/`Down` and a
-    /// pane-stealing `←` are deliberately ignored as exits.
+    /// is exited only through `Enter` (commit and save), `Tab` (commit,
+    /// advance, save) and `Esc` (discard, routed in
+    /// [`ConfigDialog::key`]); every other key edits the value, so
+    /// `Up`/`Down` and a pane-stealing `←` are deliberately ignored as
+    /// exits.
     fn editing_key(&mut self, code: KeyCode) -> DialogOutcome {
         match code {
-            // Enter commits, keeping the field cursor on the row.
+            // Enter commits and saves, keeping the field cursor on the
+            // row.
             KeyCode::Enter => self.commit_edit(),
             // Tab commits and then takes the same step as outside edit
-            // mode: next field, page turn at an edge, actions last.
+            // mode: next field, page turn at an edge.
             KeyCode::Tab => {
-                self.commit_edit();
+                let outcome = self.commit_edit();
                 self.tab_forward();
+                outcome
             }
             _ => {
                 let Some(field) = self.fields.get_mut(self.cursor) else {
@@ -489,9 +483,9 @@ impl ConfigDialog {
                     KeyCode::End => field.text.end(),
                     _ => {}
                 }
+                DialogOutcome::Edited
             }
         }
-        DialogOutcome::Edited
     }
 
     /// Open the focused text field for editing: remember its value for
@@ -506,50 +500,23 @@ impl ConfigDialog {
     }
 
     /// Close the open field keeping its edited value. The commit is the
-    /// moment an edit counts, so this is where the row is marked.
-    fn commit_edit(&mut self) {
+    /// save: what the user sees is the saved state, so the caller is
+    /// asked to persist right away.
+    fn commit_edit(&mut self) -> DialogOutcome {
         self.editing = false;
         self.edit_backup.clear();
-        self.mark_dirty();
+        DialogOutcome::Save
     }
 
     /// Close the open field restoring the value it had when editing
-    /// began. A discard is not an edit: it never marks the row.
+    /// began. A discard is purely local: nothing is saved and the
+    /// dialog stays exactly as it was.
     fn discard_edit(&mut self) {
         self.editing = false;
         let backup = std::mem::take(&mut self.edit_backup);
         if let Some(field) = self.fields.get_mut(self.cursor) {
             let caret = backup.chars().count();
             field.text.restore(backup, caret);
-        }
-    }
-    /// Keys while the footer actions are focused.
-    fn actions_key(&mut self, code: KeyCode) -> DialogOutcome {
-        match code {
-            KeyCode::Enter => {
-                self.error = None;
-                // A successful save persists the form, so no row keeps
-                // an unsaved-edits marker (the dialog closes anyway).
-                self.dirty_row = None;
-                DialogOutcome::Save
-            }
-            KeyCode::Left => {
-                self.pane = Pane::List;
-                DialogOutcome::Edited
-            }
-            KeyCode::Right => {
-                self.pane = Pane::Form;
-                DialogOutcome::Edited
-            }
-            KeyCode::Tab => {
-                self.pane = Pane::List;
-                DialogOutcome::Edited
-            }
-            KeyCode::BackTab => {
-                self.pane = Pane::Form;
-                DialogOutcome::Edited
-            }
-            _ => DialogOutcome::Edited,
         }
     }
 
@@ -571,19 +538,15 @@ impl ConfigDialog {
     }
 
     /// Tab off the last field of a page turns the page; off the last
-    /// field of the last page it reaches the actions.
+    /// field of the last page it stops there — nothing follows the
+    /// form, the list sits left of it.
     fn tab_forward(&mut self) {
         let range = self.page.fields();
         if self.cursor + 1 < range.end {
             self.cursor += 1;
-        } else {
-            match self.page.next() {
-                Some(next) => {
-                    self.page = next;
-                    self.cursor = next.fields().start;
-                }
-                None => self.pane = Pane::Actions,
-            }
+        } else if let Some(next) = self.page.next() {
+            self.page = next;
+            self.cursor = next.fields().start;
         }
     }
 
@@ -604,15 +567,6 @@ impl ConfigDialog {
         }
     }
 
-    /// Attribute a committed field edit or toggle flip to the entry
-    /// being edited: the marker follows the most recently edited row,
-    /// since a new edit supersedes what the marker said about an
-    /// older one.
-    fn mark_dirty(&mut self) {
-        if let Some(selected) = &self.selected {
-            self.dirty_row = Some(selected.clone());
-        }
-    }
     /// Validate the form into `(label, ServerConfig)`, or the i18n key
     /// of the first violated rule. Every page is checked; `proxy` is the
     /// one key no page models, so it comes back `None` and the save path
@@ -869,18 +823,12 @@ channels = ["#three"]
         assert_eq!((dialog.page, dialog.cursor), (Page::Channels, F_CHANNELS));
         dialog.key(KeyCode::Tab, false, false);
         assert_eq!(dialog.cursor, F_QUERIES);
-        // Tab off the very last field lands on the actions, then the
-        // cycle closes back to the list.
+        // Tab off the very last field stops there: no actions pane
+        // follows the form anymore.
         dialog.key(KeyCode::Tab, false, false);
-        assert_eq!(dialog.pane, Pane::Actions);
-        dialog.key(KeyCode::Tab, false, false);
-        assert_eq!(dialog.pane, Pane::List);
-
-        // BackTab unwinds the exact same path.
-        dialog.key(KeyCode::BackTab, false, false);
-        assert_eq!(dialog.pane, Pane::Actions);
-        dialog.key(KeyCode::BackTab, false, false);
         assert_eq!((dialog.pane, dialog.cursor), (Pane::Form, F_QUERIES));
+
+        // BackTab unwinds the exact same path, ending on the list.
         dialog.key(KeyCode::BackTab, false, false);
         assert_eq!((dialog.page, dialog.cursor), (Page::Channels, F_CHANNELS));
         dialog.key(KeyCode::BackTab, false, false);
@@ -968,8 +916,7 @@ channels = ["#three"]
         dialog.pane = Pane::Form;
 
         // Act / Assert: Enter on a text field opens it for editing —
-        // the cursor stays on the row and never flows toward the
-        // actions (that step belongs to Tab now).
+        // the cursor stays on the row and only Tab advances it.
         dialog.cursor = F_HOST;
         dialog.key(KeyCode::Enter, false, false);
         assert!(dialog.editing);
@@ -982,17 +929,15 @@ channels = ["#three"]
         assert!(!dialog.editing);
         assert_eq!(dialog.fields[F_TLS].flag, !before);
         assert_eq!(dialog.cursor, F_TLS);
-        assert_eq!(dialog.dirty_row.as_deref(), Some("alpha"));
-        // ...and Space flips it the same way.
+        // ...and Space flips (and saves) it the same way.
         dialog.key(KeyCode::Char(' '), false, false);
         assert_eq!(dialog.fields[F_TLS].flag, before);
         assert!(!dialog.editing);
-        // Tab off the last field of the last page still reaches the
-        // actions.
+        // Tab off the last field of the last page stops at the field.
         dialog.page = Page::Channels;
         dialog.cursor = F_QUERIES;
         dialog.key(KeyCode::Tab, false, false);
-        assert_eq!(dialog.pane, Pane::Actions);
+        assert_eq!((dialog.pane, dialog.cursor), (Pane::Form, F_QUERIES))
     }
 
     #[test]
@@ -1012,20 +957,18 @@ channels = ["#three"]
     }
 
     #[test]
-    fn the_actions_row_saves_and_esc_or_ctrl_c_cancel_from_any_pane() {
+    fn esc_or_ctrl_c_cancels_from_any_pane() {
         // Arrange
         let mut dialog = ConfigDialog::from_config(&two_servers());
 
-        // Act / Assert
-        dialog.pane = Pane::Actions;
-        assert_eq!(
-            dialog.key(KeyCode::Enter, false, false),
-            DialogOutcome::Save
-        );
+        // Act / Assert: Esc closes from the list...
         assert_eq!(
             dialog.key(KeyCode::Esc, false, false),
             DialogOutcome::Cancel
         );
+        // ...and from the form, while Ctrl+C does the same from either
+        // pane; every other ctrl chord is swallowed, not saved.
+        dialog.pane = Pane::Form;
         assert_eq!(
             dialog.key(KeyCode::Char('c'), true, false),
             DialogOutcome::Cancel
@@ -1033,16 +976,6 @@ channels = ["#three"]
         assert_eq!(
             dialog.key(KeyCode::Char('x'), true, false),
             DialogOutcome::Edited
-        );
-        dialog.pane = Pane::List;
-        assert_eq!(
-            dialog.key(KeyCode::Esc, false, false),
-            DialogOutcome::Cancel
-        );
-        dialog.pane = Pane::Form;
-        assert_eq!(
-            dialog.key(KeyCode::Char('c'), true, false),
-            DialogOutcome::Cancel
         );
     }
 
@@ -1065,13 +998,6 @@ channels = ["#three"]
         // the same field focused.
         dialog.key(KeyCode::Right, false, false);
         assert_eq!((dialog.pane, dialog.cursor), (Pane::Form, F_LABEL));
-        // From the actions row the arrows pick a side.
-        dialog.pane = Pane::Actions;
-        dialog.key(KeyCode::Left, false, false);
-        assert_eq!(dialog.pane, Pane::List);
-        dialog.pane = Pane::Actions;
-        dialog.key(KeyCode::Right, false, false);
-        assert_eq!(dialog.pane, Pane::Form);
     }
 
     #[test]
@@ -1112,13 +1038,12 @@ channels = ["#three"]
         }
         assert_eq!(dialog.field_text("dlg.field_label"), "alpha");
         assert_eq!(dialog.fields[F_LABEL].text.cursor(), 5);
-        assert_eq!(dialog.dirty_row, None);
 
         // Inside edit mode the same keys edit the value.
         dialog.key(KeyCode::Enter, false, false);
         dialog.key(KeyCode::Char('!'), false, false);
         assert_eq!(dialog.field_text("dlg.field_label"), "alpha!");
-        assert_eq!(dialog.dirty_row, None, "typing alone does not commit");
+        assert!(dialog.editing, "typing alone does not commit");
     }
 
     #[test]
@@ -1129,21 +1054,24 @@ channels = ["#three"]
         dialog.key(KeyCode::Enter, false, false);
         dialog.key(KeyCode::Char('2'), false, false);
 
-        // Act
-        dialog.key(KeyCode::Enter, false, false);
+        // Act: Enter commits — and the commit asks for an immediate
+        // save.
+        assert_eq!(
+            dialog.key(KeyCode::Enter, false, false),
+            DialogOutcome::Save
+        );
 
-        // Assert: the text stays, edit mode ends, the cursor stays on
-        // the row, and the commit marks it unsaved.
+        // Assert: the text stays, edit mode ends, and the cursor stays
+        // on the row.
         assert!(!dialog.editing);
         assert_eq!(dialog.field_text("dlg.field_label"), "alpha2");
         assert_eq!(dialog.cursor, F_LABEL);
-        assert_eq!(dialog.dirty_row.as_deref(), Some("alpha"));
     }
 
     #[test]
     fn esc_while_editing_discards_the_edit_instead_of_cancelling() {
-        // Arrange: one committed edit ("alpha2") marks the row, then
-        // the field reopens and the edit goes further before Esc.
+        // Arrange: one committed edit ("alpha2"), then the field
+        // reopens and the edit goes further before Esc.
         let mut dialog = ConfigDialog::from_config(&two_servers());
         dialog.pane = Pane::Form;
         dialog.key(KeyCode::Enter, false, false);
@@ -1159,11 +1087,10 @@ channels = ["#three"]
             DialogOutcome::Edited
         );
 
-        // Assert: the value snaps back to what the last commit left,
-        // edit mode ends, and the earlier commit's marker survives.
+        // Assert: the value snaps back to what the last commit left
+        // and edit mode ends.
         assert!(!dialog.editing);
         assert_eq!(dialog.field_text("dlg.field_label"), "alpha2");
-        assert_eq!(dialog.dirty_row.as_deref(), Some("alpha"));
 
         // Outside edit mode, Esc cancels the dialog as before.
         assert_eq!(
@@ -1173,43 +1100,21 @@ channels = ["#three"]
     }
 
     #[test]
-    fn an_escaped_edit_never_marks_the_row() {
+    fn an_escaped_edit_stays_local_without_saving() {
         // Arrange / Act: open, type, discard — nothing is committed.
         let mut dialog = ConfigDialog::from_config(&two_servers());
         dialog.pane = Pane::Form;
         dialog.key(KeyCode::Enter, false, false);
         dialog.key(KeyCode::Char('x'), false, false);
-        dialog.key(KeyCode::Esc, false, false);
 
-        // Assert
+        // Assert: Esc restores the value and reports a plain edit, so
+        // nothing reaches the save path.
+        assert_eq!(
+            dialog.key(KeyCode::Esc, false, false),
+            DialogOutcome::Edited
+        );
+        assert!(!dialog.editing);
         assert_eq!(dialog.field_text("dlg.field_label"), "alpha");
-        assert_eq!(dialog.dirty_row, None);
-    }
-
-    #[test]
-    fn tab_while_editing_commits_and_advances_like_idle_tab() {
-        // Arrange: the host field open with a change.
-        let mut dialog = ConfigDialog::from_config(&two_servers());
-        dialog.pane = Pane::Form;
-        dialog.cursor = F_HOST;
-        dialog.key(KeyCode::Enter, false, false);
-        dialog.key(KeyCode::Char('!'), false, false);
-
-        // Act / Assert: Tab commits and steps to the next field.
-        dialog.key(KeyCode::Tab, false, false);
-        assert!(!dialog.editing);
-        assert_eq!(dialog.field_text("dlg.field_host"), "irc.alpha.org!");
-        assert_eq!(dialog.cursor, F_PORT);
-        assert_eq!(dialog.dirty_row.as_deref(), Some("alpha"));
-
-        // Off the last field of the last page it commits and lands on
-        // the actions, the same step as outside edit mode.
-        dialog.page = Page::Channels;
-        dialog.cursor = F_QUERIES;
-        dialog.key(KeyCode::Enter, false, false);
-        dialog.key(KeyCode::Tab, false, false);
-        assert!(!dialog.editing);
-        assert_eq!(dialog.pane, Pane::Actions);
     }
 
     #[test]
@@ -1338,12 +1243,12 @@ channels = ["#three"]
         assert!(dialog.editing);
 
         // Act / Assert: End + insert appends, Backspace removes the
-        // tail — none of it dirties the row before a commit.
+        // tail — none of it reaches the save path before a commit.
         dialog.key(KeyCode::End, false, false);
         dialog.key(KeyCode::Char('s'), false, false);
         dialog.key(KeyCode::Backspace, false, false);
         assert_eq!(dialog.field_text("dlg.field_host"), "irc.libera.chat");
-        assert_eq!(dialog.dirty_row, None);
+        assert!(dialog.editing, "typing alone does not commit");
         // Left moves the caret while editing (not the pane); Delete
         // then removes the character under it.
         dialog.key(KeyCode::Left, false, false);
@@ -1354,54 +1259,119 @@ channels = ["#three"]
     }
 
     #[test]
-    fn committed_edits_mark_the_entry_until_save_or_returning_to_it() {
-        // Arrange: the form focused on the first entry's label.
+    fn moving_the_list_cursor_reloads_the_saved_entry_preview() {
+        // Arrange: the form on the first entry, one field committed (a
+        // save the dialog itself only requests — the entries list is
+        // the save path's business).
         let mut dialog = ConfigDialog::from_config(&two_servers());
         dialog.pane = Pane::Form;
-
-        // Act / Assert: caret moves and typing inside edit mode do not
-        // dirty the entry — only the commit does, or a toggle flip.
         dialog.key(KeyCode::Enter, false, false);
-        dialog.key(KeyCode::End, false, false);
-        dialog.key(KeyCode::Home, false, false);
-        dialog.key(KeyCode::End, false, false);
-        assert_eq!(dialog.dirty_row, None);
         dialog.key(KeyCode::Char('x'), false, false);
-        assert_eq!(dialog.dirty_row, None, "typing alone does not commit");
-        dialog.key(KeyCode::Enter, false, false);
-        assert_eq!(dialog.field_text("dlg.field_label"), "alphax");
-        assert_eq!(dialog.dirty_row.as_deref(), Some("alpha"));
-        dialog.cursor = F_TLS;
-        dialog.key(KeyCode::Char(' '), false, false);
-        assert_eq!(dialog.dirty_row.as_deref(), Some("alpha"));
-
-        // Moving the list cursor away keeps the marker on the row whose
-        // edits were just silently discarded.
-        dialog.pane = Pane::List;
-        dialog.key(KeyCode::Down, false, false);
-        assert_eq!(dialog.selected.as_deref(), Some("beta"));
-        assert_eq!(dialog.dirty_row.as_deref(), Some("alpha"));
-
-        // A save clears it: the dialog closes on success anyway.
-        dialog.pane = Pane::Actions;
         assert_eq!(
             dialog.key(KeyCode::Enter, false, false),
             DialogOutcome::Save
         );
-        assert_eq!(dialog.dirty_row, None);
+        assert_eq!(dialog.field_text("dlg.field_label"), "alphax");
 
-        // Re-landing on the edited row also clears it: the user has now
-        // seen that the preview restarted from the saved values.
+        // Act / Assert: moving away and back restarts the preview from
+        // the entry the list holds — under auto-save the form shows the
+        // persisted state, so an unsaved preview concept cannot leak.
+        dialog.pane = Pane::List;
+        dialog.key(KeyCode::Down, false, false);
+        assert_eq!(dialog.selected.as_deref(), Some("beta"));
+        dialog.key(KeyCode::Up, false, false);
+        assert_eq!(dialog.selected.as_deref(), Some("alpha"));
+        assert_eq!(dialog.field_text("dlg.field_label"), "alpha");
+    }
+
+    #[test]
+    fn committing_a_text_edit_auto_saves_and_keeps_the_form_open() {
+        // Arrange: the label field of the first entry open with a change.
         let mut dialog = ConfigDialog::from_config(&two_servers());
         dialog.pane = Pane::Form;
         dialog.key(KeyCode::Enter, false, false);
-        dialog.key(KeyCode::Char('x'), false, false);
+        dialog.key(KeyCode::Char('2'), false, false);
+
+        // Act: Enter commits — and committing is saving now, so the key
+        // asks the caller to persist instead of just editing.
+        assert_eq!(
+            dialog.key(KeyCode::Enter, false, false),
+            DialogOutcome::Save
+        );
+
+        // Assert: the value stays committed and edit mode ended; the
+        // dialog itself stays open for further browsing.
+        assert!(!dialog.editing);
+        assert_eq!(dialog.field_text("dlg.field_label"), "alpha2");
+        assert_eq!(dialog.cursor, F_LABEL);
+    }
+
+    #[test]
+    fn flipping_a_toggle_auto_saves_in_place() {
+        // Arrange: the form focused on the TLS toggle.
+        let mut dialog = ConfigDialog::from_config(&two_servers());
+        dialog.pane = Pane::Form;
+        dialog.cursor = F_TLS;
+        let before = dialog.fields[F_TLS].flag;
+
+        // Act / Assert: Enter flips (and saves) without edit mode...
+        assert_eq!(
+            dialog.key(KeyCode::Enter, false, false),
+            DialogOutcome::Save
+        );
+        assert!(!dialog.editing);
+        assert_eq!(dialog.fields[F_TLS].flag, !before);
+        // ...and Space flips (and saves) the same way.
+        assert_eq!(
+            dialog.key(KeyCode::Char(' '), false, false),
+            DialogOutcome::Save
+        );
+        assert_eq!(dialog.fields[F_TLS].flag, before);
+    }
+
+    #[test]
+    fn tab_while_editing_commits_advances_and_auto_saves() {
+        // Arrange: the host field open with a change.
+        let mut dialog = ConfigDialog::from_config(&two_servers());
+        dialog.pane = Pane::Form;
+        dialog.cursor = F_HOST;
         dialog.key(KeyCode::Enter, false, false);
-        assert_eq!(dialog.dirty_row.as_deref(), Some("alpha"));
+        dialog.key(KeyCode::Char('!'), false, false);
+
+        // Act: Tab commits, advances, and saves in one step.
+        assert_eq!(dialog.key(KeyCode::Tab, false, false), DialogOutcome::Save);
+
+        // Assert
+        assert!(!dialog.editing);
+        assert_eq!(dialog.field_text("dlg.field_host"), "irc.alpha.org!");
+        assert_eq!(dialog.cursor, F_PORT);
+
+        // Tab off the very last field commits and then stops there:
+        // there is no actions pane to fall into anymore.
+        dialog.page = Page::Channels;
+        dialog.cursor = F_QUERIES;
+        dialog.key(KeyCode::Enter, false, false);
+        dialog.key(KeyCode::Char('!'), false, false);
+        assert_eq!(dialog.key(KeyCode::Tab, false, false), DialogOutcome::Save);
+        assert_eq!((dialog.pane, dialog.cursor), (Pane::Form, F_QUERIES));
+    }
+
+    #[test]
+    fn tab_cycles_only_the_list_and_form_panes() {
+        // Arrange
+        let mut dialog = ConfigDialog::from_config(&two_servers());
+
+        // Act / Assert: Tab from the list focuses the form; BackTab
+        // from the list wraps to the form as well — the arrows' ←/→
+        // semantics (← Form→List, → List→Form) mirrored.
+        dialog.key(KeyCode::Tab, false, false);
+        assert_eq!(dialog.pane, Pane::Form);
         dialog.pane = Pane::List;
-        dialog.key(KeyCode::Down, false, false);
-        dialog.key(KeyCode::Up, false, false);
-        assert_eq!(dialog.selected.as_deref(), Some("alpha"));
-        assert_eq!(dialog.dirty_row, None);
+        dialog.key(KeyCode::BackTab, false, false);
+        assert_eq!(dialog.pane, Pane::Form);
+        // BackTab off the form's first field reaches the list.
+        dialog.cursor = F_LABEL;
+        dialog.key(KeyCode::BackTab, false, false);
+        assert_eq!(dialog.pane, Pane::List);
     }
 }
