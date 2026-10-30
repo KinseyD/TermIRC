@@ -92,7 +92,7 @@ const REGISTRY: &[(&str, &str)] = &[
     ("dlg.page_channels", "channels"),
     (
         "dlg.hub_hint",
-        "enter edit · ↑/↓ fields · ←/→ panes · alt+←/→ page · esc cancel",
+        "Enter edit · ↑/↓ fields · ←/→ panes · Alt+←/→ page · Esc cancel",
     ),
     ("dlg.field_label", "Name"),
     ("dlg.field_host", "Server"),
@@ -110,7 +110,7 @@ const REGISTRY: &[(&str, &str)] = &[
     ("dlg.help_connection", "Name, host, port, and TLS"),
     ("dlg.help_identity", "Nickname, username, password, SASL"),
     ("dlg.help_channels", "Channels and queries at startup"),
-    ("dlg.editing_hint", "enter apply · esc discard"),
+    ("dlg.editing_hint", "Enter apply · Esc discard"),
     (
         "dlg.err_label",
         "the name must be non-empty without spaces or . \" ' [ ] # =",
@@ -536,7 +536,7 @@ mod tests {
             ("dlg.page_channels", "channels"),
             (
                 "dlg.hub_hint",
-                "enter edit · ↑/↓ fields · ←/→ panes · alt+←/→ page · esc cancel",
+                "Enter edit · ↑/↓ fields · ←/→ panes · Alt+←/→ page · Esc cancel",
             ),
             ("dlg.field_label", "Name"),
             ("dlg.field_host", "Server"),
@@ -554,7 +554,7 @@ mod tests {
             ("dlg.help_connection", "Name, host, port, and TLS"),
             ("dlg.help_identity", "Nickname, username, password, SASL"),
             ("dlg.help_channels", "Channels and queries at startup"),
-            ("dlg.editing_hint", "enter apply · esc discard"),
+            ("dlg.editing_hint", "Enter apply · Esc discard"),
             (
                 "dlg.err_label",
                 "the name must be non-empty without spaces or . \" ' [ ] # =",
@@ -698,7 +698,7 @@ mod tests {
                 .iter()
                 .find(|(key, _)| *key == "dlg.hub_hint")
                 .map(|(_, value)| *value),
-            Some("enter edit · ↑/↓ fields · ←/→ panes · alt+←/→ page · esc cancel")
+            Some("Enter edit · ↑/↓ fields · ←/→ panes · Alt+←/→ page · Esc cancel")
         );
         let zh = BUILTIN_LOCALES
             .iter()
@@ -707,7 +707,7 @@ mod tests {
             .1;
         assert!(
             zh.contains(
-                "hub_hint = \"enter 编辑 · ↑/↓ 字段 · ←/→ 切栏 · alt+←/→ 翻页 · esc 取消\""
+                "hub_hint = \"Enter 编辑 · ↑/↓ 字段 · ←/→ 切栏 · Alt+←/→ 翻页 · Esc 取消\""
             ),
             "zh-CN hub hint literal changed"
         );

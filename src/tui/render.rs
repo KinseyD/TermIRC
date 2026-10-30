@@ -2237,7 +2237,7 @@ channels = ["#three"]
         // Assert: the dim helper row under the fields carries the
         // editing hint instead of the page's help while the field is
         // open.
-        assert!(text.contains("enter apply · esc discard"), "{text}");
+        assert!(text.contains("Enter apply · Esc discard"), "{text}");
         assert!(
             !text.contains(crate::i18n::t("dlg.help_identity")),
             "page help must yield to the editing hint: {text}"

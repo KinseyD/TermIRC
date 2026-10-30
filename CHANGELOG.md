@@ -21,8 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   colors joined by a thin separator. Field rows carry the `❯ ` focus
   prefix instead of the old `┃` cursor, `→`/`←` switch panes (← from
   the form always returns to the sidebar), `Alt+Left`/`Alt+Right`
-  turn pages from any pane, and a dim footer hint (`enter edit · ↑/↓
-  fields · ←/→ panes · alt+←/→ page · esc cancel`) replaces the
+  turn pages from any pane, and a dim footer hint (`Enter edit · ↑/↓
+  fields · ←/→ panes · Alt+←/→ page · Esc cancel`) replaces the
   in-form footer buttons.
 - Editing the hub's form is WYSIWYG: what the screen shows is the
   saved configuration. Every commit (`Enter`, or `Tab` which also
@@ -45,7 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cursor at the value's caret (the TLS toggle flips in place
   instead), typing lands only while the field is open, `Enter`
   commits, `Tab` commits and advances, and `Esc` discards — the dim
-  helper row under the fields swaps to `enter apply · esc discard`
+  helper row under the fields swaps to `Enter apply · Esc discard`
   meanwhile.
 
 ### Added
