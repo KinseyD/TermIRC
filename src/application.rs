@@ -125,6 +125,29 @@ impl Session {
         ));
     }
 
+    /// Tear down one server's whole footprint: its buffers (console,
+    /// channels, queries), connection state, and per-server routing
+    /// bookkeeping. The active buffer falls back to another server's
+    /// buffer when the viewed one was closed, or to none. The label
+    /// matches ASCII-case-insensitively, like every `ServerId`
+    /// comparison. History and per-buffer view state keyed by the closed
+    /// `BufferId`s are left in place: ids are never reused, so they are
+    /// unreachable rather than stale.
+    pub fn remove_server(&mut self, label: &str) {
+        let server = ServerId::new(label);
+        self.buffers.retain(|buffer| buffer.server != server);
+        self.servers.remove(&server);
+        self.pending_whois.remove(&server);
+        self.pending_self_echoes
+            .retain(|id, _| self.buffers.iter().any(|buffer| buffer.id == *id));
+        if self
+            .active
+            .is_some_and(|active| self.buffer(active).is_none())
+        {
+            self.active = self.buffers.first().map(|buffer| buffer.id);
+        }
+    }
+
     pub fn new(message_capacity: usize) -> Self {
         Self {
             buffers: Vec::new(),
@@ -1162,6 +1185,43 @@ impl Composer<'_> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn remove_server_closes_its_buffers_and_falls_back_to_a_survivor() {
+        use super::*;
+        let mut session = Session::default();
+        let gone = session.open_server("gone");
+        let channel = session.open_channel("gone", "#a");
+        let query = session.open_query("gone", "alice");
+        let other = session.open_server("other");
+        session.select_buffer_id(channel);
+
+        // Act: the label matches ASCII-case-insensitively, like every
+        // ServerId comparison.
+        session.remove_server("GONE");
+
+        // Assert: every buffer of that server is closed, the active
+        // buffer falls back to a survivor, and other servers stay.
+        assert!(session.buffer(gone).is_none());
+        assert!(session.buffer(channel).is_none());
+        assert!(session.buffer(query).is_none());
+        assert_eq!(session.buffer_count(), 1);
+        assert_eq!(session.active_buffer().map(|buffer| buffer.id), Some(other));
+    }
+
+    #[test]
+    fn remove_server_with_no_survivors_clears_the_active_buffer() {
+        use super::*;
+        let mut session = Session::default();
+        let console = session.open_server("only");
+        session.select_buffer_id(console);
+
+        // Act
+        session.remove_server("only");
+
+        // Assert: nothing is viewed anymore, like a first-run session.
+        assert!(session.active_buffer().is_none());
+        assert!(session.buffer(console).is_none());
+    }
+
     fn connection_notes_fan_out_to_all_server_buffers_without_unread() {
         use super::*;
         let mut session = Session::default();
