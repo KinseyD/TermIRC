@@ -385,7 +385,6 @@ impl ConfigDialog {
             KeyCode::Right => self.pane = Pane::Form,
             KeyCode::Tab => self.pane = Pane::Form,
             KeyCode::BackTab => self.pane = Pane::Actions,
-            KeyCode::PageUp | KeyCode::PageDown => self.turn_page(code == KeyCode::PageDown),
             _ => {}
         }
         DialogOutcome::Edited
@@ -403,10 +402,9 @@ impl ConfigDialog {
             KeyCode::Left if self.fields[self.cursor].text.cursor() == 0 => self.pane = Pane::List,
             KeyCode::BackTab => self.tab_backward(),
             // Up/Down stay within the current page: pages are turned
-            // explicitly (Tab at the edge, PageUp/PageDown).
+            // explicitly (Tab at the edge, alt+←/alt+→ from any pane).
             KeyCode::Up => self.cursor = self.cursor.saturating_sub(1).max(range.start),
             KeyCode::Down => self.cursor = (self.cursor + 1).min(range.end - 1),
-            KeyCode::PageUp | KeyCode::PageDown => self.turn_page(code == KeyCode::PageDown),
             KeyCode::Enter => {
                 if let Some(field) = self.fields.get_mut(self.cursor) {
                     if field.kind == FieldKind::Toggle {
@@ -836,32 +834,39 @@ channels = ["#three"]
     }
 
     #[test]
-    fn page_up_and_down_turn_pages_directly_and_clamp() {
-        // Arrange: the form focused on the first page.
+    fn page_keys_are_inert_and_only_alt_arrows_turn_pages() {
+        // Arrange: the list focused on the first page.
         let mut dialog = ConfigDialog::from_config(&two_servers());
-        dialog.pane = Pane::Form;
 
-        // Act / Assert: pages turn without wrapping around the ends.
+        // Act / Assert: PageUp/PageDown no longer turn pages in any
+        // pane — pages turn only through alt+←/alt+→ (and Tab at a
+        // field edge) — so both keys are swallowed where they land.
         dialog.key(KeyCode::PageDown, false, false);
-        assert_eq!(dialog.page, Page::Identity);
+        assert_eq!(dialog.page, Page::Connection, "list pane");
+        dialog.pane = Pane::Form;
         dialog.key(KeyCode::PageDown, false, false);
-        assert_eq!(dialog.page, Page::Channels);
-        dialog.key(KeyCode::PageDown, false, false);
-        assert_eq!(dialog.page, Page::Channels, "no wrap past the last page");
-        dialog.key(KeyCode::PageUp, false, false);
-        assert_eq!(dialog.page, Page::Identity);
+        assert_eq!(dialog.page, Page::Connection, "form pane");
         dialog.key(KeyCode::PageUp, false, false);
         assert_eq!(dialog.page, Page::Connection);
-        dialog.key(KeyCode::PageUp, false, false);
-        assert_eq!(dialog.page, Page::Connection, "no wrap before the first");
 
-        // The field offset carries into the new page, clamped to it.
+        // alt+←/alt+→ still turn from the form, clamping at the ends
+        // without wrapping and carrying the field offset, clamped,
+        // into the new page.
+        dialog.key(KeyCode::Right, false, true);
+        assert_eq!(dialog.page, Page::Identity);
+        dialog.key(KeyCode::Right, false, true);
+        assert_eq!(dialog.page, Page::Channels);
+        dialog.key(KeyCode::Right, false, true);
+        assert_eq!(dialog.page, Page::Channels, "no wrap past the last page");
         dialog.page = Page::Identity;
         dialog.cursor = F_SASL_PASS; // offset 4 of a 5-field page
-        dialog.key(KeyCode::PageDown, false, false);
+        dialog.key(KeyCode::Right, false, true);
         assert_eq!((dialog.page, dialog.cursor), (Page::Channels, F_QUERIES));
-        dialog.key(KeyCode::PageUp, false, false);
+        dialog.key(KeyCode::Left, false, true);
         assert_eq!((dialog.page, dialog.cursor), (Page::Identity, F_USERNAME));
+        dialog.key(KeyCode::Left, false, true);
+        dialog.key(KeyCode::Left, false, true);
+        assert_eq!(dialog.page, Page::Connection, "no wrap before the first");
     }
 
     #[test]

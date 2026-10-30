@@ -1451,8 +1451,8 @@ fn render_dialog_form(
     // Page track, a replica of omp's segment track (segment-track.ts:
     // `renderSegmentTrack`): the caption, one space, then each page label
     // in its own position color — the active one filled as a powerline
-    // chip with caps, the rest joined by a thin separator — and the
-    // alt-arrow hint two spaces after. The palette maps omp's
+    // chip with caps, the rest joined by a thin separator — with no
+    // trailing hint: the page-turn keys live only in the footer. The
     // accent/success/warning slots onto existing roles: accent →
     // `theme.accent`, success → `theme.status_ok`, warning →
     // `theme.status_pending` (the status palette's uncertain slot).
@@ -1501,11 +1501,6 @@ fn render_dialog_form(
             track.push(Span::styled(label, Style::new().fg(color)));
         }
     }
-    track.push(Span::raw("  "));
-    track.push(Span::styled(
-        "alt+←/alt+→".to_string(),
-        Style::new().fg(theme.dim),
-    ));
     rows.push(Line::from(track));
     rows.push(Line::from(""));
     // Fields of the shown page; the `❯` prefix follows the focused
@@ -2145,11 +2140,16 @@ channels = ["#three"]
         assert_eq!(buffer.cell((57, 2)).unwrap().symbol(), "c");
         assert_eq!(buffer.cell((57, 2)).unwrap().fg, theme().status_pending);
 
-        // The alt-arrow hint closes the row, dim and two spaces after
-        // the track.
-        assert!(row.contains("  alt+←/alt+→"), "{row}");
-        let hint = column_of(&buffer, 2, "alt+←/alt+→");
-        assert_eq!(buffer.cell((hint, 2)).unwrap().fg, theme().dim);
+        // The track row ends with the last page label: the page-turn
+        // hint lives only in the hub's footer, never on the tab row.
+        assert!(!row.contains("alt+←/alt+→"), "{row}");
+        for x in 57 + "channels".len() as u16..buffer.area.width - 1 {
+            assert_eq!(
+                buffer.cell((x, 2)).unwrap().symbol(),
+                " ",
+                "column {x} must stay blank after the track"
+            );
+        }
     }
 
     #[test]
