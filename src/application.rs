@@ -1595,8 +1595,17 @@ mod tests {
                         warm_app.open_channel("srv", "#a");
                     }
                     warm_app.select_buffer(0);
+                    // The warmup must itself submit a rejected slash command:
+                    // interest is cached per callsite, so re-registering only
+                    // the surrounding plumbing (an empty submission never
+                    // reaches the reject callsites) leaves a `never()` cached
+                    // by a sibling test able to blank the captured pass.
+                    for c in "/unknown warmup".chars() {
+                        warm_app.type_char(c);
+                    }
                     let mut warm_status = String::new();
-                    submit_composer(&mut warm_app, &config, &outgoing, &mut warm_status);
+                    let warm_outgoing = std::collections::HashMap::new();
+                    submit_composer(&mut warm_app, &config, &warm_outgoing, &mut warm_status);
                 });
 
                 tracing::subscriber::with_default(subscriber, || {
