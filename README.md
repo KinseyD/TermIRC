@@ -1,24 +1,19 @@
 # TermIRC
 
-[![CI](https://github.com/KinseyD/TermIRC/actions/workflows/ci.yml/badge.svg)](https://github.com/KinseyD/TermIRC/actions/workflows/ci.yml)
+[![CI](https://github.com/KinseyD/TermIRC/actions/workflows/ci.yml)](https://github.com/KinseyD/TermIRC/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/Rust-1.88%2B-DEA584?logo=rust)](https://www.rust-lang.org/)
-[![Built With Ratatui](https://img.shields.io/badge/Built_With_Ratatui-000?logo=ratatui&logoColor=fff)](https://ratatui.rs/)
 
-A terminal IRC client written in Rust. TermIRC reads your servers from a
-TOML config file, opens one connection per server — joining every
-configured channel — and gives you a scrollable chat pane, a
-server/channel sidebar, a composer to talk with, and a focus-aware
-status bar along the bottom. `Enter` sends.
+A terminal IRC client written in Rust. One connection per configured
+server, one config file, no CLI flags.
 
 ## Requirements
 
 - [Rust](https://rustup.rs) 1.88 or newer
 - A terminal with Unicode support; on Windows use **Windows Terminal**
-  (a CJK-capable font is needed if you read CJK channels)
 
 ## Quick start
 
-1. Create the config file at `~/.config/termirc/config.toml`
+1. Create `~/.config/termirc/config.toml`
    (Windows: `C:\Users\<you>\.config\termirc\config.toml`):
 
    ```toml
@@ -33,44 +28,9 @@ status bar along the bottom. `Enter` sends.
    queries = ["alice", "bob"]
    ```
 
-   A sample (`config.example.toml`) ships in the repo root; replace its connection settings before use.
-
-   Alternatively, skip this step: run TermIRC with no config file and
-   the in-TUI setup wizard opens on the first frame. It takes over the
-   whole terminal like a fullscreen hub — a `╭─ Server configuration
-   ─┬─╮` frame with the server list left of the divider and a paged
-   form on the right. The sidebar lists every configured server (a `●`
-   icon, `❯` on the selected row), a separator, and a `+ new server`
-  row; the body opens with a muted status line naming the entry (or
-  the last validation error) over a colored page track whose active
-  page is a filled chip, then edits the selection across three pages:
-  ① connection (name, host, port, TLS), ② identity (nickname,
-  username, server password, SASL pair), ③ channels (pre-join channels
-  and query nicknames). `Up`/`Down` move between fields, `Enter` opens
-  the focused field for editing — typing lands only while it is open,
-  `Enter`/`Tab` commit, `Esc` discards, and the TLS toggle flips in
-  place. Editing is WYSIWYG: what you see on screen is always the
-  saved configuration — every commit or toggle flip writes
-  `config.toml` immediately, so there is no save action and no
-  unsaved marker; `Esc` (outside an open field) closes the wizard.
-  `Tab` walks the fields and turns a page off a page's last field
-  (`BackTab` reverses; both stop at the form's edges), and together
-  with `→`/`←` it cycles the sidebar and the form.
-  `PageUp`/`PageDown` turn pages from any pane. Type `/config` at
-  any time to reopen the wizard; on the welcome page (no composer),
-  `c` opens it instead. Committing a change to a
-  connection-affecting field (label, host, port, TLS, username,
-  password, SASL pair, proxy) respawns the server's worker so the new
-  settings apply immediately; nickname, channels and queries ride the
-  live connection. Renaming an entry replaces it in the file (and its
-  worker) instead of duplicating it; `password` and `queries` are part
-  of the form, while `proxy` and non-server tables (`[ui]`, `[theme]`,
-  ...) are preserved verbatim.
-   Deleting a server is a double gesture: with the hub's list focused
-   on an entry, press `d` — the footer switches to "Press d again to
-   delete" — and a second `d` within three seconds removes the server
-   from `config.toml`, stops its worker, and closes its buffers; any
-   other key (or the deadline passing) cancels.
+   Or just run TermIRC with no config file: the built-in setup wizard
+   opens on first launch and writes the file for you (`/config` reopens
+   it anytime).
 
 2. Run:
 
@@ -78,363 +38,51 @@ status bar along the bottom. `Enter` sends.
    cargo run --release
    ```
 
-3. You land on the welcome page — just the TermIRC logo. Focus starts on
-   the sidebar: move with `j`/`k`, press `Enter` on a channel, and type.
+3. Pick a channel in the sidebar (`j`/`k`, `Enter`) and type. `Enter` sends.
 
-## Configuration
+## Essentials
 
-Each `[servers.<name>]` table is one connection; TermIRC connects to all
-of them in parallel and joins all of their channels. The config is read
-once at startup — restart to pick up changes.
+- `Tab` cycles focus between the sidebar, the messages, and the composer;
+  the focused pane receives your keys.
+- `j`/`k` move the sidebar cursor or message selection, `PgUp`/`PgDn` scroll,
+  `Esc` quits.
+- The mouse works too: wheel scrolls, a click focuses a pane or opens a
+  channel. Hold `Shift` for the terminal's own text selection.
+- The bottom bar shows where your focus is.
 
-| Key        | Required | Default | Meaning                              |
-|------------|----------|---------|--------------------------------------|
-| `username` | yes      | —       | IRC username                         |
-| `nickname` | yes      | —       | the nick others see                  |
-| `password` | yes      | —       | server password / auth token         |
-| `server`   | yes      | —       | hostname                             |
-| `port`     | yes      | —       | usually 6667 (plain) or 6697 (TLS)   |
-| `use_tls`  | no       | `false` | connect over TLS                     |
-| `sasl_username` | no | —    | SASL PLAIN account name; must be set together with `sasl_password` |
-| `sasl_password` | no | —    | SASL PLAIN password; see authentication notes below |
-| `channels` | yes      | —       | startup channel intent, in order; runtime changes are not persisted |
-
-An optional `[servers.<name>.proxy]` table routes that server's connection
-through a SOCKS5 proxy (only `type = "socks5"` is supported); DNS also
-resolves through the proxy. For Tor, a local node at `socks5://127.0.0.1:9050`
-is just `type = "socks5"`, `host = "127.0.0.1"`, `port = 9050` (see
-`config.example.toml`).
-
-| Proxy key  | Required | Default | Meaning                              |
-|------------|----------|---------|--------------------------------------|
-| `type`     | yes      | —       | only `socks5` is accepted            |
-| `host`     | yes      | —       | proxy hostname or IP                 |
-| `port`     | yes      | —       | proxy port (1-65535; Tor: 9050)      |
-| `username` | no       | —       | proxy username                       |
-| `password` | no       | —       | proxy password                       |
-
-`queries` contains individual nicknames, not channels or comma-separated targets.
-Repeated names are deduplicated within each server using ASCII case-insensitive
-matching; the same nickname on different servers is a separate conversation.
-These entries only create sidebar conversations: they do not send JOIN or any
-private message, and do not indicate whether the other user is online.
-
-An optional `[history]` table controls persistent chat history:
-
-| Key              | Required | Default | Meaning                              |
-|------------------|----------|---------|--------------------------------------|
-| `persist`        | no       | `false` | store chat history across restarts   |
-| `retention_days` | no       | `7`     | days to keep archived messages       |
-| `exclude`        | no       | `[]`    | buffers never archived; a bare name applies to every server, `"server/name"` to one server |
-
-`channels` seeds the channels to join at startup. Each entry must be one `#` or
-`&` channel name with at least one character after the prefix; whitespace,
-control characters, commas and colons are not allowed. Invalid configured names
-are rejected when loading the config. Channel keys/passwords and multi-target
-entries are unsupported. Runtime JOIN/PART changes stay in memory, never rewrite
-the config, and disappear when the application exits.
-
-An optional `[ui]` table selects the interface language:
-
-| Key        | Required | Default | Meaning                              |
-|------------|----------|---------|--------------------------------------|
-| `language` | no       | `"en"`  | UI language tag; shipped translations are built in |
-
-`"en"` uses the built-in English strings and loads no file. Shipped
-translations (currently zh-CN) are built into the binary and need no files
-either. A `locales/<language>.toml` file found on the search paths — beside
-the `termirc` binary, in the working directory, or in
-`~/.config/termirc/locales/` — overrides the built-in copy, so per-install
-customization is possible without rebuilding. A missing file, missing
-entries, or entries
-whose `{placeholders}` do not match the English originals fall back to the
-built-in text for just those entries, with one warning per problem in the
-log — a broken locale never keeps TermIRC from starting. Log output and the
-IRC wire itself always stay English.
-
-An optional `[theme]` table recolors the interface. Each key is a color role
-and each value is a named ANSI-16 color (`"red"`, `"bright-black"`, ...), a
-256-color index (`0-255`), or an `"#rrggbb"` hex string. Unlisted roles keep
-their defaults, so an empty `[theme]` table renders exactly like the built-in
-dark theme; unknown role names and malformed colors are rejected at startup.
-The most useful roles:
-
-| Role                | Default     | Colors                          |
-|---------------------|-------------|---------------------------------|
-| `global_bg`         | `#0a0a0a`   | screen background               |
-| `input_bg`          | `#1e1e1e`   | composer panel background       |
-| `accent`            | `#9ad99a`   | composer/selection `┃` accent   |
-| `separator`         | `#555555`   | sidebar/main `│` divider        |
-| `sidebar_active_bg` | `#2e2e2e`   | active channel row background   |
-| `message_select_bg` | `#242424`   | selected message highlight      |
-| `nick`              | `cyan`      | message author prefix           |
-| `status_ok`         | `green`     | connected server dot            |
-
-The remaining roles (`dim`, `accent_dim`, `hover_bg`, `sidebar_cursor_bg`,
-`status_err`, `status_pending`, `status_bar_highlight`) follow the same
-rules; see the commented example in `config.example.toml`. The former
-`input_cursor_fg` / `input_cursor_bg` roles are deprecated: they are still
-accepted (with a warning) but ignored, since the composer's cursor is the
-terminal's real cursor and takes the terminal's own cursor styling.
-
-Security notes:
-
-- The file holds a credential — on Unix, `chmod 600` it.
-- With `use_tls = false` the password crosses the network unencrypted.
-  If your network offers TLS, set `use_tls = true` and the TLS port.
-
-Authentication and capability notes:
-
-- SASL PLAIN authenticates during registration when both `sasl_username` and
-  `sasl_password` are set (both, or neither). It composes with `password`,
-  which is still sent as PASS first. A failed SASL exchange (or a server that
-  does not offer SASL when credentials are configured) stops that server's
-  connection permanently — no silent unauthenticated downgrade, no retries.
-- Every registration starts an IRCv3 capability negotiation
-  (`CAP LS 302`). When the server offers them, TermIRC requests
-  `server-time` (message timestamps taken from the server's `time` tag) and
-  `echo-message` (the server's echo of your own message confirms its local
-  echo instead of displaying a duplicate line). Servers without CAP support
-  skip the exchange automatically with no extra registration traffic.
-- SASL credentials must not contain NUL, CR or LF, and their encoded SASL
-  PLAIN payload must fit one 400-byte `AUTHENTICATE` line; larger
-  combinations are rejected when loading the config.
-
-## Using TermIRC
-
-The gist: `Tab` cycles focus between the sidebar, the messages, and the
-composer, and the focused pane receives your keys. `j`/`k` move the
-sidebar cursor or the message selection, `Enter` opens the highlighted
-channel (sidebar) or sends your line (composer), `PgUp`/`PgDn` scroll the
-messages, and `Esc` quits — the composer's bottom row always repeats the
-essentials. The rest is there to explore.
-
-While the composer has focus, TermIRC positions your terminal's real cursor
-at the caret — blinking, block, or underline exactly as your terminal
-renders it — and hides it whenever another pane (or the welcome page) has
-focus. The sidebar's cursor is a highlighted row, not a terminal cursor.
-
-While you type a `/` command in the composer, matching commands with
-one-line descriptions appear in a hint area above the input; the message
-pane compresses upward while it is visible and restores when it hides.
-`Up`/`Down` move the highlight through the hints and `Tab` completes the
-highlighted command into the input.
-
-The mouse works too: the wheel scrolls the messages, resting the pointer
-on a message pre-highlights it, and a click focuses a pane — clicking a
-channel in the sidebar opens it. While TermIRC runs, hold `Shift` for the
-terminal's own text selection.
-
-A one-line status bar sits at the very bottom: the server and channel
-names followed by a `type in` label, nested arrow-to-tail. The block
-matching where your focus is — typing in the composer, reading the
-message pane, or navigating the sidebar — is highlighted and always the
-last one shown; blocks to its right hide until focus moves past them.
-While the sidebar holds focus its cursor row supplies the names: a server
-header row shows that server's block alone, a channel or query row adds
-that channel's name (`@nick` for queries), so the entry frame already
-shows a highlighted server block. With focus elsewhere the names come
-from the viewed buffer, and a viewed server console shows the server
-block alone. When no block has a value (nothing connected yet) the bar
-renders fully dim — the `type in` label stands for the composer alone.
-Clicking a block focuses the matching sidebar row (inside the sidebar,
-the row that block already names), blocks without a value hide entirely,
-and the server/channel sidebar holds focus from the program's first
-frame.
-
-The status bar's separator is the powerline right-arrow `` (U+E0B0),
-which fills the row's full height; it comes from a Nerd Font. Without
-one, terminals substitute a fallback glyph — the bar still works, the
-arrow just looks plain (`▶`-like at best, a box at worst).
-
-Inputs beginning with `/` after trimming surrounding whitespace are parsed
-as slash commands in both channels and the server console. Supported
-channel, identity and connection commands are:
+### Slash commands
 
 | Command | Behavior |
 | --- | --- |
-| `/join #channel` | Join or focus a channel on the current registered server; a new JOIN waits for server confirmation. |
-| `/part [#channel] [reason]` | Leave the named channel, or the current channel when omitted; retain its buffer and history. |
-| `/query <nickname>` | Create or reopen a private conversation on the current server and focus its composer; works while disconnected. |
-| `/close` | Hide the current private conversation and return to its server console; not available on channels or server consoles. |
-| `/msg <target> <text>` | Send a message without switching conversation. A `#`/`&` target must be a joined channel; a nickname target opens (or reopens) its private conversation and focuses it. |
-| `/me <action>` | Send a CTCP ACTION to the current private conversation or joined channel, shown as `* <action>`. |
-| `/nick <nickname>` | Request a nickname change on the current server; local echoes use the new nickname after the server confirms it. |
-| `/topic [#channel]` | Query the topic of the named channel, or the current channel when omitted; the topic reply appears in that channel's buffer. |
-| `/names [#channel]` | List the members of the named channel, or the current channel when omitted, as a system line; the replies refresh the sidebar's member completion cache. |
-| `/mode [target [mode]]` | Send a MODE query or change, passed through to the server. With no argument, query the modes of the current channel. |
-| `/whois <nickname>` | Query who a nickname is on the current server; the whois replies appear in the buffer that issued the command. |
-| `/away [reason]` | Set an away message. With no argument, toggle between away (default reason `Away`) and back, using the confirmed away state. |
-| `/back` | Clear away status on the current server. |
-| `/connect [server]` | Connect a stopped server using its configuration key; defaults to the current server. |
-| `/reconnect [server]` | Restart that server's connection, or connect if stopped; defaults to the current server. |
-| `/disconnect [reason]` | Disconnect the current server and cancel automatic retries. |
-| `/quit [reason]` | Alias for `/disconnect`; the application remains open. Use Esc or Ctrl+C to exit TermIRC. |
+| `/join #channel` | Join or focus a channel on the current server. |
+| `/part [#channel] [reason]` | Leave a channel; its buffer and history are kept. |
+| `/query <nickname>` | Open a private conversation. |
+| `/close` | Hide the current private conversation. |
+| `/msg <target> <text>` | Send a message without switching conversation. |
+| `/me <action>` | Send a CTCP ACTION. |
+| `/nick <nickname>` | Request a nickname change. |
+| `/topic` `/names` `/mode` `/whois` | Channel/user queries; replies appear in the buffer that issued the command. |
+| `/away [reason]` / `/back` | Set or clear away status. |
+| `/connect [server]` / `/reconnect [server]` | Connect or restart a server's connection. |
+| `/disconnect [reason]` / `/quit [reason]` | Disconnect (Esc or Ctrl+C exits TermIRC). |
 
-Server keys are matched case-insensitively; keys that differ only in ASCII
-letter case cannot coexist in one configuration. Connection commands use the
-existing configuration; they do not add servers. Successful command
-submission clears the composer. Invalid, unsupported or unavailable
-commands retain the original input and cursor for editing. Slash input
-never becomes chat or a raw console line; `//` is not an escape for sending
-a literal slash. Local command feedback is only recorded at DEBUG level,
-without command contents or arguments, and never adds a status-bar prompt
-or history line. Normal server messages still appear in the server console.
+Invalid or unavailable commands keep the original input for editing.
 
-Each server and channel has a status dot (private conversations do not):
+## Configuration notes
 
-- **Green:** server registration confirmed, or our JOIN confirmed for a channel.
-- **Blinking grey:** connecting, waiting to retry, or waiting for a channel JOIN/PART confirmation.
-- **Red:** stopped, not joined, or uncertain channel membership after a timeout.
-
-Unexpected disconnections automatically retry up to three times, waiting
-1, 2 and 4 seconds. A connection/registration attempt times out after
-30 seconds; each channel JOIN or PART has its own 30-second confirmation
-timeout. Registration nickname/password rejection or a server ban stops
-automatic retries immediately. A connection stable for 30 seconds resets
-the retry budget. `/connect` or `/reconnect` starts a fresh retry budget
-after stopping. Reconnection retains the confirmed nickname in memory,
-rejoins channels with current join intent and clears away status. Queued messages from a
-previous connection are discarded, never replayed on the new connection.
-Connect, connection-lost, and disconnect notices appear as system lines in
-every conversation of the server; they cannot be selected and never mark
-conversations unread.
-
-Opening a channel jumps to its newest messages, and the view follows new
-ones while you stay at the bottom. Returning to a previously opened conversation
-restores its reading position. Each server console, channel and private conversation keeps its own
-draft and editing cursor. Histories remain available across disconnections,
-with up to 5,000 messages per conversation; resizing never deletes messages.
-
-Outgoing IRC lines are limited to 512 UTF-8 bytes including the command,
-target and terminating CRLF. Oversized lines retain the full draft and cursor
-for editing; they are not split or queued. Raw console commands preserve the
-spaces within their trailing parameter. Local echoes mean the message was
-queued, not acknowledged by the server; when the server has acknowledged
-`echo-message`, its echo of the same line confirms that local entry in place
-instead of adding a second copy. Server errors for known channels
-appear there once as system messages; other errors appear in the server console.
-
-### Dynamic channels
-
-Use `/join #channel` from a channel, private conversation or server console.
-Use `/part`, `/part leaving for lunch`, or `/part #channel leaving for lunch`
-to leave. Without an explicit target, PART requires a current channel.
-These commands are online-only: the server must have completed registration.
-Only one `#` or `&` channel is accepted, following the configuration name rule;
-keys/passwords, comma-separated targets and `JOIN 0` are not supported.
-Console raw `JOIN #channel` and `PART #channel :reason` use the same managed
-validation, intent and confirmation path, not an unmanaged escape hatch.
-
-Channel state is separate from join intent:
-
-| State | Meaning |
-| --- | --- |
-| `NotJoined` | No confirmed membership; join failure, PART, KICK or disconnection may lead here. |
-| `Joining` | JOIN requested; channel chat remains disabled until our own server-confirmed JOIN. |
-| `Joined` | Our JOIN is confirmed; channel chat is enabled while the server remains registered. |
-| `Parting` | PART requested; channel chat is immediately disabled while confirmation is pending. |
-| `Uncertain` | JOIN/PART timed out; membership is unknown, not proof that the operation failed. Chat remains disabled. |
-
-Each operation has an independent deadline. Late confirmations resolve uncertain
-state; a late JOIN after leaving does not restore join intent and is followed by
-PART when needed. A failed JOIN or KICK retains join intent but does not trigger
-an automatic retry on the same connection. Explicitly use `/join` to retry.
-Our own PART clears intent; PART after a timed-out JOIN also requests exit.
-Reconnection includes runtime-added channels and excludes configured channels
-you have parted. Operations already accepted just before disconnection still
-update intent, but queued chat is never replayed.
-
-PART does not hide or delete the channel: history, draft and reading position
-remain available. Joining an existing channel reuses its buffer. Incoming
-messages for unknown channels are ignored; our own server-confirmed JOIN first
-registers a newly discovered channel, so its first message is not lost.
-`/topic`, `/names` and `/mode` query or change channel state on the
-registered server; their replies are shown in the channel's buffer.
-
-### Private conversations
-
-The sidebar groups each server's channels followed by private conversations,
-shown as `@nickname`. Incoming private messages automatically create or reopen a
-conversation without changing your current page or draft. A trailing `*` marks
-unread messages; it clears only when that conversation is visible at the bottom
-of a nonempty message pane. Scrolling through older messages keeps it unread.
-The sidebar scrolls with keyboard navigation or its mouse wheel.
-
-Use `/query alice` to open a conversation, then type normally and press Enter.
-Sending only requires a registered server connection, not a channel JOIN.
-The first visit opens at the newest message; later visits restore the reading
-position. Private ACTION messages are displayed; ordinary NOTICE messages still
-go to the server console. Replies 401 (no such nickname) and 301 (away) go to an
-existing visible private conversation, otherwise to the server console.
-
-`/close` hides rather than deletes: history, drafts and reading positions remain
-in memory until exit. Opening it again or receiving another private message
-restores it. Closing sends no PART or QUIT and does not block the sender.
-`/query`, incoming messages and `/close` never write the configuration file.
-Configured `queries` appear again on restart; runtime-only conversations do not.
-There is no close shortcut and no persistent history; `/msg <nickname> <text>`
-starts or reopens a private conversation from anywhere on that server.
-
-Confirmed peer nickname changes update the conversation's name and send target
-without changing its identity or configuration. If the new nickname already has
-a conversation, both histories and drafts are preserved separately: the old
-conversation explains the change and blocks sending to the old nickname. Use
-`/query <new-nickname>` to continue, or explicitly `/query <old-nickname>` to
-select that old nickname again and unblock it. Identity changes while offline
-are not inferred; server-specific CASEMAPPING remains unsupported. Sending to
-yourself displays the matching local echo only once; with `echo-message`
-negotiated, the server's echo confirms the local line in place (channel
-messages), leaving no duplicate.
-
-## Architecture and development
-
-TermIRC remains a single crate. Its internal boundaries are:
-
-| Module | Responsibility |
-| --- | --- |
-| `core` | Stable server, buffer and message identities; typed conversations, message metadata, drafts and outbound requests. Uses only the standard library. |
-| `history` | Bounded message queues per buffer; returns the IDs removed by eviction. |
-| `protocol` | IRC decoding, tags, structured server errors, wire encoding and byte limits. |
-| `connection` | One worker per server, bounded queues, confirmed connection state, retries and cancellation. |
-| `application` | Session registration, input submission, command execution, event routing and unconfirmed local echoes. |
-| `tui` | Focus, editing gestures, mouse input, layout, view anchors and rendering. |
-
-`config` and `logging` remain independent services; `main` assembles resources
-and restores the terminal. Core and history have no terminal or IRC-library
-dependencies. Layout uses message IDs and `usize` row coordinates. Measured row
-ranges survive layout-text cache eviction; the 50,000-row cache budget does not
-limit history. Rendering constructs text only for visible rows. The composer
-uses the same display-width geometry for wrapping, sizing and mouse regions.
-
-Persistent history is opt-in via the `[history]` table. When `persist = true`,
-chat and action lines are stored in a local SQLite database at
-`~/.local/share/termirc/history.sqlite` and replayed when their buffer is
-opened again; console and system lines are never stored, records older than
-`retention_days` are deleted at startup, and buffers listed in `exclude` are
-skipped. Deleting the file with `rm` deletes the history.
-
-Run local validation with cached dependencies:
-
-```sh
-cargo test --locked --offline --all-targets
-cargo fmt --all --check
-cargo clippy --all-targets --locked --offline -- -D warnings
-git diff --check
-cargo run --release --locked --offline --example layout_benchmark
-```
-
-Network tests use mock servers bound to `127.0.0.1`; the benchmark reads no
-user configuration and opens no connections.
+- All `[servers.<name>]` keys are documented in `config.example.toml`;
+  the config is read once at startup — restart to pick up changes.
+- Optional SOCKS5 proxy per server via `[servers.<name>.proxy]`
+  (Tor-ready: DNS also resolves through the proxy).
+- Optional persistent history via `[history] persist = true` (SQLite,
+  `retention_days`, `exclude`).
+- UI language via `[ui] language` (built-in English + zh-CN).
 
 ## Troubleshooting
 
-- **`failed to load config from …`** — create
-  `~/.config/termirc/config.toml` (see [Configuration](#configuration)).
 - **CJK characters render as boxes** — use Windows Terminal (or run
   `chcp 65001`) with a CJK font.
-- **A server has a red dot** — check the configuration and runtime log, then
-  use `/connect` or `/reconnect` in that server's console or a channel.
-  A red channel under a green server indicates a failed JOIN, PART or KICK.
-- **Where do the logs live?** Runtime logs (connections, errors; no chat
-  content) rotate daily under `~/.config/termirc/logs/`, 7 days kept.
+- **A server won't connect** — check the config and the log, then use
+  `/connect` or `/reconnect`.
+- **Where do the logs live?** `~/.config/termirc/logs/`, daily files,
+  7 days kept.
