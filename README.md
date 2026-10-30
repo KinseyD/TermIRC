@@ -66,6 +66,11 @@ status bar along the bottom. `Enter` sends.
   worker) instead of duplicating it; `password` and `queries` are part
   of the form, while `proxy` and non-server tables (`[ui]`, `[theme]`,
   ...) are preserved verbatim.
+   Deleting a server is a double gesture: with the hub's list focused
+   on an entry, press `d` — the footer switches to "Press d again to
+   delete" — and a second `d` within three seconds removes the server
+   from `config.toml`, stops its worker, and closes its buffers; any
+   other key (or the deadline passing) cancels.
 
 2. Run:
 

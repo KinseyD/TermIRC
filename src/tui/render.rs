@@ -1276,7 +1276,20 @@ pub fn render_config_dialog(
     put(frame.buffer_mut(), area.x, last_col, footer_y, '│', border);
     frame.render_widget(
         Paragraph::new(Span::styled(
-            i18n::t("dlg.hub_hint").to_string(),
+            // A pending delete swaps the hint for its confirm wording;
+            // expiry is observed by the loop's `tick`, so a live arm
+            // here is one whose deadline has not passed.
+            i18n::t(
+                if dialog
+                    .delete_armed
+                    .is_some_and(|deadline| deadline > std::time::Instant::now())
+                {
+                    "dlg.delete_hint"
+                } else {
+                    "dlg.hub_hint"
+                },
+            )
+            .to_string(),
             Style::new().fg(theme.dim),
         )),
         Rect::new(area.x + 2, footer_y, (width - 4) as u16, 1),
@@ -1807,6 +1820,39 @@ mod tests {
         assert_eq!(footer.chars().next(), Some('│'));
         assert_eq!(footer.chars().last(), Some('│'));
         assert!(footer.contains(crate::i18n::t("dlg.hub_hint")), "{footer}");
+    }
+
+    #[test]
+    fn the_hub_footer_swaps_to_the_delete_hint_while_the_arm_is_live() {
+        // Arrange: a two-server dialog with a delete armed by a `d`.
+        let mut app = App::new(80, 24);
+        app.open_config_dialog(&two_server_config());
+        app.dialog.as_mut().unwrap().key(
+            ratatui::crossterm::event::KeyCode::Char('d'),
+            false,
+            false,
+        );
+
+        // Act / Assert: the footer carries the confirm hint while the
+        // deadline is live...
+        let armed = render_sized(&app, "", 80, 24);
+        let footer = buffer_line(&armed, 22);
+        assert!(
+            footer.contains(crate::i18n::t("dlg.delete_hint")),
+            "{footer}"
+        );
+        assert!(!footer.contains(crate::i18n::t("dlg.hub_hint")), "{footer}");
+
+        // ...and reverts once the deadline has passed.
+        app.dialog.as_mut().unwrap().delete_armed =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        let expired = render_sized(&app, "", 80, 24);
+        let footer = buffer_line(&expired, 22);
+        assert!(footer.contains(crate::i18n::t("dlg.hub_hint")), "{footer}");
+        assert!(
+            !footer.contains(crate::i18n::t("dlg.delete_hint")),
+            "{footer}"
+        );
     }
 
     #[test]

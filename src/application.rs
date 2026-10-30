@@ -1221,7 +1221,7 @@ mod tests {
         assert!(session.active_buffer().is_none());
         assert!(session.buffer(console).is_none());
     }
-
+    #[test]
     fn connection_notes_fan_out_to_all_server_buffers_without_unread() {
         use super::*;
         let mut session = Session::default();

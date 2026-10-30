@@ -94,6 +94,7 @@ const REGISTRY: &[(&str, &str)] = &[
         "dlg.hub_hint",
         "Enter edit · ↑/↓ fields · ←/→ panes · PgUp/PgDn page · Esc cancel",
     ),
+    ("dlg.delete_hint", "Press d again to delete · Esc cancels"),
     ("dlg.field_label", "Name"),
     ("dlg.field_host", "Server"),
     ("dlg.field_port", "Port"),
@@ -538,6 +539,7 @@ mod tests {
                 "dlg.hub_hint",
                 "Enter edit · ↑/↓ fields · ←/→ panes · PgUp/PgDn page · Esc cancel",
             ),
+            ("dlg.delete_hint", "Press d again to delete · Esc cancels"),
             ("dlg.field_label", "Name"),
             ("dlg.field_host", "Server"),
             ("dlg.field_port", "Port"),
@@ -711,6 +713,10 @@ mod tests {
             ),
             "zh-CN hub hint literal changed"
         );
+        assert!(
+            zh.contains("delete_hint = \"再按一下 d 删除 · Esc 取消\""),
+            "zh-CN delete hint literal changed"
+        );
     }
 
     /// The hub's footer paragraph receives `width - 4` columns — 76 at
@@ -724,33 +730,45 @@ mod tests {
                 .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))
                 .sum()
         };
-        // Arrange / Act: the pinned hint strings from both locales.
-        let en = REGISTRY
-            .iter()
-            .find(|(key, _)| *key == "dlg.hub_hint")
-            .map(|(_, value)| *value)
-            .unwrap();
-        let zh_line = BUILTIN_LOCALES
-            .iter()
-            .find(|(tag, _)| *tag == "zh-CN")
-            .unwrap()
-            .1
-            .lines()
-            .find(|line| line.starts_with("hub_hint"))
-            .unwrap();
-        let zh = zh_line
-            .split_once('"')
-            .unwrap()
-            .1
-            .rsplit_once('"')
-            .unwrap()
-            .0;
+        // Arrange / Act: the pinned hint strings from both locales,
+        // hub and delete-confirm alike (both render in the footer).
+        let registry_text = |key: &str| {
+            REGISTRY
+                .iter()
+                .find(|(registry_key, _)| *registry_key == key)
+                .map(|(_, value)| *value)
+                .unwrap()
+        };
+        let zh_text = |prefix: &str| {
+            BUILTIN_LOCALES
+                .iter()
+                .find(|(tag, _)| *tag == "zh-CN")
+                .unwrap()
+                .1
+                .lines()
+                .find(|line| line.starts_with(prefix))
+                .unwrap()
+                .split_once('"')
+                .unwrap()
+                .1
+                .rsplit_once('"')
+                .unwrap()
+                .0
+                .to_string()
+        };
+        let hints = [
+            registry_text("dlg.hub_hint").to_string(),
+            registry_text("dlg.delete_hint").to_string(),
+            zh_text("hub_hint"),
+            zh_text("delete_hint"),
+        ];
 
-        // Assert: both fit 76 display columns, so the footer's last
-        // glyph (`消` of 取消) stays visible at 80 columns.
-        let (en_w, zh_w) = (display_width(en), display_width(zh));
-        assert!(en_w <= 76, "en hint is {en_w} columns: {en}");
-        assert!(zh_w <= 76, "zh hint is {zh_w} columns: {zh}");
+        // Assert: all fit 76 display columns, so the footer's last
+        // glyph stays visible at 80 columns.
+        for hint in &hints {
+            let width = display_width(hint);
+            assert!(width <= 76, "hint is {width} columns: {hint}");
+        }
     }
 
     /// The command table's second column must reference exactly the `cmd.*`

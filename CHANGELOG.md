@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Servers can be deleted from the hub's list: with the sidebar
+  focused on an entry, `d` arms the delete (the footer hint switches
+  to "Press d again to delete · Esc cancels") and a second `d` within
+  three seconds removes the server — its `[servers.<name>]` section
+  from `config.toml`, its worker, and its buffers. Any other key, the
+  deadline passing, or a failed write cancels; the wizard stays open.
+
 ### Changed
 
 - The setup wizard is now a fullscreen hub modeled 1:1 on the
