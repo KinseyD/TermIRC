@@ -111,6 +111,7 @@ const REGISTRY: &[(&str, &str)] = &[
     ("dlg.help_connection", "Name, host, port, and TLS"),
     ("dlg.help_identity", "Nickname, username, password, SASL"),
     ("dlg.help_channels", "Channels and queries at startup"),
+    ("dlg.editing_hint", "enter save · esc discard"),
     (
         "dlg.err_label",
         "the name must be non-empty without spaces or . \" ' [ ] # =",
@@ -556,6 +557,7 @@ mod tests {
             ("dlg.help_connection", "Name, host, port, and TLS"),
             ("dlg.help_identity", "Nickname, username, password, SASL"),
             ("dlg.help_channels", "Channels and queries at startup"),
+            ("dlg.editing_hint", "enter save · esc discard"),
             (
                 "dlg.err_label",
                 "the name must be non-empty without spaces or . \" ' [ ] # =",
@@ -690,7 +692,9 @@ mod tests {
                 .iter()
                 .find(|(key, _)| *key == "dlg.hub_hint")
                 .map(|(_, value)| *value),
-            Some("enter edit/save · ↑/↓ fields · ←/→ panes · alt+←/alt+→ page · tab actions · esc cancel")
+            Some(
+                "enter edit/save · ↑/↓ fields · ←/→ panes · alt+←/alt+→ page · tab actions · esc cancel"
+            )
         );
         let zh = BUILTIN_LOCALES
             .iter()
@@ -703,7 +707,10 @@ mod tests {
             ),
             "zh-CN hub hint literal changed"
         );
-        assert!(!zh.contains("pgup") && !zh.contains("pgdn"), "zh locale: {zh}");
+        assert!(
+            !zh.contains("pgup") && !zh.contains("pgdn"),
+            "zh locale: {zh}"
+        );
     }
 
     /// The command table's second column must reference exactly the `cmd.*`

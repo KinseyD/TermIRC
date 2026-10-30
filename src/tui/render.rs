@@ -1308,6 +1308,48 @@ pub fn render_config_dialog(
     };
     render_dialog_list(frame, rows, dialog, theme);
     render_dialog_form(frame, body, dialog, theme);
+    // The edited field's caret is the terminal's real cursor (like the
+    // composer's): placed at the caret cell while the form holds focus
+    // and a field is open for editing; no other hub state moves it.
+    if dialog.pane == crate::tui::dialog::Pane::Form
+        && dialog.editing
+        && let Some(position) = dialog_cursor_cell(body, dialog)
+    {
+        frame.set_cursor_position(position);
+    }
+}
+
+/// The cell of the open field's text caret: the body column after the
+/// `❯ ` prefix and the 16-column label block, offset by the display
+/// columns before the caret and clamped into the field's value area —
+/// the hub's counterpart of [`composer_cursor_cell`], which clamps
+/// into the composer the same way.
+fn dialog_cursor_cell(
+    body: Rect,
+    dialog: &crate::tui::dialog::ConfigDialog,
+) -> Option<ratatui::layout::Position> {
+    let field = dialog.fields.get(dialog.cursor)?;
+    // Fields start three rows under the body: status, page track, blank.
+    let offset = (dialog.cursor - dialog.page.fields().start) as u16;
+    let y = body.y + 3 + offset;
+    if y >= body.y + body.height {
+        return None;
+    }
+    let value_width = (body.width as usize).saturating_sub(DIALOG_LABEL_WIDTH + 2);
+    if value_width == 0 {
+        return None;
+    }
+    let before_caret: String = field
+        .text
+        .text()
+        .chars()
+        .take(field.text.cursor())
+        .collect();
+    let column = before_caret.width().min(value_width - 1) as u16;
+    Some(ratatui::layout::Position::new(
+        body.x + 2 + DIALOG_LABEL_WIDTH as u16 + column,
+        y,
+    ))
 }
 
 /// The hub's sidebar column: every configured server, a separator rule,
@@ -1533,8 +1575,15 @@ fn render_dialog_form(
         ]));
     }
     rows.push(Line::from(""));
+    let help_key = if dialog.pane == crate::tui::dialog::Pane::Form && dialog.editing {
+        // A field is open: the keys that end the edit matter more than
+        // the page's contents.
+        "dlg.editing_hint"
+    } else {
+        dialog.page.help_key()
+    };
     rows.push(Line::from(Span::styled(
-        i18n::t(dialog.page.help_key()).to_string(),
+        i18n::t(help_key).to_string(),
         Style::new().fg(theme.dim),
     )));
     frame.render_widget(Paragraph::new(rows), area);
@@ -2186,6 +2235,111 @@ channels = ["#three"]
         assert_eq!(buffer.cell((41, 5)).unwrap().symbol(), "i"); // "irc.alpha.org"
         let tls_row = buffer_line(&buffer, 7);
         assert!(tls_row.contains(crate::i18n::t("dlg.off")), "{tls_row}");
+    }
+
+    #[test]
+    fn the_hub_helper_row_switches_to_the_editing_hint_while_editing() {
+        // Arrange: the form focused on the identity page with the
+        // server password field open for editing.
+        let mut app = App::new(80, 24);
+        app.open_config_dialog(&two_server_config());
+        let dialog = app.dialog.as_mut().unwrap();
+        dialog.pane = crate::tui::dialog::Pane::Form;
+        dialog.page = crate::tui::dialog::Page::Identity;
+        dialog.cursor = crate::tui::dialog::F_PASSWORD;
+        dialog.key(ratatui::crossterm::event::KeyCode::Enter, false, false);
+
+        // Act
+        let buffer = render_sized(&app, "", 80, 24);
+        let text: String = (0..buffer.area.height)
+            .map(|y| buffer_line(&buffer, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Assert: the dim helper row under the fields carries the
+        // editing hint instead of the page's help while the field is
+        // open.
+        assert!(text.contains("enter save · esc discard"), "{text}");
+        assert!(
+            !text.contains(crate::i18n::t("dlg.help_identity")),
+            "page help must yield to the editing hint: {text}"
+        );
+
+        // Committing the edit brings the page's own help back.
+        app.dialog
+            .as_mut()
+            .unwrap()
+            .key(ratatui::crossterm::event::KeyCode::Enter, false, false);
+        let buffer = render_sized(&app, "", 80, 24);
+        let text: String = (0..buffer.area.height)
+            .map(|y| buffer_line(&buffer, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains(crate::i18n::t("dlg.help_identity")), "{text}");
+        assert!(!text.contains("enter save · esc discard"), "{text}");
+    }
+
+    #[test]
+    fn the_hub_places_the_terminal_cursor_at_the_edited_fields_caret() {
+        // Arrange: 80x24 with short labels — sidebar 18, divider 21,
+        // body from column 23, 55 wide — and the host field (the
+        // connection page's second row, y=5) opened for editing.
+        let mut app = App::new(80, 24);
+        app.open_config_dialog(&two_server_config());
+        let dialog = app.dialog.as_mut().unwrap();
+        dialog.pane = crate::tui::dialog::Pane::Form;
+        dialog.cursor = crate::tui::dialog::F_HOST;
+        dialog.key(ratatui::crossterm::event::KeyCode::Enter, false, false);
+
+        // Act / Assert: the real terminal cursor sits at the value's
+        // caret cell — body x + the 2-column `❯ ` prefix + 16 label
+        // columns + the 14 columns of "irc.alpha.org" before the caret.
+        let (_, cursor) = render_frame(&app, "", 80, 24, &theme());
+        let expected = 23 + 2 + 16 + "irc.alpha.org".len();
+        assert_eq!(
+            cursor,
+            Some(ratatui::layout::Position::new(expected as u16, 5))
+        );
+
+        // Left moves the caret one column back, still in the value.
+        app.dialog
+            .as_mut()
+            .unwrap()
+            .key(ratatui::crossterm::event::KeyCode::Left, false, false);
+        let (_, cursor) = render_frame(&app, "", 80, 24, &theme());
+        assert_eq!(
+            cursor,
+            Some(ratatui::layout::Position::new((expected - 1) as u16, 5))
+        );
+
+        // A value longer than the value area clamps the caret onto its
+        // last visible cell (the body's final column, 77).
+        app.dialog
+            .as_mut()
+            .unwrap()
+            .key(ratatui::crossterm::event::KeyCode::Enter, false, false);
+        app.dialog
+            .as_mut()
+            .unwrap()
+            .set_field_text("dlg.field_host", &"h".repeat(60));
+        app.dialog
+            .as_mut()
+            .unwrap()
+            .key(ratatui::crossterm::event::KeyCode::Enter, false, false);
+        let (_, cursor) = render_frame(&app, "", 80, 24, &theme());
+        assert_eq!(
+            cursor,
+            Some(ratatui::layout::Position::new(77, 5)),
+            "the caret clamps into the value area"
+        );
+
+        // No other dialog state moves the cursor: committing hides it.
+        app.dialog
+            .as_mut()
+            .unwrap()
+            .key(ratatui::crossterm::event::KeyCode::Enter, false, false);
+        let (_, cursor) = render_frame(&app, "", 80, 24, &theme());
+        assert_eq!(cursor, None, "the hub hides the cursor outside edit mode");
     }
 
     #[test]
