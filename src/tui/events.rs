@@ -35,6 +35,11 @@ pub fn run(
 
     while app.is_running() {
         fit_app(&mut app, term_size);
+        // The dialog owns a deadline (a pending delete): observe time
+        // here so expiry reverts the footer hint without a key press.
+        if let Some(dialog) = app.dialog.as_mut() {
+            dialog.tick(std::time::Instant::now());
+        }
         app.tick(started.elapsed());
         let chrome = ui::Chrome {
             status: &status,
@@ -136,6 +141,7 @@ fn handle_key_press(
         match outcome {
             DialogOutcome::Cancel => app.close_dialog(),
             DialogOutcome::Save => save_dialog(app, ctx),
+            DialogOutcome::Delete(name) => delete_server(app, ctx, &name),
             DialogOutcome::Edited => {}
         }
         return false;
@@ -406,6 +412,33 @@ fn save_dialog(app: &mut App, ctx: &mut KeyContext<'_>) {
             dialog.list_cursor = dialog.entries.len() - 1;
         }
         dialog.error = None;
+    }
+}
+
+/// Carry out a confirmed delete (the second `d` in the hub's list):
+/// rewrite the config file without the entry, drop it from memory and
+/// the worker map (dropping the handle stops the worker), close the
+/// server's buffers, and refresh the dialog onto the surviving row.
+/// The dialog stays open — WYSIWYG continues on what is left. A failed
+/// write keeps everything and shows the reason on the status row.
+fn delete_server(app: &mut App, ctx: &mut KeyContext<'_>, name: &str) {
+    if let Err(error) = config::remove_server(ctx.config_path, name) {
+        // Log the top-level context only: the error chain can embed raw
+        // TOML source lines, which may persist SASL passwords.
+        tracing::warn!(target: "termirc::config", "{error}");
+        if let Some(dialog) = app.dialog.as_mut() {
+            dialog.error = Some("err.cfg_write");
+            dialog.delete_armed = None;
+        }
+        return;
+    }
+    ctx.config.servers.shift_remove(name);
+    // Dropping the handle closes its channels, and the worker's
+    // `control.recv()` returning `None` ends its loop.
+    ctx.outgoing.remove(name);
+    app.session.remove_server(name);
+    if let Some(dialog) = app.dialog.as_mut() {
+        dialog.remove_entry(name);
     }
 }
 
@@ -1194,5 +1227,113 @@ channels = ["#three"]
 "##,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn a_confirmed_delete_removes_the_server_everywhere_and_previews_the_neighbor() {
+        // Arrange: two configured entries with a live fake worker for
+        // the first, its channel viewed, and the wizard on its list.
+        let path =
+            std::env::temp_dir().join(format!("termirc-wizard-delete-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(
+            &path,
+            "[servers.alpha]\nusername = \"me\"\nnickname = \"me\"\npassword = \"\"\nserver = \"irc.alpha.org\"\nuse_tls = false\nport = 6667\nchannels = [\"#one\"]\n\n[servers.beta]\nusername = \"you\"\nnickname = \"you\"\npassword = \"\"\nserver = \"irc.beta.org\"\nuse_tls = false\nport = 6667\nchannels = []\n",
+        )
+        .unwrap();
+        let mut config = crate::config::Config::load(&path).unwrap();
+        let mut app = App::new(40, 10);
+        app.session.register_server("beta", &config.servers["beta"]);
+        app.session
+            .register_server("alpha", &config.servers["alpha"]);
+        let channel = app.open_channel("alpha", "#one");
+        app.activate_buffer(channel);
+        app.open_config_dialog(&config);
+        let (old_outgoing, _old_outgoing_rx) = tokio::sync::mpsc::channel(8);
+        let (old_control, mut old_control_rx) = tokio::sync::mpsc::channel(8);
+        let mut outgoing = std::collections::HashMap::from([(
+            "alpha".to_string(),
+            ConnectionHandle {
+                outgoing: old_outgoing,
+                control: old_control,
+            },
+        )]);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut status = String::new();
+        let mut ctx = save_context(&mut config, &mut outgoing, &tx, &path, &mut status);
+
+        // Act: arm with the first `d`, confirm with the second.
+        handle_key_press(&mut app, KeyCode::Char('d'), false, false, &mut ctx);
+        handle_key_press(&mut app, KeyCode::Char('d'), false, false, &mut ctx);
+
+        // Assert: the file, memory, and worker map all dropped the
+        // entry; the worker's control channel closed; the server's
+        // buffers closed with the active buffer falling back; and the
+        // dialog stayed open previewing the surviving neighbor.
+        assert!(app.dialog.is_some(), "the dialog stays open");
+        let saved = crate::config::Config::load(&path).unwrap();
+        assert!(!saved.servers.contains_key("alpha"));
+        assert!(saved.servers.contains_key("beta"));
+        assert!(!config.servers.contains_key("alpha"));
+        assert!(outgoing.is_empty(), "the worker handle was dropped");
+        assert!(
+            matches!(
+                old_control_rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+            ),
+            "dropping the handle must close its control channel"
+        );
+        assert!(app.buffer(channel).is_none(), "the channel buffer closed");
+        assert_eq!(
+            app.active_buffer().map(|buffer| buffer.id),
+            Some(app.session.open_server("beta")),
+            "the fallback lands on a survivor's console"
+        );
+        let dialog = app.dialog.as_ref().unwrap();
+        assert_eq!(
+            dialog
+                .entries
+                .iter()
+                .map(|(label, _)| label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["beta"]
+        );
+        assert_eq!(dialog.selected.as_deref(), Some("beta"));
+        assert_eq!(dialog.field_text("dlg.field_host"), "irc.beta.org");
+        assert_eq!(dialog.error, None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_failed_delete_keeps_the_dialog_open_with_the_reason() {
+        // Arrange: a valid dialog, but a config path that cannot be
+        // written (a directory stands where the file belongs).
+        let dir =
+            std::env::temp_dir().join(format!("termirc-wizard-delete-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::create_dir(&path).unwrap();
+        let mut config = two_server_config();
+        let mut app = App::new(40, 10);
+        app.open_config_dialog(&config);
+        let mut outgoing = std::collections::HashMap::new();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut status = String::new();
+        let mut ctx = save_context(&mut config, &mut outgoing, &tx, &path, &mut status);
+
+        // Act: arm and confirm the delete of the first entry.
+        handle_key_press(&mut app, KeyCode::Char('d'), false, false, &mut ctx);
+        handle_key_press(&mut app, KeyCode::Char('d'), false, false, &mut ctx);
+
+        // Assert: nothing was removed, the reason shows on the status
+        // row, the arm is gone, and the dialog stays open.
+        assert!(app.dialog.is_some());
+        let dialog = app.dialog.as_ref().unwrap();
+        assert_eq!(dialog.error, Some("err.cfg_write"));
+        assert!(dialog.delete_armed.is_none());
+        assert_eq!(dialog.entries.len(), 2);
+        assert!(config.servers.contains_key("alpha"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

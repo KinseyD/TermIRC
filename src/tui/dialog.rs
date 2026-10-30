@@ -198,6 +198,11 @@ fn fields_from(name: &str, server: &ServerConfig) -> Vec<Field> {
     ]
 }
 
+/// How long the first `d` press stays armed before the pending delete
+/// cancels itself: long enough for a deliberate second press, short
+/// enough that a stray `d` does not linger as a loaded trigger.
+const DELETE_ARM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// The modal wizard: the server list, the paged form for the selection,
 /// and the validation error of the last failed save.
 #[derive(Debug, Clone)]
@@ -228,10 +233,17 @@ pub struct ConfigDialog {
     /// The focused field's value as it was when editing began, restored
     /// by an `Esc` discard.
     edit_backup: String,
+    /// The deadline of a pending delete confirmation: the first `d`
+    /// set it, a second `d` before the deadline confirms, anything
+    /// else (including the deadline passing) cancels it. Public so
+    /// tests can fabricate already-expired arms; `key` re-checks
+    /// expiry with `Instant::now()` itself — the dialog stays pure
+    /// state with no clock parameter on its key routing.
+    pub delete_armed: Option<std::time::Instant>,
 }
 
 /// What one routed key press did to the dialog.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DialogOutcome {
     /// Not consumed (or a pure edit): the dialog stays open.
     Edited,
@@ -240,6 +252,9 @@ pub enum DialogOutcome {
     /// A commit (Enter/Tab) or toggle flip: persist the form now. The
     /// dialog stays open — what the user sees is the saved state.
     Save,
+    /// A confirmed delete (the second `d`): remove this server's entry
+    /// from the file, memory, and the list. The dialog stays open.
+    Delete(String),
 }
 
 impl ConfigDialog {
@@ -256,6 +271,7 @@ impl ConfigDialog {
             selected: None,
             editing: false,
             edit_backup: String::new(),
+            delete_armed: None,
         }
     }
 
@@ -340,6 +356,28 @@ impl ConfigDialog {
                 DialogOutcome::Edited
             };
         }
+        // Lazily expire a pending delete so it can never confirm after
+        // its deadline, even without a `tick` in between.
+        self.delete_armed = self
+            .delete_armed
+            .take_if(|deadline| *deadline > std::time::Instant::now());
+        // A pending delete is a modal confirm: the second `d` confirms,
+        // every other key — Esc included — cancels the arm instead of
+        // doing what it usually would (Esc must not close the dialog),
+        // and nothing reaches the panes while armed.
+        if self.delete_armed.is_some() {
+            self.delete_armed = None;
+            return match code {
+                KeyCode::Char('d') => match self.entries.get(self.list_cursor) {
+                    Some((name, _)) => DialogOutcome::Delete(name.clone()),
+                    // Unreachable in practice — arming requires an
+                    // existing row — but a vanished entry must not
+                    // delete anything.
+                    None => DialogOutcome::Edited,
+                },
+                _ => DialogOutcome::Edited,
+            };
+        }
         if matches!(code, KeyCode::Esc) {
             // While a field is open for editing, Esc discards the edit;
             // only outside edit mode does Esc close the dialog.
@@ -369,6 +407,26 @@ impl ConfigDialog {
             Pane::List => self.list_key(code),
             Pane::Form => self.form_key(code),
         }
+    }
+
+    /// Observe the passage of time: a pending delete whose deadline
+    /// has passed is cancelled here, so the footer hint reverts without
+    /// waiting for a key press. The event loop calls this once per
+    /// iteration.
+    pub fn tick(&mut self, now: std::time::Instant) {
+        self.delete_armed = self.delete_armed.take_if(|deadline| *deadline > now);
+    }
+
+    /// Drop one entry from the list after its server was deleted: the
+    /// cursor clamps onto a surviving row (or the pseudo-row), the form
+    /// previews whatever lands under it, and any arm or error clears.
+    pub fn remove_entry(&mut self, name: &str) {
+        if let Some(index) = self.entries.iter().position(|(label, _)| label == name) {
+            self.entries.remove(index);
+            self.list_cursor = self.list_cursor.min(self.entries.len());
+        }
+        self.delete_armed = None;
+        self.load_selection();
     }
 
     /// Keys while the server list is focused. Typing never reaches the
@@ -402,6 +460,12 @@ impl ConfigDialog {
             // BackTab wraps the cycle the other way: the form again,
             // mirroring ←/→'s two-pane semantics.
             KeyCode::BackTab => self.pane = Pane::Form,
+            // `d` arms deletion of the selected entry — the second `d`
+            // (routed through `key`'s arm gate) confirms. On the
+            // pseudo-row there is nothing to delete, so it stays inert.
+            KeyCode::Char('d') if !self.on_new_row() => {
+                self.delete_armed = Some(std::time::Instant::now() + DELETE_ARM_TIMEOUT);
+            }
             _ => {}
         }
         DialogOutcome::Edited
@@ -1374,5 +1438,114 @@ channels = ["#three"]
         dialog.cursor = F_LABEL;
         dialog.key(KeyCode::BackTab, false, false);
         assert_eq!(dialog.pane, Pane::List);
+    }
+
+    #[test]
+    fn d_arms_deletion_on_an_existing_row_and_stays_inert_on_the_new_row() {
+        // Arrange / Act
+        let mut dialog = ConfigDialog::from_config(&two_servers());
+        assert_eq!(
+            dialog.key(KeyCode::Char('d'), false, false),
+            DialogOutcome::Edited
+        );
+
+        // Assert: the arm carries a future deadline.
+        let deadline = dialog.delete_armed.expect("d must arm the delete");
+        assert!(deadline > std::time::Instant::now());
+
+        // On the pseudo-row the same key does nothing.
+        dialog.delete_armed = None;
+        dialog.key(KeyCode::Char('n'), false, false);
+        dialog.pane = Pane::List;
+        assert!(dialog.on_new_row());
+        dialog.key(KeyCode::Char('d'), false, false);
+        assert!(
+            dialog.delete_armed.is_none(),
+            "no entry under the cursor, no arm"
+        );
+    }
+
+    #[test]
+    fn an_armed_delete_swallows_every_key_but_the_second_d_and_disarms_on_esc() {
+        // Arrange
+        let mut dialog = ConfigDialog::from_config(&two_servers());
+
+        // Act / Assert: any other key cancels the arm, is swallowed,
+        // and leaves the dialog exactly as it was — `n` must not jump
+        // to the form, and Esc must not close the dialog.
+        for code in [
+            KeyCode::Char('n'),
+            KeyCode::Up,
+            KeyCode::Enter,
+            KeyCode::Tab,
+        ] {
+            dialog.key(KeyCode::Char('d'), false, false);
+            assert_eq!(
+                dialog.key(code, false, false),
+                DialogOutcome::Edited,
+                "{code:?}"
+            );
+            assert!(dialog.delete_armed.is_none(), "{code:?} must disarm");
+            assert_eq!(dialog.pane, Pane::List, "{code:?} must not reach the panes");
+            assert_eq!(dialog.list_cursor, 0, "{code:?} must not move the cursor");
+        }
+        dialog.key(KeyCode::Char('d'), false, false);
+        assert_eq!(
+            dialog.key(KeyCode::Esc, false, false),
+            DialogOutcome::Edited
+        );
+        assert!(dialog.delete_armed.is_none());
+        assert_eq!(
+            dialog.selected.as_deref(),
+            Some("alpha"),
+            "Esc disarmed the delete, it did not close the dialog"
+        );
+    }
+
+    #[test]
+    fn the_second_d_within_the_timeout_confirms_and_deletes_the_entry() {
+        // Arrange / Act
+        let mut dialog = ConfigDialog::from_config(&two_servers());
+        dialog.key(KeyCode::Char('d'), false, false);
+
+        // Assert: the confirm carries the selected entry's label and
+        // re-arms nothing.
+        assert!(matches!(
+            dialog.key(KeyCode::Char('d'), false, false),
+            DialogOutcome::Delete(ref name) if name == "alpha"
+        ));
+        assert!(dialog.delete_armed.is_none());
+    }
+
+    #[test]
+    fn an_expired_arm_cannot_confirm_and_tick_clears_it() {
+        // Arrange: an arm whose deadline already passed — fabricated
+        // directly because `key` takes no clock parameter.
+        let mut dialog = ConfigDialog::from_config(&two_servers());
+        dialog.key(KeyCode::Char('d'), false, false);
+        dialog.delete_armed = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+
+        // Act / Assert: the second `d` no longer confirms; expiry drops
+        // the arm and the press re-arms instead.
+        assert_eq!(
+            dialog.key(KeyCode::Char('d'), false, false),
+            DialogOutcome::Edited
+        );
+        assert!(
+            dialog.delete_armed.is_some(),
+            "the press re-armed a fresh delete"
+        );
+
+        // `tick` clears an expired arm outright (the footer hint
+        // reverts without a key press) and keeps a live one.
+        dialog.delete_armed = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        dialog.tick(std::time::Instant::now());
+        assert!(dialog.delete_armed.is_none());
+        dialog.delete_armed = Some(std::time::Instant::now() + DELETE_ARM_TIMEOUT);
+        dialog.tick(std::time::Instant::now());
+        assert!(
+            dialog.delete_armed.is_some(),
+            "a live arm survives its tick"
+        );
     }
 }
