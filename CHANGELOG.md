@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Reclaim the blank row wasted between the composer's fade row and the
+  status bar: the gap below the composer is now the single fade row, so
+  the composer sits flush above the status bar and the message pane
+  gains one row.
+
 ## [0.10.0] — 2026-10-30
 
 ### Added

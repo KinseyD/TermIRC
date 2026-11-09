@@ -49,9 +49,9 @@ pub const HORIZONTAL_PAD: u16 = 2;
 /// Fixed rows of the composer besides the typed text: a blank row above, a
 /// blank row below, and the tips row.
 pub const INPUT_FIXED_ROWS: u16 = 3;
-/// Rows below the composer: a half-block "fade" of its background on the row
-/// immediately under it, then a blank row before the window bottom.
-pub const GAP_ROWS: u16 = 2;
+/// The single row below the composer: a half-block "fade" of its background
+/// immediately above the status bar.
+pub const GAP_ROWS: u16 = 1;
 /// Blank padding between the composer panel's left edge and its text.
 pub const INPUT_LEFT_PAD: u16 = 1;
 /// Blank padding between the composer text and the panel's right edge.
@@ -3012,7 +3012,7 @@ channels = ["#three"]
 
     #[test]
     fn input_area_has_background_and_accent_column() {
-        // Arrange: 50x10 -> input occupies rows 3..=6 (above the 2-row gap
+        // Arrange: 50x10 -> input occupies rows 4..=7 (above the 1-row fade
         // and the status bar on row 9).
         let app = test_app(22, 3);
 
@@ -3022,7 +3022,7 @@ channels = ["#three"]
         // Assert: each input row has the `┃` accent at the composer's left edge
         // (col INPUT_X) in pale green, standing on the global bg (no panel bg
         // behind it); the panel background starts one column to the right.
-        for y in 3..=6 {
+        for y in 4..=7 {
             let cell = buffer.cell((INPUT_X, y)).unwrap();
             assert_eq!(cell.symbol(), "┃", "accent missing on row {y}");
             assert_eq!(cell.fg, theme().accent, "accent color wrong on row {y}");
@@ -3032,7 +3032,7 @@ channels = ["#three"]
                 "accent should sit on global bg on row {y}"
             );
         }
-        assert_eq!(buffer.cell((INPUT_X + 1, 4)).unwrap().bg, theme().input_bg); // panel starts here
+        assert_eq!(buffer.cell((INPUT_X + 1, 5)).unwrap().bg, theme().input_bg); // panel starts here
     }
 
     #[test]
@@ -3043,8 +3043,8 @@ channels = ["#three"]
         // Act
         let buffer = render_sized(&app, "connected to irc.example.org", 100, 10);
 
-        // Assert: the input's last row (row 6) carries status plus key hints.
-        let tips = buffer_line(&buffer, 6);
+        // Assert: the input's last row (row 7) carries status plus key hints.
+        let tips = buffer_line(&buffer, 7);
         assert!(
             tips.contains("connected to irc.example.org"),
             "tips: {tips:?}"
@@ -3063,13 +3063,13 @@ channels = ["#three"]
         // Act
         let (buffer, cursor) = render_frame(&app, "", 50, 10, &theme());
 
-        // Assert: the input line (row 4) shows the text, and the terminal
+        // Assert: the input line (row 5) shows the text, and the terminal
         // cursor sits just past "hi" (at its end).
-        let row = buffer_line(&buffer, 4);
+        let row = buffer_line(&buffer, 5);
         assert!(row.contains("hi"), "row was: {row:?}");
         assert_eq!(
             cursor,
-            Some(ratatui::layout::Position::new(MAIN_COL_X + 2, 4))
+            Some(ratatui::layout::Position::new(MAIN_COL_X + 2, 5))
         );
     }
 
@@ -3130,7 +3130,7 @@ channels = ["#three"]
             );
         }
         // The `┃` lives only on the composer rows, at col INPUT_X.
-        for y in 3..=6 {
+        for y in 4..=7 {
             assert_eq!(buffer.cell((INPUT_X, y)).unwrap().symbol(), "┃");
         }
         assert_eq!(buffer.cell((INPUT_X, 1)).unwrap().symbol(), " ");
@@ -3144,13 +3144,14 @@ channels = ["#three"]
         // Act
         let buffer = render_sized(&app, "", 50, 10);
 
-        // Assert: on the fade row (row 7), the composer's `┃` tapers via `╹`
-        // (pale green, on the global bg); the rest of the row is the `▀` fade.
-        let taper = buffer.cell((INPUT_X, 7)).unwrap();
+        // Assert: on the fade row (row 8, the last row above the status bar),
+        // the composer's `┃` tapers via `╹` (pale green, on the global bg);
+        // the rest of the row is the `▀` fade.
+        let taper = buffer.cell((INPUT_X, 8)).unwrap();
         assert_eq!(taper.symbol(), "╹");
         assert_eq!(taper.fg, theme().accent);
         assert_eq!(taper.bg, theme().global_bg);
-        let fade = buffer.cell((INPUT_X + 1, 7)).unwrap();
+        let fade = buffer.cell((INPUT_X + 1, 8)).unwrap();
         assert_eq!(fade.symbol(), "▀");
         assert_eq!(fade.fg, theme().input_bg);
     }
@@ -3280,9 +3281,8 @@ channels = ["#three"]
     #[test]
     fn message_viewport_extends_down_to_the_composer() {
         // Arrange: H=11 with empty input -> the message viewport owns rows
-        // 0..=3 (the old static spacer row is now the trailing separator in
-        // the stream), composer rows 4..=7. An empty channel lays out to no
-        // rows, so the pane is blank.
+        // 0..=4, composer rows 5..=8, fade row 9, status bar row 10. An
+        // empty channel lays out to no rows, so the pane is blank.
         let mut app = App::new(22, 3);
         app.open_channel("osu_irc", "#osu");
         app.select_buffer(0);
@@ -3293,21 +3293,21 @@ channels = ["#three"]
         // Assert: the pane's bottom row is blank with the global background
         // across the main column, and the composer ┃ starts on the row below.
         for x in INPUT_X..50 {
-            assert_eq!(buffer.cell((x, 3)).unwrap().symbol(), " ", "col {x}");
+            assert_eq!(buffer.cell((x, 4)).unwrap().symbol(), " ", "col {x}");
             assert_eq!(
-                buffer.cell((x, 3)).unwrap().bg,
+                buffer.cell((x, 4)).unwrap().bg,
                 theme().global_bg,
                 "col {x}"
             );
         }
-        assert_eq!(buffer.cell((INPUT_X, 4)).unwrap().symbol(), "┃");
+        assert_eq!(buffer.cell((INPUT_X, 5)).unwrap().symbol(), "┃");
     }
 
     #[test]
     fn multiline_input_grows_the_composer() {
         // Arrange: 25 chars at text width 19 wrap into 2 lines, so the composer
         // is 5 rows (blank + 2 text + blank + tips). For H=11 that puts the
-        // composer on rows 3..=7.
+        // composer on rows 4..=8.
         let mut app = viewing_app(22, 2);
         for _ in 0..25 {
             app.type_char('x');
@@ -3317,24 +3317,24 @@ channels = ["#three"]
         let buffer = render_sized(&app, "", 50, 11);
 
         // Assert: the ┃ spans all 5 composer rows, both wrapped text lines are
-        // shown, and the tips row moved down to row 7.
-        for y in 3..=7 {
+        // shown, and the tips row moved down to row 8.
+        for y in 4..=8 {
             assert_eq!(buffer.cell((INPUT_X, y)).unwrap().symbol(), "┃", "row {y}");
         }
-        assert!(buffer_line(&buffer, 4).contains('x'));
         assert!(buffer_line(&buffer, 5).contains('x'));
-        assert!(buffer_line(&buffer, 7).contains("Esc quit"));
+        assert!(buffer_line(&buffer, 6).contains('x'));
+        assert!(buffer_line(&buffer, 8).contains("Esc quit"));
     }
 
     #[test]
     fn multiline_input_squeezes_the_message_pane() {
-        // Arrange / Act: empty input -> composer 4 rows (┃ top at row 4 for H=11);
-        // 2-line input -> composer 5 rows (┃ top moves up to row 3).
+        // Arrange / Act: empty input -> composer 4 rows (┃ top at row 5 for H=11);
+        // 2-line input -> composer 5 rows (┃ top moves up to row 4).
 
         let app_empty = viewing_app(22, 3);
         let buf_empty = render_sized(&app_empty, "", 50, 11);
-        assert_eq!(buf_empty.cell((INPUT_X, 4)).unwrap().symbol(), "┃");
-        assert_eq!(buf_empty.cell((INPUT_X, 3)).unwrap().symbol(), " ");
+        assert_eq!(buf_empty.cell((INPUT_X, 5)).unwrap().symbol(), "┃");
+        assert_eq!(buf_empty.cell((INPUT_X, 4)).unwrap().symbol(), " ");
 
         let mut app_full = viewing_app(22, 2);
         for _ in 0..25 {
@@ -3343,7 +3343,7 @@ channels = ["#three"]
         let buf_full = render_sized(&app_full, "", 50, 11);
 
         // Assert: the composer's top edge moved up one row.
-        assert_eq!(buf_full.cell((INPUT_X, 3)).unwrap().symbol(), "┃");
+        assert_eq!(buf_full.cell((INPUT_X, 4)).unwrap().symbol(), "┃");
     }
 
     #[test]
@@ -3582,7 +3582,7 @@ channels = ["#three"]
         // Assert: no hint text remains and the pane grew back.
         assert!(row_containing(&plain, "/join").is_none());
         let plain_g = geometry(60, 14, "", 0, true, 0);
-        assert_eq!(plain_g.messages.height, 7);
+        assert_eq!(plain_g.messages.height, 8);
         assert_eq!(plain_g.hints.height, 0);
         assert!(app.is_at_bottom());
     }
@@ -4077,5 +4077,38 @@ queries = []
                 }
             }
         }
+    }
+
+    #[test]
+    fn composer_gap_is_one_fade_row_flush_above_the_status_bar() {
+        // Arrange: a viewed channel with an empty draft, on a 50x10 screen.
+        let app = viewing_app(22, 3);
+
+        // Act
+        let g = geometry(50, 10, app.input(), app.input_cursor(), true, 0);
+
+        // Assert: the gap under the composer is the single fade row, sitting
+        // directly on the status bar - no blank spacer row between them - so
+        // the message pane owns every row above the composer.
+        assert_eq!(g.gap.height, 1);
+        assert_eq!(g.gap.bottom(), g.status_bar.y);
+        assert_eq!(g.composer.bottom(), g.status_bar.y.saturating_sub(1));
+        assert_eq!(g.messages.bottom(), g.composer.y);
+    }
+
+    #[test]
+    fn fade_row_touches_the_status_bar_in_the_rendered_frame() {
+        // Arrange: a viewed channel, empty draft, 50x10 screen.
+        let app = viewing_app(22, 3);
+
+        // Act
+        let buffer = render_sized(&app, "", 50, 10);
+
+        // Assert: row 8 (the last row above the status bar) is the composer's
+        // fade row - `╹` taper at the accent column, `▀` fade beside it - not
+        // a blank spacer, and the composer's tips row sits on row 7.
+        assert_eq!(buffer.cell((INPUT_X, 8)).unwrap().symbol(), "╹");
+        assert_eq!(buffer.cell((INPUT_X + 1, 8)).unwrap().symbol(), "▀");
+        assert!(buffer_line(&buffer, 7).contains("Esc quit"));
     }
 }
