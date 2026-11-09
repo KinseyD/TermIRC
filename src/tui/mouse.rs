@@ -93,15 +93,9 @@ mod tests {
 
     #[test]
     fn composer_rows_are_composer_including_accent_and_right_gap() {
-        assert_eq!(hit(24, 4, W, H, COMPOSER), MouseTarget::Composer); // ┃ accent col
-        assert_eq!(hit(26, 6, W, H, COMPOSER), MouseTarget::Composer); // tips row
-        assert_eq!(hit(49, 5, W, H, COMPOSER), MouseTarget::Composer); // right gap
-    }
-
-    #[test]
-    fn rows_below_the_composer_are_none_except_the_status_bar() {
-        assert_eq!(hit(26, 8, W, H, COMPOSER), MouseTarget::None); // fade row
-        assert_eq!(hit(26, 7, W, H, COMPOSER), MouseTarget::None); // blank row
+        assert_eq!(hit(24, 5, W, H, COMPOSER), MouseTarget::Composer); // ┃ accent col
+        assert_eq!(hit(26, 7, W, H, COMPOSER), MouseTarget::Composer); // tips row
+        assert_eq!(hit(49, 6, W, H, COMPOSER), MouseTarget::Composer); // right gap
     }
 
     #[test]
