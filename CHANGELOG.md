@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-11-13
+
 ### Added
 
 - Typing a lone `/` in the composer opens the slash-command hint bar
@@ -187,6 +189,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - SQLite-backed persistent chat history configured via the `[history]`
   section; restored history obeys the same in-memory cutoffs as live buffers.
 
+[0.11.0]: https://github.com/KinseyD/TermIRC/releases/tag/v0.11.0
 [0.10.1]: https://github.com/KinseyD/TermIRC/releases/tag/v0.10.1
 [0.10.0]: https://github.com/KinseyD/TermIRC/releases/tag/v0.10.0
 [0.9.0]: https://github.com/KinseyD/TermIRC/releases/tag/v0.9.0
