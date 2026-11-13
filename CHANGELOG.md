@@ -10,8 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Typing a lone `/` in the composer opens the slash-command hint bar
-  immediately with the full command catalog; the list still filters by
-  the typed prefix once characters follow the slash.
+  immediately; the bar shows at most five rows and the Up/Down keys
+  scroll the full command catalog behind that viewport (and behind any
+  typed-prefix list) one entry at a time.
 
 ## [0.10.1] — 2026-11-09
 

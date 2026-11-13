@@ -6,8 +6,9 @@ use std::ops::{Deref, DerefMut};
 const MAX_MESSAGES: usize = 5000;
 use super::layout::{LayoutCache, LayoutLine};
 
-/// At most this many matching commands fill the inline hint bar.
-const MAX_HINT_ROWS: usize = 5;
+/// At most this many hint rows are visible at once; longer candidate lists
+/// scroll behind this viewport instead of crowding the messages out.
+pub(crate) const MAX_HINT_ROWS: usize = 5;
 
 /// The draft's leading command word without its `/`, ASCII-lowercased;
 /// a bare `/` yields the empty word, which offers the whole catalog.
@@ -23,27 +24,24 @@ fn hint_word(input: &str) -> Option<String> {
     }
 }
 
-/// Table-order command suggestions whose names strictly extend `prefix`,
-/// capped at `cap`. An exact match yields nothing: the hint bar only
-/// suggests completions still left to type.
+/// Table-order command suggestions whose names strictly extend `prefix`.
+/// An exact match yields nothing: the hint bar only suggests completions
+/// still left to type. The list is complete, never capped here — the
+/// five-row viewport does the capping so every match stays reachable.
 fn prefix_matches(
     table: &[(&'static str, &'static str)],
     prefix: &str,
-    cap: usize,
 ) -> Vec<(&'static str, &'static str)> {
     table
         .iter()
         .filter(|(name, _)| name.starts_with(prefix) && name.len() > prefix.len())
-        .take(cap)
         .copied()
         .collect()
 }
 
 /// The hint bar's items for `input`: [`prefix_matches`] over the command
 /// table, but only while the composer is focused (the bar lives on the
-/// composer, so it hides whenever the composer does). A bare slash lists
-/// the full catalog uncapped; a typed prefix keeps the bar capped so a
-/// growing table can never crowd the messages out.
+/// composer, so it hides whenever the composer does).
 fn hint_matches(input: &str, composer_focused: bool) -> Vec<(&'static str, &'static str)> {
     if !composer_focused {
         return Vec::new();
@@ -51,12 +49,7 @@ fn hint_matches(input: &str, composer_focused: bool) -> Vec<(&'static str, &'sta
     let Some(prefix) = hint_word(input) else {
         return Vec::new();
     };
-    let cap = if prefix.is_empty() {
-        usize::MAX
-    } else {
-        MAX_HINT_ROWS
-    };
-    prefix_matches(&crate::command::COMMANDS, &prefix, cap)
+    prefix_matches(&crate::command::COMMANDS, &prefix)
 }
 
 pub const MAX_CACHED_LINES: usize = 50_000;
@@ -121,10 +114,12 @@ pub struct App {
     connecting_dot_visible: bool,
     cache_budget: usize,
     /// The hint bar's highlight: the leading word it was last moved on
-    /// (`join`, no slash) and the row index chosen then. A different word
-    /// means a different item list, so the highlight reads back as row 0.
+    /// (`join`, no slash), the candidate index chosen then, and the
+    /// viewport's first visible candidate. A different word means a
+    /// different item list, so the highlight reads back as row 0.
     hint_selection_word: String,
     hint_selected: usize,
+    hint_scroll: usize,
     /// The modal setup wizard, while open. Owned here so the renderer
     /// can draw it last and the event loop can route every key to it.
     pub dialog: Option<super::dialog::ConfigDialog>,
@@ -169,6 +164,7 @@ impl App {
             connecting_dot_visible: true,
             hint_selection_word: String::new(),
             hint_selected: 0,
+            hint_scroll: 0,
             dialog: None,
             cache_budget,
         }
@@ -570,11 +566,11 @@ impl App {
     }
 
     /// The hint bar's items for the current draft: `(name, catalog-key)`
-    /// pairs in table order — the full catalog for a bare `/`, otherwise
-    /// capped at [`MAX_HINT_ROWS`]. Keys are resolved to description text
-    /// at render time. Hidden unless the composer is focused on an opened
-    /// buffer and the draft's leading word strictly extends at least one
-    /// command name.
+    /// pairs in table order — the full catalog for a bare `/`, every
+    /// command extending a typed prefix. Keys are resolved to description
+    /// text at render time. Hidden unless the composer is focused on an
+    /// opened buffer and the draft's leading word strictly extends at
+    /// least one command name.
     pub fn command_hints(&self) -> Vec<(&'static str, &'static str)> {
         hint_matches(
             self.input(),
@@ -587,18 +583,38 @@ impl App {
     }
 
     /// Rows the hint bar reserves between the message pane and the composer:
-    /// one separator rule plus one row per visible item. Zero while hidden.
+    /// one separator rule plus one row per visible item — at most
+    /// [`MAX_HINT_ROWS`], whatever the candidate count. Zero while hidden.
     pub fn hint_rows(&self) -> u16 {
         let items = self.command_hints();
         if items.is_empty() {
             return 0;
         }
-        u16::try_from(items.len() + 1).unwrap_or(u16::MAX)
+        let visible = items.len().min(MAX_HINT_ROWS);
+        u16::try_from(visible + 1).unwrap_or(u16::MAX)
     }
 
-    /// The highlighted hint row. Reading resets to the first row whenever
-    /// the item list changed (a different leading word), and clamps to the
-    /// last row so a shrunken list can never point past its end.
+    /// The slice of candidates the viewport currently shows: a
+    /// [`MAX_HINT_ROWS`]-row window over the full list, anchored at the
+    /// stored scroll offset (reset to the top whenever the item list
+    /// changes, clamped read-side so a shrunken list can never scroll
+    /// past its end).
+    pub fn hint_window(&self) -> std::ops::Range<usize> {
+        let len = self.command_hints().len();
+        let visible = len.min(MAX_HINT_ROWS);
+        let start = if self.hint_selection_word == hint_word(self.input()).unwrap_or_default() {
+            self.hint_scroll
+        } else {
+            0
+        };
+        let start = start.min(len.saturating_sub(visible));
+        start..start + visible
+    }
+
+    /// The highlighted hint row, as an index into the full candidate list.
+    /// Reading resets to the first row whenever the item list changed (a
+    /// different leading word), and clamps to the last row so a shrunken
+    /// list can never point past its end.
     pub fn hint_selected(&self) -> usize {
         let items = self.command_hints();
         if items.is_empty() {
@@ -620,14 +636,18 @@ impl App {
     }
 
     /// Clamp-move the hint highlight without wrapping; a no-op while the
-    /// bar is hidden.
+    /// bar is hidden. The viewport scrolls only when the move would leave
+    /// it: past the bottom row the window slides one entry down (the new
+    /// entry enters at the bottom), above the top row it slides one entry
+    /// up, mirroring Down.
     fn move_hint_selection(&mut self, down: bool) {
         let items = self.command_hints();
         if items.is_empty() {
             return;
         }
         let word = hint_word(self.input()).unwrap_or_default();
-        let current = if self.hint_selection_word == word {
+        let same_list = self.hint_selection_word == word;
+        let current = if same_list {
             self.hint_selected.min(items.len() - 1)
         } else {
             0
@@ -637,8 +657,22 @@ impl App {
         } else {
             current.saturating_sub(1)
         };
+        let visible = items.len().min(MAX_HINT_ROWS);
+        let top = if same_list {
+            self.hint_scroll.min(items.len().saturating_sub(visible))
+        } else {
+            0
+        };
+        let scrolled = if next >= top + visible {
+            next + 1 - visible
+        } else if next < top {
+            next
+        } else {
+            top
+        };
         self.hint_selection_word = word;
         self.hint_selected = next;
+        self.hint_scroll = scrolled;
     }
 
     /// Complete the highlighted command into the draft: the leading word
@@ -677,6 +711,7 @@ impl App {
         if self.hint_selection_word != word {
             self.hint_selection_word = word;
             self.hint_selected = 0;
+            self.hint_scroll = 0;
         }
     }
 
