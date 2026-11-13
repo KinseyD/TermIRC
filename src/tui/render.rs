@@ -3648,6 +3648,38 @@ channels = ["#three"]
         }
     }
 
+    #[test]
+    fn typing_a_lone_slash_renders_the_full_hint_bar_immediately() {
+        // Arrange: a viewed channel with the composer focused, empty draft.
+        let mut app = hint_scroll_app();
+        app.restore_input(String::new());
+
+        // Act: typing the slash opens the bar in the very same frame.
+        app.type_char('/');
+        assert!(app.is_hint_active());
+        let buffer = render_fitted(&mut app, 100, 30);
+
+        // Assert: the bar reserves the rule plus one row per catalog
+        // command directly above the composer, and the message pane
+        // still keeps rows of its own.
+        let g = geometry(
+            100,
+            30,
+            app.input(),
+            app.input_cursor(),
+            true,
+            app.hint_rows(),
+        );
+        let full_height = u16::try_from(crate::command::COMMANDS.len() + 1).unwrap();
+        assert_eq!(g.hints.height, full_height);
+        assert_eq!(g.hints.bottom(), g.composer.y);
+        assert!(g.messages.height >= 1);
+        let join_row = row_containing(&buffer, "/join").unwrap();
+        assert_eq!(join_row, g.hints.y + 1);
+        assert!(buffer_line(&buffer, join_row).contains("Join or focus"));
+        assert!(row_containing(&buffer, "/config").is_some());
+    }
+
     /// Column ranges (arrow column included) of the bar's blocks at width
     /// 50 with the osu_irc/#osu buffer, truncated after the highlighted
     /// zone's block — mirroring `fit_status_bar`'s cut. Input focus:

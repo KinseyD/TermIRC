@@ -9,12 +9,18 @@ use super::layout::{LayoutCache, LayoutLine};
 /// At most this many matching commands fill the inline hint bar.
 const MAX_HINT_ROWS: usize = 5;
 
-/// The draft's leading command word without its `/`, ASCII-lowercased.
-/// `None` when the draft (after trimming) does not start a slash command.
+/// The draft's leading command word without its `/`, ASCII-lowercased;
+/// a bare `/` yields the empty word, which offers the whole catalog.
+/// `None` when the draft (after leading whitespace) does not start a
+/// slash command, or when whitespace already followed the slash without
+/// any word (`/ `): nothing is left to complete then.
 fn hint_word(input: &str) -> Option<String> {
-    let rest = input.trim().strip_prefix('/')?;
-    let word = rest.split_whitespace().next()?;
-    Some(word.to_ascii_lowercase())
+    let rest = input.trim_start().strip_prefix('/')?;
+    match rest.split_whitespace().next() {
+        Some(word) => Some(word.to_ascii_lowercase()),
+        None if rest.is_empty() => Some(String::new()),
+        None => None,
+    }
 }
 
 /// Table-order command suggestions whose names strictly extend `prefix`,
@@ -35,7 +41,9 @@ fn prefix_matches(
 
 /// The hint bar's items for `input`: [`prefix_matches`] over the command
 /// table, but only while the composer is focused (the bar lives on the
-/// composer, so it hides whenever the composer does).
+/// composer, so it hides whenever the composer does). A bare slash lists
+/// the full catalog uncapped; a typed prefix keeps the bar capped so a
+/// growing table can never crowd the messages out.
 fn hint_matches(input: &str, composer_focused: bool) -> Vec<(&'static str, &'static str)> {
     if !composer_focused {
         return Vec::new();
@@ -43,7 +51,12 @@ fn hint_matches(input: &str, composer_focused: bool) -> Vec<(&'static str, &'sta
     let Some(prefix) = hint_word(input) else {
         return Vec::new();
     };
-    prefix_matches(&crate::command::COMMANDS, &prefix, MAX_HINT_ROWS)
+    let cap = if prefix.is_empty() {
+        usize::MAX
+    } else {
+        MAX_HINT_ROWS
+    };
+    prefix_matches(&crate::command::COMMANDS, &prefix, cap)
 }
 
 pub const MAX_CACHED_LINES: usize = 50_000;
@@ -557,10 +570,11 @@ impl App {
     }
 
     /// The hint bar's items for the current draft: `(name, catalog-key)`
-    /// pairs in table order, capped at [`MAX_HINT_ROWS`]. Keys are resolved
-    /// to description text at render time. Hidden unless the composer is
-    /// focused on an opened buffer and the draft's leading word strictly
-    /// extends at least one command name.
+    /// pairs in table order — the full catalog for a bare `/`, otherwise
+    /// capped at [`MAX_HINT_ROWS`]. Keys are resolved to description text
+    /// at render time. Hidden unless the composer is focused on an opened
+    /// buffer and the draft's leading word strictly extends at least one
+    /// command name.
     pub fn command_hints(&self) -> Vec<(&'static str, &'static str)> {
         hint_matches(
             self.input(),

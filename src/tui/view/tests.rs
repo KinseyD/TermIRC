@@ -1705,13 +1705,64 @@ fn hint_names(app: &App) -> Vec<&str> {
 }
 
 #[test]
-fn slash_hints_activate_only_for_strict_prefixes_while_composing() {
+fn typing_a_lone_slash_opens_the_hint_bar_immediately() {
+    // Arrange: a viewed channel with the composer focused on an empty draft.
+    let mut app = App::new(40, 10);
+    app.open_channel("srv", "#a");
+    app.select_buffer(0);
+    app.focus_composer();
+    assert!(!app.is_hint_active());
+
+    // Act: the slash itself is the first character typed.
+    app.type_char('/');
+
+    // Assert: the bar is active without any further characters typed.
+    assert!(app.is_hint_active());
+    assert!(app.hint_rows() > 0);
+
+    // A space after the lone slash closes the bar again (no command word
+    // is left to complete), and typing a word reopens it filtered.
+    app.type_char(' ');
+    assert!(!app.is_hint_active());
+    app.backspace();
+    app.type_char('q');
+    assert_eq!(hint_names(&app), ["query", "quit"]);
+}
+
+#[test]
+fn a_bare_slash_lists_the_whole_catalog_without_duplicates() {
+    // Arrange: a bare slash draft offers every command in table order.
+    let table: Vec<&str> = crate::command::COMMANDS
+        .iter()
+        .map(|(name, _)| *name)
+        .collect();
+    assert_eq!(hint_names(&hint_app("/")), table);
+
+    // The catalog never repeats a name, so the bar cannot show dupes.
+    let app = hint_app("/");
+    let listed = hint_names(&app);
+    let mut unique = listed.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(listed.len(), unique.len());
+
+    // A typed prefix still filters by the leading word.
+    assert_eq!(hint_names(&hint_app("/jo")), ["join"]);
+
+    // The list is a pure read of the static table, so it is deterministic.
+    assert_eq!(hint_names(&hint_app("/")), table);
+}
+
+#[test]
+fn slash_hints_hide_for_complete_or_unmatched_words_and_unfocused_composers() {
     // Arrange: a viewed channel with the composer focused.
     let mut app = hint_app("/jo");
     assert_eq!(hint_names(&app), ["join"]);
 
-    // Act/Assert: hidden shapes.
-    for draft in ["/", "/join", "/join #osu", "hello", "  "] {
+    // Act/Assert: hidden shapes — a word already complete, arguments
+    // started, a non-matching prefix, a space ending the empty word, a
+    // plain line, and a blank draft.
+    for draft in ["/join", "/join #osu", "/zz", "/ ", "hello", "  "] {
         app.restore_input(draft.into());
         assert!(hint_names(&app).is_empty(), "{draft:?} must hide the bar");
     }
