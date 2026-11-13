@@ -288,11 +288,12 @@ pub fn draw(frame: &mut Frame, app: &App, chrome: &Chrome<'_>) {
     render_status_bar(frame, g.status_bar, app, theme);
 }
 
-/// Render the inline slash-command hint bar between the message pane and the
-/// composer: a thin rule in the sidebar divider color, then one row per
-/// matching command (`/name — description`) with the highlighted row in bold
-/// reverse video and the others dimming their descriptions. The rows come
-/// from `geometry`, which reserves them out of the message pane.
+/// Render the inline slash-command hint bar between the message pane and
+/// the composer: a thin rule in the sidebar divider color, then one row
+/// per command visible in the five-row viewport (`/name — description`)
+/// with the highlighted row in bold reverse video and the others dimming
+/// their descriptions. The rows come from `geometry`, which reserves them
+/// out of the message pane.
 fn render_hints(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     if area.is_empty() {
         return;
@@ -306,10 +307,13 @@ fn render_hints(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         Rect::new(area.x, area.y, area.width, 1),
     );
     let selected = app.hint_selected();
+    let window = app.hint_window();
     let rows: Vec<Line<'static>> = app
         .command_hints()
         .into_iter()
         .enumerate()
+        .skip(window.start)
+        .take(window.len())
         .map(|(index, (name, key))| {
             // The table's second column is a catalog key; resolve it here so
             // the view state stays raw identifiers and only this presentation
@@ -3646,6 +3650,55 @@ channels = ["#three"]
                 }
             }
         }
+    }
+
+    #[test]
+    fn typing_a_lone_slash_renders_a_capped_scrollable_hint_bar_immediately() {
+        // Arrange: a viewed channel with the composer focused, empty draft.
+        let mut app = hint_scroll_app();
+        app.restore_input(String::new());
+
+        // Act: typing the slash opens the bar in the very same frame.
+        app.type_char('/');
+        assert!(app.is_hint_active());
+        let buffer = render_fitted(&mut app, 100, 30);
+
+        // Assert: the bar reserves the rule plus at most five item rows —
+        // never the whole catalog — and shows the table's first window.
+        let g = geometry(
+            100,
+            30,
+            app.input(),
+            app.input_cursor(),
+            true,
+            app.hint_rows(),
+        );
+        assert_eq!(
+            g.hints.height,
+            u16::try_from(crate::tui::view::MAX_HINT_ROWS + 1).unwrap()
+        );
+        assert_eq!(g.hints.bottom(), g.composer.y);
+        assert!(g.messages.height >= 1);
+        let join_row = row_containing(&buffer, "/join").unwrap();
+        assert_eq!(join_row, g.hints.y + 1);
+        assert!(buffer_line(&buffer, join_row).contains("Join or focus"));
+        assert!(
+            row_containing(&buffer, "/config").is_none(),
+            "commands past the viewport must stay off-screen"
+        );
+
+        // Scrolling to the end of the catalog swaps the window: the last
+        // command enters at the viewport's bottom, the first one leaves.
+        for _ in 0..crate::command::COMMANDS.len() - 1 {
+            app.hint_down();
+        }
+        let scrolled = render_fitted(&mut app, 100, 30);
+        let config_row = row_containing(&scrolled, "/config").unwrap();
+        assert!(buffer_line(&scrolled, config_row).contains("configuration wizard"));
+        assert!(
+            row_containing(&scrolled, "/join").is_none(),
+            "scrolled-out commands must leave the frame"
+        );
     }
 
     /// Column ranges (arrow column included) of the bar's blocks at width

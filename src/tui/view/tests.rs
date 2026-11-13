@@ -1705,13 +1705,64 @@ fn hint_names(app: &App) -> Vec<&str> {
 }
 
 #[test]
-fn slash_hints_activate_only_for_strict_prefixes_while_composing() {
+fn typing_a_lone_slash_opens_the_hint_bar_immediately() {
+    // Arrange: a viewed channel with the composer focused on an empty draft.
+    let mut app = App::new(40, 10);
+    app.open_channel("srv", "#a");
+    app.select_buffer(0);
+    app.focus_composer();
+    assert!(!app.is_hint_active());
+
+    // Act: the slash itself is the first character typed.
+    app.type_char('/');
+
+    // Assert: the bar is active without any further characters typed.
+    assert!(app.is_hint_active());
+    assert!(app.hint_rows() > 0);
+
+    // A space after the lone slash closes the bar again (no command word
+    // is left to complete), and typing a word reopens it filtered.
+    app.type_char(' ');
+    assert!(!app.is_hint_active());
+    app.backspace();
+    app.type_char('q');
+    assert_eq!(hint_names(&app), ["query", "quit"]);
+}
+
+#[test]
+fn a_bare_slash_lists_the_whole_catalog_without_duplicates() {
+    // Arrange: a bare slash draft offers every command in table order.
+    let table: Vec<&str> = crate::command::COMMANDS
+        .iter()
+        .map(|(name, _)| *name)
+        .collect();
+    assert_eq!(hint_names(&hint_app("/")), table);
+
+    // The catalog never repeats a name, so the bar cannot show dupes.
+    let app = hint_app("/");
+    let listed = hint_names(&app);
+    let mut unique = listed.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(listed.len(), unique.len());
+
+    // A typed prefix still filters by the leading word.
+    assert_eq!(hint_names(&hint_app("/jo")), ["join"]);
+
+    // The list is a pure read of the static table, so it is deterministic.
+    assert_eq!(hint_names(&hint_app("/")), table);
+}
+
+#[test]
+fn slash_hints_hide_for_complete_or_unmatched_words_and_unfocused_composers() {
     // Arrange: a viewed channel with the composer focused.
     let mut app = hint_app("/jo");
     assert_eq!(hint_names(&app), ["join"]);
 
-    // Act/Assert: hidden shapes.
-    for draft in ["/", "/join", "/join #osu", "hello", "  "] {
+    // Act/Assert: hidden shapes — a word already complete, arguments
+    // started, a non-matching prefix, a space ending the empty word, a
+    // plain line, and a blank draft.
+    for draft in ["/join", "/join #osu", "/zz", "/ ", "hello", "  "] {
         app.restore_input(draft.into());
         assert!(hint_names(&app).is_empty(), "{draft:?} must hide the bar");
     }
@@ -1746,13 +1797,13 @@ fn slash_hints_activate_only_for_strict_prefixes_while_composing() {
 }
 
 #[test]
-fn slash_hints_filter_in_table_order_and_cap_at_five_rows() {
+fn slash_hints_filter_in_table_order_and_keep_the_whole_list() {
     // Arrange/Assert: matches keep the description table's order.
     let app = hint_app("/c");
     assert_eq!(hint_names(&app), ["close", "connect", "config"]);
 
-    // Act/Assert: a list longer than the bar's capacity is truncated after
-    // the first matches in table order.
+    // Act/Assert: a list longer than the bar's capacity stays complete;
+    // the five-row viewport, not the candidate list, does the capping.
     let fabricated = [
         ("aa0", ""),
         ("aa1", ""),
@@ -1763,11 +1814,98 @@ fn slash_hints_filter_in_table_order_and_cap_at_five_rows() {
         ("aa6", ""),
         ("aa7", ""),
     ];
-    let capped = prefix_matches(&fabricated, "aa", MAX_HINT_ROWS);
+    let listed = prefix_matches(&fabricated, "aa");
     assert_eq!(
-        capped.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
-        ["aa0", "aa1", "aa2", "aa3", "aa4"]
+        listed.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+        ["aa0", "aa1", "aa2", "aa3", "aa4", "aa5", "aa6", "aa7"]
     );
+}
+
+#[test]
+fn a_bare_slash_caps_the_hint_bar_viewport_at_five_rows() {
+    // Arrange: a bare slash offers all 18 commands.
+    let mut app = hint_app("/");
+    assert_eq!(hint_names(&app).len(), 18);
+
+    // Act/Assert: the reserved block is the rule plus exactly five rows,
+    // and the viewport shows the first five commands in table order.
+    assert_eq!(app.hint_rows(), u16::try_from(MAX_HINT_ROWS + 1).unwrap());
+    assert_eq!(app.hint_window().len(), MAX_HINT_ROWS);
+    assert_eq!(app.hint_window().start, 0);
+
+    // Short lists still reserve one row per item, never padding to five.
+    app.restore_input("/q".into());
+    assert_eq!(app.hint_rows(), 3);
+    assert_eq!(app.hint_window().len(), 2);
+}
+
+#[test]
+fn down_past_the_fifth_row_scrolls_the_viewport_one_entry_at_a_time() {
+    // Arrange: the bare-slash catalog with the highlight on the first row.
+    let mut app = hint_app("/");
+    assert_eq!(app.hint_window(), 0..MAX_HINT_ROWS);
+
+    // Act: five Downs move the highlight onto the sixth command; the new
+    // entry enters at the viewport's bottom and the top entry leaves.
+    for _ in 0..MAX_HINT_ROWS {
+        app.hint_down();
+    }
+    assert_eq!(app.hint_selected(), MAX_HINT_ROWS);
+    assert_eq!(app.hint_window(), 1..1 + MAX_HINT_ROWS);
+    assert_eq!(
+        hint_names(&app)[app.hint_window().clone()].first(),
+        Some(&"part")
+    );
+
+    // Up from the viewport's inner rows does not scroll; Up past the top
+    // scrolls one entry down (the leaving entry re-enters at the top).
+    app.hint_up();
+    assert_eq!(app.hint_selected(), 4);
+    assert_eq!(app.hint_window(), 1..1 + MAX_HINT_ROWS);
+    for _ in 0..4 {
+        app.hint_up();
+    }
+    assert_eq!(app.hint_selected(), 0);
+    assert_eq!(app.hint_window(), 0..MAX_HINT_ROWS);
+
+    // Movement still clamps at both ends without wrapping.
+    app.hint_up();
+    assert_eq!(app.hint_selected(), 0);
+    assert_eq!(app.hint_window(), 0..MAX_HINT_ROWS);
+}
+
+#[test]
+fn scrolling_reaches_the_last_command_exactly_once() {
+    // Arrange: the bare-slash catalog.
+    let mut app = hint_app("/");
+    let table: Vec<String> = hint_names(&app).into_iter().map(str::to_string).collect();
+
+    // Act: enough Downs to reach the last row; Down there is a no-op.
+    for _ in 0..table.len() - 1 {
+        app.hint_down();
+    }
+    assert_eq!(app.hint_selected(), table.len() - 1);
+    app.hint_down();
+    assert_eq!(app.hint_selected(), table.len() - 1);
+
+    // Assert: the viewport frames the table's tail, so every command is
+    // reachable by scrolling and the deterministic order holds end to end.
+    let window: Vec<&str> = table[app.hint_window().clone()]
+        .iter()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(window.last(), Some(&"config"));
+    assert!(!window.contains(&"join"));
+    assert_eq!(window.len(), 5);
+    for _ in 0..table.len() - 1 {
+        app.hint_up();
+    }
+    assert_eq!(app.hint_selected(), 0);
+    assert_eq!(app.hint_window().start, 0);
+    let mut round_trip = table.clone();
+    round_trip.sort_unstable();
+    round_trip.dedup();
+    assert_eq!(table.len(), round_trip.len());
 }
 
 #[test]
