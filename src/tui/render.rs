@@ -62,6 +62,13 @@ pub const INPUT_RIGHT_GAP: u16 = 3;
 /// The composer text is this many columns narrower than the message viewport
 /// (INPUT_LEFT_PAD + INPUT_RIGHT_PAD, given how the panel is positioned).
 pub const INPUT_TEXT_INSET: u16 = INPUT_LEFT_PAD + INPUT_RIGHT_PAD;
+/// Blank columns kept between the widest message text and the message
+/// pane's right boundary, on top of [`HORIZONTAL_PAD`]: text never touches
+/// the viewport's right edge.
+pub const MESSAGE_RIGHT_PAD: u16 = 1;
+/// Blank columns between the hint bar (its separator rule and its rows)
+/// and the window's right edge; long descriptions ellipsize to fit.
+pub const HINT_RIGHT_GAP: u16 = 3;
 
 /// The powerline right-pointing triangle (U+E0B0, from Nerd Fonts) that
 /// closes every status-bar block. Unlike `U+25B6` it is designed to fill
@@ -176,17 +183,28 @@ pub fn geometry(
     // keeps at least one message row when the terminal can afford both; a
     // terminal too short for that hides the bar rather than the messages.
     let hint_height = hint_rows.min(available_rows(height, chrome_height));
-    let messages = inset(
+    // The pane's width doubles as the wrap width (`App::resize` feeds it to
+    // the layout cache), so the extra right pad keeps one blank column
+    // between the widest wrapped text and the pane's right boundary.
+    let messages = {
+        let pane = inset(
+            Rect::new(
+                main.x,
+                0,
+                main.width,
+                height
+                    .saturating_sub(chrome_height)
+                    .saturating_sub(hint_height),
+            ),
+            HORIZONTAL_PAD,
+        );
         Rect::new(
-            main.x,
-            0,
-            main.width,
-            height
-                .saturating_sub(chrome_height)
-                .saturating_sub(hint_height),
-        ),
-        HORIZONTAL_PAD,
-    );
+            pane.x,
+            pane.y,
+            pane.width.saturating_sub(MESSAGE_RIGHT_PAD),
+            pane.height,
+        )
+    };
     let hints = Rect::new(main.x, messages.bottom(), main.width, hint_height);
     let composer = Rect::new(main.x, hints.bottom(), main.width, composer_height);
     let gap = Rect::new(main.x, composer.bottom(), main.width, gap_height);
@@ -298,16 +316,28 @@ fn render_hints(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     if area.is_empty() {
         return;
     }
-    let rule: String = "─".repeat(usize::from(area.width));
+    // The rule and the hint rows share the same right boundary: both stop
+    // HINT_RIGHT_GAP columns short of the window's right edge.
+    let rule_width = area.width.saturating_sub(HINT_RIGHT_GAP);
+    let rule: String = "─".repeat(usize::from(rule_width));
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             rule,
             Style::new().fg(theme.separator),
         ))),
-        Rect::new(area.x, area.y, area.width, 1),
+        Rect::new(area.x, area.y, rule_width, 1),
     );
     let selected = app.hint_selected();
     let window = app.hint_window();
+    let text_area = Rect::new(
+        area.x + HORIZONTAL_PAD,
+        area.y + 1,
+        area.width.saturating_sub(HORIZONTAL_PAD + HINT_RIGHT_GAP),
+        area.height - 1,
+    );
+    // Descriptions clip with the shared ellipsis convention so a row that
+    // would overflow still ends inside the right boundary.
+    let text_width = usize::from(text_area.width);
     let rows: Vec<Line<'static>> = app
         .command_hints()
         .into_iter()
@@ -319,26 +349,25 @@ fn render_hints(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             // the view state stays raw identifiers and only this presentation
             // layer localizes.
             let description = i18n::t(key);
+            let prefix = format!("/{name}");
             if index == selected {
                 Line::from(Span::styled(
-                    format!("/{name} — {description}"),
+                    clip_columns(&format!("{prefix} — {description}"), text_width),
                     Style::new().add_modifier(Modifier::BOLD | Modifier::REVERSED),
                 ))
             } else {
+                let rest = text_width.saturating_sub(prefix.width());
                 Line::from(vec![
-                    Span::raw(format!("/{name}")),
-                    Span::styled(format!(" — {description}"), Style::new().fg(theme.dim)),
+                    Span::raw(prefix),
+                    Span::styled(
+                        clip_columns(&format!(" — {description}"), rest),
+                        Style::new().fg(theme.dim),
+                    ),
                 ])
             }
         })
         .collect();
-    frame.render_widget(
-        Paragraph::new(Text::from(rows)),
-        inset(
-            Rect::new(area.x, area.y + 1, area.width, area.height - 1),
-            HORIZONTAL_PAD,
-        ),
-    );
+    frame.render_widget(Paragraph::new(Text::from(rows)), text_area);
 }
 /// Render the thin gray vertical line that separates the sidebar from the main
 /// column, spanning the full height (left edge of the separator-gap segment).
@@ -3283,6 +3312,29 @@ channels = ["#three"]
     }
 
     #[test]
+    fn message_text_keeps_one_blank_column_before_the_pane_right_edge() {
+        // Arrange: for W=50 the pane's text starts at x = 26; a nick-less
+        // message wraps to the pane's width, so its first row is the
+        // widest the text ever gets.
+        let mut app = viewing_app(22, 3);
+        app.push_message(msg("", &"a".repeat(60)));
+
+        // Act
+        let buffer = render_fitted(&mut app, 50, 10);
+
+        // Assert: the first wrapped row fills up to x = 46 and keeps x = 47
+        // blank — one empty column between the widest text and the pane's
+        // right boundary.
+        let row = row_containing(&buffer, &"a".repeat(21)).unwrap();
+        assert_eq!(buffer.cell((46, row)).unwrap().symbol(), "a");
+        assert_eq!(
+            buffer.cell((47, row)).unwrap().symbol(),
+            " ",
+            "one blank column must survive at the pane's right edge"
+        );
+    }
+
+    #[test]
     fn message_viewport_extends_down_to_the_composer() {
         // Arrange: H=11 with empty input -> the message viewport owns rows
         // 0..=4, composer rows 5..=8, fade row 9, status bar row 10. An
@@ -3699,6 +3751,59 @@ channels = ["#three"]
             row_containing(&scrolled, "/join").is_none(),
             "scrolled-out commands must leave the frame"
         );
+    }
+
+    #[test]
+    fn the_hint_rule_stops_three_columns_short_of_the_screen_right_edge() {
+        // Arrange: a visible hint bar on a 100-column terminal.
+        let mut app = hint_scroll_app();
+        app.restore_input("/j".into());
+        let buffer = render_fitted(&mut app, 100, 30);
+        let g = geometry(
+            100,
+            30,
+            app.input(),
+            app.input_cursor(),
+            true,
+            app.hint_rows(),
+        );
+
+        // Assert: the rule's last dash sits at x = 96; the remaining three
+        // columns of the window stay blank.
+        let rule_row = g.hints.y;
+        assert_eq!(buffer.cell((96, rule_row)).unwrap().symbol(), "─");
+        for x in 97..=99 {
+            assert_eq!(buffer.cell((x, rule_row)).unwrap().symbol(), " ", "col {x}");
+        }
+    }
+
+    #[test]
+    fn hint_text_stops_three_columns_short_of_the_screen_right_edge() {
+        // Arrange: the lone-slash hint bar on a 100-column terminal.
+        let mut app = hint_scroll_app();
+        app.restore_input(String::new());
+        app.type_char('/');
+        let buffer = render_fitted(&mut app, 100, 30);
+
+        // Assert: the first hint row's text never enters the window's last
+        // three columns.
+        let row = row_containing(&buffer, "/join").unwrap();
+        for x in 97..=99 {
+            assert_eq!(buffer.cell((x, row)).unwrap().symbol(), " ", "col {x}");
+        }
+
+        // A narrow terminal truncates the description with the shared
+        // ellipsis convention, still inside the same boundary.
+        let narrow = render_fitted(&mut app, 40, 30);
+        let row = row_containing(&narrow, "/join").unwrap();
+        assert!(
+            buffer_line(&narrow, row).trim_end().ends_with('…'),
+            "long description must ellipsize: {}",
+            buffer_line(&narrow, row)
+        );
+        for x in 37..=39 {
+            assert_eq!(narrow.cell((x, row)).unwrap().symbol(), " ", "col {x}");
+        }
     }
 
     /// Column ranges (arrow column included) of the bar's blocks at width

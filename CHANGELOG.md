@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+- Respect right-side breathing room in the main column: message text
+  keeps one blank column before the message pane's right edge, and the
+  hint bar's separator rule and hint rows (ellipsizing overlong
+  descriptions) stop three columns short of the window's right edge.
+
 - Typing a lone `/` in the composer opens the slash-command hint bar
   immediately; the bar shows at most five rows and the Up/Down keys
   scroll the full command catalog behind that viewport (and behind any
