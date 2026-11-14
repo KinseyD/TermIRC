@@ -78,16 +78,18 @@ mod tests {
 
     #[test]
     fn message_pane_rows_map_to_their_screen_row() {
-        // The pane's content spans x = 26..=47 (22 + 2 + 2 .. 50 - 2 - 1).
+        // The pane's content spans x = 26..=46 (22 + 2 + 2 .. 50 - 2 - 1,
+        // minus MESSAGE_RIGHT_PAD at the right edge).
         assert_eq!(hit(26, 0, W, H, COMPOSER), MouseTarget::MessageRow(0));
-        assert_eq!(hit(47, 2, W, H, COMPOSER), MouseTarget::MessageRow(2));
+        assert_eq!(hit(46, 2, W, H, COMPOSER), MouseTarget::MessageRow(2));
     }
 
     #[test]
     fn message_pane_horizontal_padding_is_none() {
         assert_eq!(hit(24, 1, W, H, COMPOSER), MouseTarget::None); // left pad
         assert_eq!(hit(25, 1, W, H, COMPOSER), MouseTarget::None);
-        assert_eq!(hit(48, 1, W, H, COMPOSER), MouseTarget::None); // right pad
+        assert_eq!(hit(47, 1, W, H, COMPOSER), MouseTarget::None); // right pad
+        assert_eq!(hit(48, 1, W, H, COMPOSER), MouseTarget::None);
         assert_eq!(hit(49, 1, W, H, COMPOSER), MouseTarget::None);
     }
 
