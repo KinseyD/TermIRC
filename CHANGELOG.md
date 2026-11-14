@@ -7,16 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.11.0] — 2026-11-13
+## [0.11.1] — 2026-11-15
 
-### Added
-
-### Changed
+### Fixed
 
 - Respect right-side breathing room in the main column: message text
   keeps one blank column before the message pane's right edge, and the
   hint bar's separator rule and hint rows (ellipsizing overlong
   descriptions) stop three columns short of the window's right edge.
+
+## [0.11.0] — 2026-11-13
+
+### Added
+
+### Changed
 
 - Typing a lone `/` in the composer opens the slash-command hint bar
   immediately; the bar shows at most five rows and the Up/Down keys
@@ -196,6 +200,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - SQLite-backed persistent chat history configured via the `[history]`
   section; restored history obeys the same in-memory cutoffs as live buffers.
 
+[0.11.1]: https://github.com/KinseyD/TermIRC/releases/tag/v0.11.1
 [0.11.0]: https://github.com/KinseyD/TermIRC/releases/tag/v0.11.0
 [0.10.1]: https://github.com/KinseyD/TermIRC/releases/tag/v0.10.1
 [0.10.0]: https://github.com/KinseyD/TermIRC/releases/tag/v0.10.0
