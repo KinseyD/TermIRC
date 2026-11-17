@@ -343,6 +343,17 @@ impl ConfigDialog {
         }
     }
 
+    /// Insert pasted text only into an open text-field edit. Unlike Enter,
+    /// embedded newlines are draft content and never commit or save the form.
+    pub fn paste(&mut self, text: &str) {
+        if !self.editing {
+            return;
+        }
+        if let Some(field) = self.fields.get_mut(self.cursor) {
+            field.text.paste(text);
+        }
+    }
+
     /// Route one key press; the dialog consumes every key while open.
     /// PageUp/PageDown cycle the form's pages; `alt` carries the Alt
     /// modifier, whose keys are inert while the dialog is open.

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Config wizard writes on Unix now enforce owner-only permissions
+  (0600) on both the configuration file and its temporary file, so
+  passwords are not exposed to other users and restrictive permissions
+  survive an atomic replacement.
+- Bracketed paste plus opaque paste routing keeps multiline pastes from
+  auto-submitting or executing pasted lines as commands.
+
 ## [0.11.1] — 2026-11-15
 
 ### Fixed

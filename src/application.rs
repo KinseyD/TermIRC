@@ -458,6 +458,9 @@ impl Session {
     pub fn type_char(&mut self, character: char) {
         self.draft_mut().insert(character);
     }
+    pub fn paste_input(&mut self, text: &str) {
+        self.draft_mut().paste(text);
+    }
     pub fn backspace(&mut self) {
         self.draft_mut().backspace();
     }

@@ -1,6 +1,8 @@
 //! Startup, configured resources and terminal restoration.
 use anyhow::Context;
-use ratatui::crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use ratatui::crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use termirc::config::Config;
 use termirc::connection::{ConnectionHandle, spawn_irc};
 use termirc::tui::App;
@@ -70,13 +72,27 @@ fn main() -> anyhow::Result<()> {
             return Err(e.into());
         }
     };
-    if ratatui::crossterm::execute!(std::io::stdout(), EnableMouseCapture).is_err() {
+    // Bracketed paste is a safety boundary: pasted newlines arrive as one
+    // paste event instead of Enter keys, so they cannot auto-submit a draft
+    // or execute pasted slash commands line by line.
+    if ratatui::crossterm::execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste)
+        .is_err()
+    {
+        let _ = ratatui::crossterm::execute!(
+            std::io::stdout(),
+            DisableBracketedPaste,
+            DisableMouseCapture
+        );
         ratatui::restore();
         anyhow::bail!("{}", termirc::i18n::t("err.startup_mouse"));
     }
     let mut config = config;
     let result = run(&mut terminal, &mut config, &config_path);
-    let _ = ratatui::crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    let _ = ratatui::crossterm::execute!(
+        std::io::stdout(),
+        DisableBracketedPaste,
+        DisableMouseCapture
+    );
     match &result {
         Ok(()) => tracing::info!("termirc exiting"),
         Err(e) => tracing::error!("termirc exiting on error: {e:#}"),
@@ -91,7 +107,11 @@ fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         tracing::error!("panic: {info}");
-        let _ = ratatui::crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+        let _ = ratatui::crossterm::execute!(
+            std::io::stdout(),
+            DisableBracketedPaste,
+            DisableMouseCapture
+        );
         let _ = ratatui::try_restore();
         default_hook(info);
     }));

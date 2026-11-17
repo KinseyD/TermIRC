@@ -68,6 +68,9 @@ pub fn run(
                         },
                     );
                 }
+                Event::Paste(text) => {
+                    relayout = handle_paste(&mut app, &text);
+                }
                 Event::Resize(width, height) => {
                     term_size = (width, height);
                     relayout = true;
@@ -107,6 +110,22 @@ fn fit_app(app: &mut App, (w, h): (u16, u16)) {
     } else {
         app.sync_view();
     }
+}
+
+/// Insert terminal paste as opaque text, never as a sequence of key presses.
+/// In particular, embedded Enter, Esc, Ctrl+C and slash-command lines must not
+/// submit, quit or execute commands. The modal wizard receives paste only in
+/// its active text-field edit; non-composer focus ignores it.
+fn handle_paste(app: &mut App, text: &str) -> bool {
+    if let Some(dialog) = app.dialog.as_mut() {
+        dialog.paste(text);
+        return false;
+    }
+    if app.focus() == Focus::Composer {
+        app.paste_input(text);
+        return true;
+    }
+    false
 }
 
 /// The mutable surroundings one key press may reach: the pieces of the
@@ -677,6 +696,162 @@ mod tests {
             status: &mut String::new(),
         };
         handle_key_press(app, code, false, false, &mut ctx)
+    }
+
+    #[test]
+    fn paste_inserts_single_line_text_at_the_cursor() {
+        let mut app = App::new(40, 10);
+        app.open_channel("srv", "#a");
+        app.select_buffer(0);
+        app.focus_composer();
+        app.restore_input_at("ab".into(), 1);
+
+        assert!(handle_paste(&mut app, "猫🙂"));
+
+        assert_eq!(app.input(), "a猫🙂b");
+        assert_eq!(app.input_cursor(), 3);
+        assert_eq!(app.focus(), Focus::Composer);
+        assert!(app.is_running());
+    }
+
+    #[test]
+    fn multiline_slash_paste_stays_a_draft_and_enter_rejects_it_without_side_effects() {
+        let mut app = App::new(40, 10);
+        let original = app.open_channel("srv", "#a");
+        app.open_channel("srv", "#b");
+        app.activate_buffer(original);
+        app.focus_composer();
+        let pasted = "/join #a\n/join #b";
+
+        // No connection event, outgoing message, control command, buffer
+        // activation or wizard opening may result from either the paste or
+        // the later invalid submission attempt.
+        let (outgoing_tx, mut outgoing_rx) = tokio::sync::mpsc::channel(8);
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(8);
+        let mut outgoing = std::collections::HashMap::from([(
+            "srv".to_string(),
+            ConnectionHandle {
+                outgoing: outgoing_tx,
+                control: control_tx,
+            },
+        )]);
+        let mut config = crate::config::Config::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut status = String::new();
+        let mut ctx = save_context(
+            &mut config,
+            &mut outgoing,
+            &tx,
+            Path::new("/nonexistent/termirc/config.toml"),
+            &mut status,
+        );
+
+        assert!(handle_paste(&mut app, pasted));
+        assert_eq!(app.input(), pasted);
+        assert_eq!(app.input_cursor(), pasted.chars().count());
+        assert_eq!(app.session.active, Some(original));
+        assert!(app.dialog.is_none());
+        assert!(app.is_running());
+        assert!(outgoing_rx.try_recv().is_err());
+        assert!(control_rx.try_recv().is_err());
+        assert!(rx.try_recv().is_err());
+
+        handle_key_press(&mut app, KeyCode::Enter, false, false, &mut ctx);
+
+        assert_eq!(app.input(), pasted, "invalid newlines preserve the draft");
+        assert_eq!(app.input_cursor(), pasted.chars().count());
+        assert_eq!(app.session.active, Some(original), "no Activate effect");
+        assert!(app.dialog.is_none(), "no OpenConfig effect");
+        assert!(app.is_running());
+        assert!(outgoing_rx.try_recv().is_err());
+        assert!(control_rx.try_recv().is_err());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn paste_treats_control_and_enter_characters_as_inert_draft_text() {
+        let mut app = App::new(40, 10);
+        app.open_channel("srv", "#a");
+        app.select_buffer(0);
+        app.focus_composer();
+        let pasted = "a\u{3}\u{1b}\r\n/config\nb";
+
+        handle_paste(&mut app, pasted);
+
+        assert_eq!(app.input(), pasted);
+        assert_eq!(app.input_cursor(), pasted.chars().count());
+        assert!(
+            app.dialog.is_none(),
+            "pasted /config must not open the wizard"
+        );
+        assert!(app.is_running(), "pasted Ctrl+C and Esc must not quit");
+        assert_eq!(app.focus(), Focus::Composer);
+    }
+
+    #[test]
+    fn paste_respects_the_unicode_scalar_draft_limit() {
+        let mut app = App::new(40, 10);
+        app.open_channel("srv", "#a");
+        app.select_buffer(0);
+        app.focus_composer();
+        let original = "🙂".repeat(510);
+        app.restore_input(original.clone());
+
+        handle_paste(&mut app, "ab猫c");
+
+        assert_eq!(app.input(), format!("{original}ab"));
+        assert_eq!(app.input().chars().count(), 512);
+        assert_eq!(app.input_cursor(), 512);
+    }
+
+    #[test]
+    fn paste_is_ignored_outside_the_composer() {
+        let mut app = App::new(40, 10);
+        app.open_channel("srv", "#a");
+        app.select_buffer(0);
+        app.restore_input("keep".into());
+
+        for focus in [Focus::Sidebar, Focus::Messages] {
+            match focus {
+                Focus::Sidebar => app.focus_sidebar(),
+                Focus::Messages => app.focus_messages(),
+                Focus::Composer => unreachable!(),
+            }
+            assert!(!handle_paste(&mut app, "/join #b\n\u{3}\u{1b}"));
+            assert_eq!(app.input(), "keep");
+            assert_eq!(app.focus(), focus);
+            assert!(app.is_running());
+            assert!(app.dialog.is_none());
+        }
+    }
+
+    #[test]
+    fn dialog_paste_only_edits_an_open_field_and_never_commits_or_quits() {
+        let mut app = App::new(40, 10);
+        app.open_channel("srv", "#a");
+        app.select_buffer(0);
+        app.focus_composer();
+        app.restore_input("composer".into());
+        app.open_config_dialog(&crate::config::Config::default());
+
+        handle_paste(&mut app, "ignored");
+        assert_eq!(
+            app.dialog.as_ref().unwrap().field_text("dlg.field_label"),
+            "libera"
+        );
+
+        press(&mut app, KeyCode::Enter);
+        let pasted = "X\n/config\u{3}\u{1b}Y";
+        handle_paste(&mut app, pasted);
+
+        assert_eq!(
+            app.dialog.as_ref().unwrap().field_text("dlg.field_label"),
+            format!("libera{pasted}")
+        );
+        assert!(app.dialog.as_ref().unwrap().editing);
+        assert!(app.dialog.is_some());
+        assert_eq!(app.input(), "composer");
+        assert!(app.is_running());
     }
 
     #[test]
