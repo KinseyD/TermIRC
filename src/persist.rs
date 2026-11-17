@@ -22,11 +22,11 @@ use crate::core::{BufferKind, DeliveryState, Direction, MessageContent, MessageK
 use crate::protocol::parse_server_time;
 
 /// Format version of the schema on disk, kept in `PRAGMA user_version`.
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 /// Database file name inside the injected root directory.
 const DB_FILE: &str = "history.sqlite";
 
-/// Append-only SQLite-backed archive of chat messages and query renames.
+/// SQLite-backed archive of chat messages and query renames.
 ///
 /// The sink lives on the UI thread with the `Session`; all methods are
 /// synchronous single-statement calls, which at human IRC rates is a page
@@ -81,7 +81,7 @@ impl HistorySink {
         sink
     }
 
-    fn init(conn: Connection, config: &HistoryConfig) -> Option<HistorySink> {
+    fn init(mut conn: Connection, config: &HistoryConfig) -> Option<HistorySink> {
         let result = (|| -> rusqlite::Result<HistorySink> {
             // WAL keeps every-message commits cheap (no full fsync of the
             // main database per INSERT); NORMAL is the usual crash-safety
@@ -98,8 +98,25 @@ impl HistorySink {
                     UnsupportedSchema(version),
                 )));
             }
-            conn.execute(SCHEMA_SQL, [])?;
-            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            let transaction = conn.transaction()?;
+            match version {
+                0 => {
+                    transaction.execute(SCHEMA_SQL, [])?;
+                }
+                1 => {
+                    // The non-null default backfills every legacy row as
+                    // Received, exactly as v1 restore presented it.
+                    transaction.execute(
+                        "ALTER TABLE events ADD COLUMN delivery TEXT NOT NULL DEFAULT 'r' \
+                         CHECK (delivery IN ('r', 'u', 'c'))",
+                        [],
+                    )?;
+                }
+                2 => {}
+                _ => unreachable!("newer schemas returned above"),
+            }
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction.commit()?;
             Ok(HistorySink {
                 conn,
                 exclude: config.clone(),
@@ -129,28 +146,34 @@ impl HistorySink {
         }
     }
 
-    /// Persist one message. Only `Chat`/`Action` lines routed to a channel or
-    /// query buffer are archived; console/system lines, delivery state, tags,
-    /// and message IDs are session-scoped and never written.
-    pub fn append(&mut self, server: &ServerId, target: &BufferKind, content: &MessageContent) {
+    /// Persist one message and return its sequence number. Only `Chat`/`Action`
+    /// lines routed to a channel or query buffer are archived; console/system
+    /// lines, tags, and message IDs are session-scoped and never written.
+    pub fn append(
+        &mut self,
+        server: &ServerId,
+        target: &BufferKind,
+        content: &MessageContent,
+    ) -> Option<i64> {
         if !self.enabled {
-            return;
+            return None;
         }
         let (target_kind, name) = match target {
             BufferKind::Channel(name) => ("c", name.as_str()),
             BufferKind::Query(name) => ("q", name.as_str()),
             // Server consoles are never persisted.
-            BufferKind::Server => return,
+            BufferKind::Server => return None,
         };
         if !matches!(content.kind, MessageKind::Chat | MessageKind::Action) {
-            return;
+            return None;
         }
         if self.exclude.excludes(server.as_str(), name) {
-            return;
+            return None;
         }
         let result = self.conn.execute(
-            "INSERT INTO events (server, kind, target_kind, name, ts, dir, mkind, nick, text) \
-             VALUES (?1, 'm', ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO events
+                 (server, kind, target_kind, name, ts, dir, mkind, nick, text, delivery) \
+             VALUES (?1, 'm', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 server.as_str(),
                 target_kind,
@@ -167,11 +190,36 @@ impl HistorySink {
                 },
                 content.nick,
                 content.text,
+                match content.delivery {
+                    DeliveryState::Received => "r",
+                    DeliveryState::Unconfirmed => "u",
+                    DeliveryState::Confirmed => "c",
+                },
             ],
         );
+        match result {
+            Ok(_) => Some(self.conn.last_insert_rowid()),
+            Err(error) => {
+                // One warning, then silence for the rest of the session.
+                tracing::warn!("history persistence disabled after append failure: {error}");
+                self.enabled = false;
+                None
+            }
+        }
+    }
+
+    /// Mark the exact archived outgoing echo identified by its sequence number.
+    pub fn confirm(&mut self, seq: i64) {
+        if !self.enabled {
+            return;
+        }
+        let result = self.conn.execute(
+            "UPDATE events SET delivery = 'c' \
+             WHERE seq = ?1 AND kind = 'm' AND dir = 'o' AND delivery = 'u'",
+            params![seq],
+        );
         if let Err(error) = result {
-            // One warning, then silence for the rest of the session.
-            tracing::warn!("history persistence disabled after append failure: {error}");
+            tracing::warn!("history persistence disabled after confirmation failure: {error}");
             self.enabled = false;
         }
     }
@@ -202,7 +250,7 @@ impl HistorySink {
     /// one), and chains apply in record order.
     pub fn load(&self, server: &ServerId) -> Vec<(BufferKind, Vec<MessageContent>)> {
         let Ok(mut stmt) = self.conn.prepare(
-            "SELECT kind, target_kind, name, ts, dir, mkind, nick, text, new_name \
+            "SELECT kind, target_kind, name, ts, dir, mkind, nick, text, delivery, new_name \
                       FROM events WHERE server = ?1 ORDER BY seq",
         ) else {
             return Vec::new();
@@ -217,7 +265,8 @@ impl HistorySink {
                 mkind: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
                 nick: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
                 text: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
-                new_name: row.get::<_, Option<String>>(8)?,
+                delivery: row.get::<_, Option<String>>(8)?.unwrap_or_default(),
+                new_name: row.get::<_, Option<String>>(9)?,
             })
         });
         let Ok(rows) = rows else {
@@ -330,12 +379,12 @@ struct RawEvent {
     mkind: String,
     nick: String,
     text: String,
+    delivery: String,
     new_name: Option<String>,
 }
 
 /// Rebuild message content from a stored row: IDs are reminted by the
-/// `HistoryStore`, delivery is `Received` (the archive only records messages
-/// that were sent), and tags are wire metadata that does not outlive the line.
+/// `HistoryStore`, and tags are wire metadata that does not outlive the line.
 fn restore(row: &RawEvent) -> Option<MessageContent> {
     Some(MessageContent {
         nick: row.nick.clone(),
@@ -352,7 +401,12 @@ fn restore(row: &RawEvent) -> Option<MessageContent> {
         },
         received_at: parse_server_time(&row.ts)?,
         tags: Vec::new(),
-        delivery: DeliveryState::Received,
+        delivery: match row.delivery.as_str() {
+            "r" => DeliveryState::Received,
+            "u" => DeliveryState::Unconfirmed,
+            "c" => DeliveryState::Confirmed,
+            _ => return None,
+        },
     })
 }
 
@@ -371,6 +425,7 @@ const SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS events (
     mkind TEXT CHECK (mkind IN ('chat', 'action')),
     nick TEXT,
     text TEXT,
+    delivery TEXT NOT NULL DEFAULT 'r' CHECK (delivery IN ('r', 'u', 'c')),
     -- rename columns (kind = 'n')
     new_name TEXT,
     CHECK (
@@ -472,7 +527,7 @@ mod tests {
         content.received_at = SystemTime::UNIX_EPOCH + Duration::new(1_790_899_200, 0);
 
         // Act
-        sink.append(&server(), &BufferKind::Channel("#a".into()), &content);
+        let _ = sink.append(&server(), &BufferKind::Channel("#a".into()), &content);
         let loaded = sink.load(&server());
 
         // Assert
@@ -500,9 +555,9 @@ mod tests {
         outgoing.direction = Direction::Outgoing;
 
         // Act
-        sink.append(&server, &BufferKind::Channel("#a".into()), &chat("a", "in"));
-        sink.append(&server, &BufferKind::Channel("#a".into()), &action);
-        sink.append(&server, &BufferKind::Query("alice".into()), &outgoing);
+        let _ = sink.append(&server, &BufferKind::Channel("#a".into()), &chat("a", "in"));
+        let _ = sink.append(&server, &BufferKind::Channel("#a".into()), &action);
+        let _ = sink.append(&server, &BufferKind::Query("alice".into()), &outgoing);
         let loaded = sink.load(&server);
 
         // Assert
@@ -524,6 +579,40 @@ mod tests {
     }
 
     #[test]
+    fn round_trips_all_delivery_states() {
+        let root = temp_root("delivery");
+        let mut sink = sink(&root);
+        let server = server();
+        let target = BufferKind::Channel("#a".into());
+        let mut unconfirmed = chat("me", "pending");
+        unconfirmed.direction = Direction::Outgoing;
+        unconfirmed.delivery = DeliveryState::Unconfirmed;
+        let mut confirmed = chat("me", "acknowledged");
+        confirmed.direction = Direction::Outgoing;
+        confirmed.delivery = DeliveryState::Confirmed;
+
+        sink.append(&server, &target, &chat("peer", "received"))
+            .expect("incoming row has a sequence");
+        sink.append(&server, &target, &unconfirmed)
+            .expect("unconfirmed row has a sequence");
+        sink.append(&server, &target, &confirmed)
+            .expect("confirmed row has a sequence");
+
+        let loaded = sink.load(&server);
+        let states: Vec<DeliveryState> =
+            loaded[0].1.iter().map(|message| message.delivery).collect();
+        assert_eq!(
+            states,
+            vec![
+                DeliveryState::Received,
+                DeliveryState::Unconfirmed,
+                DeliveryState::Confirmed,
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn console_and_system_lines_and_server_buffers_are_never_persisted() {
         // Arrange
         let root = temp_root("nonchat");
@@ -531,13 +620,13 @@ mod tests {
         let server = server();
 
         // Act
-        sink.append(&server, &BufferKind::Server, &chat("a", "x"));
-        sink.append(
+        let _ = sink.append(&server, &BufferKind::Server, &chat("a", "x"));
+        let _ = sink.append(
             &server,
             &BufferKind::Channel("#a".into()),
             &MessageContent::console("note"),
         );
-        sink.append(
+        let _ = sink.append(
             &server,
             &BufferKind::Channel("#a".into()),
             &MessageContent::system("note"),
@@ -557,10 +646,10 @@ mod tests {
         let query = |nick: &str| BufferKind::Query(nick.into());
 
         // Act
-        sink.append(&server, &query("alice"), &chat("alice", "before"));
+        let _ = sink.append(&server, &query("alice"), &chat("alice", "before"));
         sink.record_rename(&server, "alice", "alicia");
-        sink.append(&server, &query("alice"), &chat("alice", "after reuse"));
-        sink.append(&server, &query("alicia"), &chat("alicia", "new convo"));
+        let _ = sink.append(&server, &query("alice"), &chat("alice", "after reuse"));
+        let _ = sink.append(&server, &query("alicia"), &chat("alicia", "new convo"));
         let loaded = sink.load(&server);
 
         // Assert
@@ -597,11 +686,11 @@ mod tests {
         let query = |nick: &str| BufferKind::Query(nick.into());
 
         // Act
-        sink.append(&server, &query("alice"), &chat("alice", "one"));
+        let _ = sink.append(&server, &query("alice"), &chat("alice", "one"));
         sink.record_rename(&server, "alice", "alicia");
-        sink.append(&server, &query("alicia"), &chat("alicia", "two"));
+        let _ = sink.append(&server, &query("alicia"), &chat("alicia", "two"));
         sink.record_rename(&server, "alicia", "alice2");
-        sink.append(&server, &query("alice2"), &chat("alice2", "three"));
+        let _ = sink.append(&server, &query("alice2"), &chat("alice2", "three"));
         let loaded = sink.load(&server);
 
         // Assert
@@ -626,8 +715,8 @@ mod tests {
         let query = |nick: &str| BufferKind::Query(nick.into());
 
         // Act
-        sink.append(&server, &query("alice"), &chat("alice", "old convo"));
-        sink.append(&server, &query("alicia"), &chat("alicia", "existing convo"));
+        let _ = sink.append(&server, &query("alice"), &chat("alice", "old convo"));
+        let _ = sink.append(&server, &query("alicia"), &chat("alicia", "existing convo"));
 
         // Assert
         let loaded = sink.load(&server);
@@ -653,8 +742,8 @@ mod tests {
         fresh.received_at = now - Duration::from_secs(60);
 
         // Act
-        sink.append(&server, &BufferKind::Channel("#a".into()), &old);
-        sink.append(&server, &BufferKind::Channel("#a".into()), &fresh);
+        let _ = sink.append(&server, &BufferKind::Channel("#a".into()), &old);
+        let _ = sink.append(&server, &BufferKind::Channel("#a".into()), &fresh);
         let reopened = HistorySink::open(&root, &config).expect("reopen applies retention");
         let loaded = reopened.load(&server);
 
@@ -683,16 +772,101 @@ mod tests {
         let kept = BufferKind::Query("alice".into());
 
         // Act
-        sink.append(&server, &channel, &chat("a", "excluded everywhere"));
-        sink.append(&server, &query, &chat("a", "excluded for srv"));
-        sink.append(&other, &query, &chat("a", "kept for other server"));
-        sink.append(&server, &kept, &chat("a", "never written"));
+        let _ = sink.append(&server, &channel, &chat("a", "excluded everywhere"));
+        let _ = sink.append(&server, &query, &chat("a", "excluded for srv"));
+        let _ = sink.append(&other, &query, &chat("a", "kept for other server"));
+        let _ = sink.append(&server, &kept, &chat("a", "never written"));
 
         // Assert
         assert!(sink.load(&server).is_empty());
         let loaded = sink.load(&other);
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].1.len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn create_v1_database(root: &Path) -> Connection {
+        std::fs::create_dir_all(root).unwrap();
+        let conn = Connection::open(root.join(DB_FILE)).unwrap();
+        let schema = SCHEMA_SQL.replace(
+            "    delivery TEXT NOT NULL DEFAULT 'r' CHECK (delivery IN ('r', 'u', 'c')),\n",
+            "",
+        );
+        assert_ne!(schema, SCHEMA_SQL, "test creates the legacy schema");
+        conn.execute(&schema, []).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        conn
+    }
+
+    fn insert_v1_message(conn: &Connection, direction: &str, text: &str) {
+        conn.execute(
+            "INSERT INTO events (server, kind, target_kind, name, ts, dir, mkind, nick, text) \
+             VALUES ('libera', 'm', 'c', '#a', ?1, ?2, 'chat', 'me', ?3)",
+            params![format_rfc3339(SystemTime::now()), direction, text],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn v1_migration_preserves_legacy_received_semantics_and_is_idempotent() {
+        let root = temp_root("migrate-v1");
+        let conn = create_v1_database(&root);
+        insert_v1_message(&conn, "i", "incoming");
+        insert_v1_message(&conn, "o", "outgoing");
+        drop(conn);
+
+        let sink = HistorySink::open(&root, &history_config(&[])).unwrap();
+        let loaded = sink.load(&server());
+        assert_eq!(loaded[0].1.len(), 2);
+        assert!(
+            loaded[0]
+                .1
+                .iter()
+                .all(|message| message.delivery == DeliveryState::Received)
+        );
+        drop(sink);
+
+        let reopened = HistorySink::open(&root, &history_config(&[])).unwrap();
+        assert_eq!(reopened.load(&server()), loaded);
+        let conn = Connection::open(root.join(DB_FILE)).unwrap();
+        let version: u32 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        assert_eq!(count, 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failed_v1_migration_preserves_version_and_data() {
+        let root = temp_root("migrate-failure");
+        let conn = create_v1_database(&root);
+        // Force the v1 ALTER to fail before its transaction can commit.
+        conn.execute(
+            "ALTER TABLE events ADD COLUMN delivery TEXT NOT NULL DEFAULT 'r' \
+             CHECK (delivery IN ('r', 'u', 'c'))",
+            [],
+        )
+        .unwrap();
+        insert_v1_message(&conn, "o", "still here");
+        drop(conn);
+
+        assert!(HistorySink::open(&root, &history_config(&[])).is_none());
+
+        let conn = Connection::open(root.join(DB_FILE)).unwrap();
+        let version: u32 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        let row: (String, String) = conn
+            .query_row("SELECT text, delivery FROM events", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(version, 1);
+        assert_eq!(row, ("still here".into(), "r".into()));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -744,8 +918,8 @@ mod tests {
         let two = ServerId::new("two");
 
         // Act
-        sink.append(&one, &BufferKind::Channel("#a".into()), &chat("a", "one's"));
-        sink.append(&two, &BufferKind::Channel("#a".into()), &chat("a", "two's"));
+        let _ = sink.append(&one, &BufferKind::Channel("#a".into()), &chat("a", "one's"));
+        let _ = sink.append(&two, &BufferKind::Channel("#a".into()), &chat("a", "two's"));
 
         // Assert
         assert_eq!(sink.load(&one)[0].1[0].text, "one's");

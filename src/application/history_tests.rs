@@ -3,6 +3,8 @@
 //! on temp directories (the `logging.rs` temp-dir pattern).
 
 use super::*;
+use std::path::Path;
+
 use crate::core::{DeliveryState, Direction, MessageKind};
 use crate::persist::HistorySink;
 
@@ -26,6 +28,38 @@ fn incoming(nick: &str, text: &str) -> RoutedMessage {
         target: BufferKind::Query(nick.into()),
         content: MessageContent::chat(nick, text),
     }
+}
+
+fn local_echo(target: BufferKind, text: &str) -> RoutedMessage {
+    RoutedMessage {
+        server: "srv".into(),
+        target,
+        content: MessageContent {
+            direction: Direction::Outgoing,
+            delivery: DeliveryState::Unconfirmed,
+            ..MessageContent::chat("me", text)
+        },
+    }
+}
+
+fn own_echo(target: BufferKind, text: &str) -> RoutedMessage {
+    RoutedMessage {
+        server: "srv".into(),
+        target,
+        content: MessageContent::chat("me", text),
+    }
+}
+
+fn archived_delivery(root: &Path, target: &BufferKind) -> Vec<DeliveryState> {
+    let sink = HistorySink::open(root, &history_config(&[])).unwrap();
+    sink.load(&"srv".into())
+        .into_iter()
+        .find(|(kind, _)| kind.matches(target))
+        .unwrap()
+        .1
+        .into_iter()
+        .map(|message| message.delivery)
+        .collect()
 }
 
 #[test]
@@ -105,6 +139,111 @@ fn drain_restores_outgoing_direction_as_received_and_trims_to_capacity() {
     assert_eq!(messages[0].direction, Direction::Outgoing);
     assert_eq!(messages[0].delivery, DeliveryState::Received);
     assert_eq!(messages[1].kind, MessageKind::System);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+fn identical_echoes_confirm_exact_archive_rows(label: &str, target: BufferKind) {
+    let root = temp_root(label);
+    let mut session = Session::with_persist(
+        5_000,
+        HistorySink::open(&root, &history_config(&[])).unwrap(),
+    );
+    let id = session.open_buffer("srv", target.clone());
+    session.apply_connection_event(&IrcEvent::Nickname("srv".into(), "me".into()));
+    session.push_message(local_echo(target.clone(), "same"));
+    session.push_message(local_echo(target.clone(), "same"));
+
+    session.push_message(own_echo(target.clone(), "same"));
+
+    let states: Vec<DeliveryState> = session
+        .messages_for(id)
+        .iter()
+        .map(|message| message.delivery)
+        .collect();
+    assert_eq!(
+        states,
+        vec![DeliveryState::Unconfirmed, DeliveryState::Confirmed]
+    );
+    assert_eq!(archived_delivery(&root, &target), states);
+
+    session.push_message(own_echo(target.clone(), "same"));
+    assert!(
+        session
+            .messages_for(id)
+            .iter()
+            .all(|message| message.delivery == DeliveryState::Confirmed)
+    );
+    assert_eq!(
+        archived_delivery(&root, &target),
+        vec![DeliveryState::Confirmed, DeliveryState::Confirmed]
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn identical_channel_echoes_confirm_exact_archive_rows() {
+    identical_echoes_confirm_exact_archive_rows(
+        "channel-echo-seq",
+        BufferKind::Channel("#room".into()),
+    );
+}
+
+#[test]
+fn identical_query_echoes_confirm_exact_archive_rows() {
+    identical_echoes_confirm_exact_archive_rows(
+        "query-echo-seq",
+        BufferKind::Query("alice".into()),
+    );
+}
+
+#[test]
+fn outgoing_without_echo_restores_as_unconfirmed() {
+    let root = temp_root("unconfirmed-restore");
+    let target = BufferKind::Channel("#room".into());
+    {
+        let mut session = Session::with_persist(
+            5_000,
+            HistorySink::open(&root, &history_config(&[])).unwrap(),
+        );
+        session.open_buffer("srv", target.clone());
+        session.push_message(local_echo(target.clone(), "still pending"));
+    }
+
+    let mut session = Session::with_persist(
+        5_000,
+        HistorySink::open(&root, &history_config(&[])).unwrap(),
+    );
+    let id = session.open_buffer("srv", target);
+    assert_eq!(session.messages_for(id)[0].text, "still pending");
+    assert_eq!(
+        session.messages_for(id)[0].delivery,
+        DeliveryState::Unconfirmed
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn evicted_echo_is_not_confirmed_in_the_archive() {
+    let root = temp_root("evicted-echo");
+    let target = BufferKind::Channel("#room".into());
+    let mut session =
+        Session::with_persist(1, HistorySink::open(&root, &history_config(&[])).unwrap());
+    let id = session.open_buffer("srv", target.clone());
+    session.apply_connection_event(&IrcEvent::Nickname("srv".into(), "me".into()));
+    session.push_message(local_echo(target.clone(), "same"));
+    session.push_message(local_echo(target.clone(), "same"));
+    assert_eq!(session.messages_for(id).len(), 1);
+
+    session.push_message(own_echo(target.clone(), "same"));
+
+    assert_eq!(
+        session.messages_for(id)[0].delivery,
+        DeliveryState::Confirmed
+    );
+    assert_eq!(
+        archived_delivery(&root, &target),
+        vec![DeliveryState::Unconfirmed, DeliveryState::Confirmed]
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 

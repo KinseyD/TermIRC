@@ -58,9 +58,10 @@ impl Session {
         if collision {
             self.buffers[index].send_blocked = true;
             self.buffers[index].unread = true;
-            self.history.append(id, MessageContent::console(format!(
+            let change = self.history.append(id, MessageContent::console(format!(
                 "{previous} is now {nickname}; existing conversations kept. Use /query {nickname}"
             )));
+            self.finish_history_append(id, &change, None);
         } else {
             self.buffers[index].kind = BufferKind::Query(nickname.into());
             // Only the clean path writes a rename record; the collision path

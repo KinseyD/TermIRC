@@ -65,6 +65,8 @@ pub struct Session {
     welcome_draft: Draft,
     next_buffer_id: u64,
     pending_self_echoes: HashMap<BufferId, HashSet<MessageId>>,
+    /// SQLite sequence numbers for live outgoing echoes awaiting confirmation.
+    persisted_echoes: HashMap<MessageId, i64>,
     /// The buffer that issued the most recent unanswered /whois per server;
     /// whois replies are redirected there until 318 (or an error) arrives.
     pending_whois: HashMap<ServerId, BufferId>,
@@ -135,6 +137,11 @@ impl Session {
     /// unreachable rather than stale.
     pub fn remove_server(&mut self, label: &str) {
         let server = ServerId::new(label);
+        for buffer in self.buffers.iter().filter(|buffer| buffer.server == server) {
+            for message in self.history.messages(buffer.id) {
+                self.persisted_echoes.remove(&message.id);
+            }
+        }
         self.buffers.retain(|buffer| buffer.server != server);
         self.servers.remove(&server);
         self.pending_whois.remove(&server);
@@ -157,6 +164,7 @@ impl Session {
             welcome_draft: Draft::default(),
             next_buffer_id: 1,
             pending_self_echoes: HashMap::new(),
+            persisted_echoes: HashMap::new(),
             pending_whois: HashMap::new(),
             persist: None,
         }
@@ -235,7 +243,8 @@ impl Session {
                 if cutoff.is_none_or(|time| content.received_at > time) {
                     cutoff = Some(content.received_at);
                 }
-                let _ = self.history.append(id, content);
+                let change = self.history.append(id, content);
+                self.finish_history_append(id, &change, None);
                 restored += 1;
             }
         }
@@ -250,13 +259,14 @@ impl Session {
             };
             let cutoff = crate::persist::format_cutoff(cutoff);
             let count = restored.to_string();
-            let _ = self.history.append(
+            let change = self.history.append(
                 id,
                 MessageContent::system(i18n::format(
                     i18n::t(key),
                     &[("n", count.as_str()), ("cutoff", cutoff.as_str())],
                 )),
             );
+            self.finish_history_append(id, &change, None);
         }
     }
 
@@ -286,6 +296,28 @@ impl Session {
         self.history.messages(buffer)
     }
 
+    /// Reconcile identity-keyed echo bookkeeping after every history append.
+    fn finish_history_append(
+        &mut self,
+        buffer: BufferId,
+        change: &HistoryChange,
+        persisted_echo: Option<i64>,
+    ) {
+        for removed in &change.evicted {
+            self.persisted_echoes.remove(removed);
+        }
+        if let Some(pending) = self.pending_self_echoes.get_mut(&buffer) {
+            for removed in &change.evicted {
+                pending.remove(removed);
+            }
+        }
+        if let Some(seq) = persisted_echo
+            && !change.evicted.contains(&change.inserted)
+        {
+            self.persisted_echoes.insert(change.inserted, seq);
+        }
+    }
+
     /// Known conversations receive exactly one history entry. Errors with no
     /// registered target remain visible in the originating server's console.
     pub fn push_message(&mut self, mut message: RoutedMessage) -> Option<HistoryChange> {
@@ -312,7 +344,14 @@ impl Session {
                     buffer.server == message.server && buffer.kind.matches(&message.target)
                 })
                 .map(|buffer| buffer.id);
-            if buffer.is_some_and(|id| self.history.confirm_echo(id, &message.content.text)) {
+            if let Some(message_id) =
+                buffer.and_then(|id| self.history.confirm_echo(id, &message.content.text))
+            {
+                if let Some(seq) = self.persisted_echoes.remove(&message_id)
+                    && let Some(sink) = self.persist.as_mut()
+                {
+                    sink.confirm(seq);
+                }
                 return None;
             }
             // Not ours to confirm (never echoed locally); still authoritative.
@@ -327,7 +366,9 @@ impl Session {
                 && matches!(&message.target, BufferKind::Query(nickname) if nickname.eq_ignore_ascii_case(&message.content.nick));
             // The archive hook rides the same commit as the in-memory append:
             // only lines that reach a history also reach the disk.
-            self.persist_append(&message);
+            let track_echo = message.content.direction == Direction::Outgoing
+                && message.content.delivery == DeliveryState::Unconfirmed;
+            let seq = self.persist_append(&message);
             let change = self.history.append(id, message.content);
             if self_echo && !change.evicted.contains(&change.inserted) {
                 self.pending_self_echoes
@@ -335,11 +376,7 @@ impl Session {
                     .or_default()
                     .insert(change.inserted);
             }
-            if let Some(pending) = self.pending_self_echoes.get_mut(&id) {
-                for removed in &change.evicted {
-                    pending.remove(removed);
-                }
-            }
+            self.finish_history_append(id, &change, track_echo.then_some(seq).flatten());
             return Some(change);
         }
         let known = self
@@ -363,8 +400,12 @@ impl Session {
             }
             None => return None,
         };
-        self.persist_append(&message);
-        Some(self.history.append(id, message.content))
+        let track_echo = message.content.direction == Direction::Outgoing
+            && message.content.delivery == DeliveryState::Unconfirmed;
+        let seq = self.persist_append(&message);
+        let change = self.history.append(id, message.content);
+        self.finish_history_append(id, &change, track_echo.then_some(seq).flatten());
+        Some(change)
     }
 
     /// Redirect or mine numeric info replies (topic/names/mode/whois) that
@@ -431,12 +472,12 @@ impl Session {
             .map_or(&[], |buffer| buffer.members.as_slice())
     }
 
-    /// Persist one routed message if a sink is attached; delivery state,
-    /// tags, and message IDs are session-scoped and never written.
-    fn persist_append(&mut self, message: &RoutedMessage) {
-        if let Some(sink) = self.persist.as_mut() {
-            sink.append(&message.server, &message.target, &message.content);
-        }
+    /// Persist one routed message if a sink is attached; tags and message IDs
+    /// are session-scoped and never written.
+    fn persist_append(&mut self, message: &RoutedMessage) -> Option<i64> {
+        self.persist
+            .as_mut()
+            .and_then(|sink| sink.append(&message.server, &message.target, &message.content))
     }
 
     fn draft(&self) -> &Draft {
@@ -560,18 +601,15 @@ impl Session {
             _ => None,
         };
         if let Some(text) = note {
-            for buffer in &self.buffers {
-                if buffer.server != server_id {
+            for index in 0..self.buffers.len() {
+                if self.buffers[index].server != server_id {
                     continue;
                 }
+                let id = self.buffers[index].id;
                 let change = self
                     .history
-                    .append(buffer.id, MessageContent::system(text.clone()));
-                if let Some(pending) = self.pending_self_echoes.get_mut(&buffer.id) {
-                    for removed in &change.evicted {
-                        pending.remove(removed);
-                    }
-                }
+                    .append(id, MessageContent::system(text.clone()));
+                self.finish_history_append(id, &change, None);
             }
         }
     }

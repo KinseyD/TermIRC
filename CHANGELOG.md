@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Preserve outgoing delivery states across restarts and synchronize
+  echo-message confirmations with the exact archived history row.
 - Config wizard writes on Unix now enforce owner-only permissions
   (0600) on both the configuration file and its temporary file, so
   passwords are not exposed to other users and restrictive permissions
