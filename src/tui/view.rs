@@ -722,6 +722,13 @@ impl App {
         self.observe_hint_word();
     }
 
+    /// Insert a terminal paste atomically, then reconcile command hints just
+    /// as other draft edits do. Paste never prepares or submits input.
+    pub fn paste_input(&mut self, text: &str) {
+        self.session.paste_input(text);
+        self.observe_hint_word();
+    }
+
     /// [`Self::restore_input_at`] for the cursor-at-end convenience form.
     pub fn restore_input(&mut self, text: String) {
         self.session.restore_input(text);

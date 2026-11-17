@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.2] — 2026-11-17
+
+### Fixed
+
+- Preserve outgoing delivery states across restarts and synchronize
+  echo-message confirmations with the exact archived history row.
+- Config wizard writes on Unix now enforce owner-only permissions
+  (0600) on both the configuration file and its temporary file, so
+  passwords are not exposed to other users and restrictive permissions
+  survive an atomic replacement.
+- Bracketed paste plus opaque paste routing keeps multiline pastes from
+  auto-submitting or executing pasted lines as commands.
+
 ## [0.11.1] — 2026-11-15
 
 ### Fixed
@@ -200,6 +213,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - SQLite-backed persistent chat history configured via the `[history]`
   section; restored history obeys the same in-memory cutoffs as live buffers.
 
+[0.11.2]: https://github.com/KinseyD/TermIRC/releases/tag/v0.11.2
 [0.11.1]: https://github.com/KinseyD/TermIRC/releases/tag/v0.11.1
 [0.11.0]: https://github.com/KinseyD/TermIRC/releases/tag/v0.11.0
 [0.10.1]: https://github.com/KinseyD/TermIRC/releases/tag/v0.10.1

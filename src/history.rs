@@ -57,11 +57,9 @@ impl HistoryStore {
 
     /// Mark the newest outgoing unconfirmed echo whose text matches as
     /// confirmed. The server's echo-message replaces our local copy instead
-    /// of appending a duplicate; false means no pending echo matched.
-    pub fn confirm_echo(&mut self, buffer: BufferId, text: &str) -> bool {
-        let Some(messages) = self.buffers.get_mut(&buffer) else {
-            return false;
-        };
+    /// of appending a duplicate; None means no pending echo matched.
+    pub fn confirm_echo(&mut self, buffer: BufferId, text: &str) -> Option<MessageId> {
+        let messages = self.buffers.get_mut(&buffer)?;
         messages
             .iter_mut()
             .rev()
@@ -70,8 +68,10 @@ impl HistoryStore {
                     && message.delivery == DeliveryState::Unconfirmed
                     && message.text == text
             })
-            .map(|message| message.content.delivery = DeliveryState::Confirmed)
-            .is_some()
+            .map(|message| {
+                message.content.delivery = DeliveryState::Confirmed;
+                message.id
+            })
     }
 
     /// Messages ordered oldest first; unknown buffers have an empty history.

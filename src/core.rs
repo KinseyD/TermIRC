@@ -233,6 +233,24 @@ impl Draft {
         self.cursor += 1;
     }
 
+    /// Insert opaque pasted text in one operation, capped at 512 Unicode
+    /// scalar values in the complete draft. The caret follows the inserted
+    /// text, including when the paste is truncated to fit.
+    pub fn paste(&mut self, text: &str) {
+        let available = 512usize.saturating_sub(self.text.chars().count());
+        if available == 0 || text.is_empty() {
+            return;
+        }
+        let inserted = text.chars().count().min(available);
+        let end = text
+            .char_indices()
+            .nth(inserted)
+            .map_or(text.len(), |(byte, _)| byte);
+        self.text
+            .insert_str(self.byte_offset(self.cursor), &text[..end]);
+        self.cursor += inserted;
+    }
+
     pub fn backspace(&mut self) {
         if self.cursor > 0 {
             self.cursor -= 1;

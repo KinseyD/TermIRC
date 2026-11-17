@@ -611,6 +611,10 @@ fn read_existing(path: &Path) -> anyhow::Result<String> {
 /// parent directories and lands the file through a same-directory
 /// temporary plus `rename`, leaving no `.tmp` behind on failure.
 fn atomic_write(path: &Path, text: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| {
             i18n::format(
@@ -620,7 +624,24 @@ fn atomic_write(path: &Path, text: &str) -> anyhow::Result<()> {
         })?;
     }
     let temp = path.with_extension("toml.tmp");
-    if let Err(error) = std::fs::write(&temp, text).and_then(|_| std::fs::rename(&temp, path)) {
+    // Passwords live in this file, so on Unix both the temporary and the
+    // final config must be owner-only (0600) even under a lax umask; the
+    // fixed `.tmp` name means a stale file must be re-restricted too.
+    let write = || -> std::io::Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&temp)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        file.write_all(text.as_bytes())
+    };
+
+    if let Err(error) = write().and_then(|_| std::fs::rename(&temp, path)) {
         // Do not leave a partial or misleading `*.toml.tmp` behind when
         // the atomic write never landed.
         let _ = std::fs::remove_file(&temp);
@@ -1183,6 +1204,42 @@ channels = ["#a"]
         assert_eq!(saved.servers["new"].server, "irc.example.org");
         assert_eq!(saved.servers["new"].port, 6697);
         assert!(saved.servers["new"].use_tls);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_server_creates_a_fresh_config_owner_read_write_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Arrange
+        let path = temp_path("perms-fresh");
+
+        // Act
+        save_server(&path, None, "new", &wizard_server()).unwrap();
+
+        // Assert: the new file is 0600 regardless of the ambient umask.
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_server_preserves_owner_only_permissions_on_an_existing_config() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Arrange: an existing 0600 config with a prior server.
+        let path = temp_path("perms-keep");
+        std::fs::write(&path, server_toml("")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        // Act
+        save_server(&path, None, "test", &wizard_server()).unwrap();
+
+        // Assert: the rename replacement keeps 0600.
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
         let _ = std::fs::remove_file(&path);
     }
 
