@@ -38,6 +38,9 @@ server, one config file, no CLI flags.
    cargo run --release
    ```
 
+   Pass `--config <PATH>` (short `-c`) to start with a different
+   configuration file; logs always stay under `~/.config/termirc/logs/`.
+
 3. Pick a channel in the sidebar (`j`/`k`, `Enter`) and type. `Enter` sends.
 
 ## Essentials
