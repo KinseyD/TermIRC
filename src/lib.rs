@@ -4,6 +4,7 @@
 //! Protocol conversion, connection workers, application coordination, and TUI
 //! presentation form separate boundaries; main only assembles resources.
 
+pub mod cli;
 pub mod command;
 pub mod config;
 pub mod connection;

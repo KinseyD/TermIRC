@@ -1,8 +1,11 @@
 //! Startup, configured resources and terminal restoration.
 use anyhow::Context;
+use clap::Parser;
 use ratatui::crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
 };
+
+use termirc::cli::Cli;
 use termirc::config::Config;
 use termirc::connection::{ConnectionHandle, spawn_irc};
 use termirc::tui::App;
@@ -10,7 +13,15 @@ fn main() -> anyhow::Result<()> {
     install_panic_hook();
 
     let home = dirs::home_dir().context(termirc::i18n::t("err.startup_home"))?;
-    let config_path = home.join(".config").join("termirc").join("config.toml");
+    // CLI parsing precedes everything else: --help/--version/parse errors
+    // exit before logging or the terminal is touched. An explicit
+    // --config PATH overrides the hardcoded default; logs always stay in
+    // the default directory so alternate profiles do not scatter them.
+    let cli = Cli::parse();
+    let config_path = match cli.config {
+        Some(path) => path,
+        None => home.join(".config").join("termirc").join("config.toml"),
+    };
     let logs_dir = home.join(".config").join("termirc").join("logs");
     // Logging failures are not fatal: run without logs rather than not run.
     // Deliberately not localized: logging starts before the configuration
