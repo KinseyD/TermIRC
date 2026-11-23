@@ -217,6 +217,12 @@ const REGISTRY: &[(&str, &str)] = &[
         "failed to load config from {path} - copy your config file there (e.g. config.example.toml)",
     ),
     ("err.startup_mouse", "failed to enable mouse capture"),
+    // listen.* — the headless `--listen` mode (no TUI).
+    (
+        "listen.no_servers",
+        "--listen requires at least one server in the config",
+    ),
+    ("listen.started", "listening on {count} server(s)"),
 ];
 
 /// Shipped translations embedded in the binary with `include_str!`, so a
@@ -654,6 +660,11 @@ mod tests {
                 "failed to load config from {path} - copy your config file there (e.g. config.example.toml)",
             ),
             ("err.startup_mouse", "failed to enable mouse capture"),
+            (
+                "listen.no_servers",
+                "--listen requires at least one server in the config",
+            ),
+            ("listen.started", "listening on {count} server(s)"),
         ];
         assert_eq!(REGISTRY.len(), pinned.len(), "registry and pin table sizes");
         for (key, literal) in pinned {

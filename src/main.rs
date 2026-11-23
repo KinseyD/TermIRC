@@ -7,7 +7,7 @@ use ratatui::crossterm::event::{
 
 use termirc::cli::Cli;
 use termirc::config::Config;
-use termirc::connection::{ConnectionHandle, spawn_irc};
+use termirc::connection::{ConnectionHandle, IrcEvent, spawn_irc};
 use termirc::tui::App;
 fn main() -> anyhow::Result<()> {
     install_panic_hook();
@@ -63,6 +63,25 @@ fn main() -> anyhow::Result<()> {
     } else {
         Config::default()
     };
+    // `--listen` is headless and read-only: branch off before any
+    // terminal takeover so the TUI path below stays exactly as it was.
+    if cli.listen {
+        // No setup wizard exists without a terminal, and a missing
+        // config file defaults to zero servers — waiting forever with
+        // nothing to print would look like a hang, so fail fast.
+        if config.first_server().is_none() {
+            let error = anyhow::anyhow!(termirc::i18n::t("listen.no_servers"));
+            tracing::error!("{error}");
+            return Err(error);
+        }
+        tracing::info!(
+            "termirc v{} starting in listen mode; config={}; servers={}",
+            env!("CARGO_PKG_VERSION"),
+            config_path.display(),
+            config.servers.len()
+        );
+        return run_listen(&config);
+    }
     if config.first_server().is_none() {
         // Not fatal: the setup wizard opens on the first frame and can
         // create the missing entry (or the user quits and writes the
@@ -134,26 +153,57 @@ fn run(
     config_path: &std::path::Path,
 ) -> anyhow::Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
-    // One IRC thread per configured server, joining all of its channels,
-    // plus the sender half of each connection's outgoing-message channel.
-    // Threads are deliberately not joined: they block on network I/O and
-    // are reaped when the process exits. The sender half stays alive for
-    // the event loop, so the setup wizard can spawn more servers later
-    // the exact same way.
-    let mut outgoing: std::collections::HashMap<String, ConnectionHandle> =
-        std::collections::HashMap::new();
+    // The handle map doubles as the outgoing-message routing table and
+    // must outlive the event loop, so the setup wizard can spawn more
+    // servers later the exact same way.
+    let mut outgoing = spawn_workers(config, &tx);
+
+    let app = assemble_session(config);
+    termirc::tui::events::run(terminal, config, app, &mut outgoing, tx, rx, config_path)
+}
+
+/// Spawn one IRC worker per configured server onto `tx`, each joining
+/// all of that server's channels, and return each connection's handle
+/// keyed by server name.
+///
+/// Threads are deliberately not joined: they block on network I/O and
+/// are reaped when the process exits. Dropping a handle cancels pending
+/// attempts and closes the active socket, so callers must keep the map
+/// alive for as long as the workers should run.
+fn spawn_workers(
+    config: &Config,
+    tx: &std::sync::mpsc::Sender<IrcEvent>,
+) -> std::collections::HashMap<String, ConnectionHandle> {
+    let mut workers = std::collections::HashMap::new();
     for (name, server) in config.servers.iter() {
-        let (_handle, sender) = spawn_irc(
+        let (_thread, handle) = spawn_irc(
             server.clone(),
             name.clone(),
             server.channels.clone(),
             tx.clone(),
         );
-        outgoing.insert(name.clone(), sender);
+        workers.insert(name.clone(), handle);
     }
+    workers
+}
 
-    let app = assemble_session(config);
-    termirc::tui::events::run(terminal, config, app, &mut outgoing, tx, rx, config_path)
+/// Headless read-only mode: spawn the same workers the TUI would, keep
+/// their handles alive for the loop, and print incoming lines until
+/// every worker has exited. Nothing here ever sends; Ctrl+C terminates.
+fn run_listen(config: &Config) -> anyhow::Result<()> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let workers = spawn_workers(config, &tx);
+    // Drop the last original sender so `recv` can observe "every worker
+    // exited" instead of being kept alive by this clone forever.
+    drop(tx);
+    println!(
+        "{}",
+        termirc::i18n::format(
+            termirc::i18n::t("listen.started"),
+            &[("count", &workers.len().to_string())]
+        )
+    );
+    termirc::listen::run(workers, rx)
 }
 
 /// Build the application session exactly as startup does, without spawning

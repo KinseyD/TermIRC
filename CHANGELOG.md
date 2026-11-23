@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `--listen`: headless read-only mode that connects to all configured
+  servers, joins their channels, and prints UTC-timestamped chat lines
+  to stdout. Nothing is ever sent and nothing is written to the
+  history database; Ctrl+C exits.
+
 ## [0.11.2] — 2026-11-17
 
 ### Fixed

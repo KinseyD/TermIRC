@@ -4,7 +4,7 @@
 [![Rust](https://img.shields.io/badge/Rust-1.88%2B-DEA584?logo=rust)](https://www.rust-lang.org/)
 
 A terminal IRC client written in Rust. One connection per configured
-server, one config file, no CLI flags.
+server, one config file, one optional flag for read-only monitoring.
 
 ## Requirements
 
@@ -70,6 +70,35 @@ server, one config file, no CLI flags.
 | `/disconnect [reason]` / `/quit [reason]` | Disconnect (Esc or Ctrl+C exits TermIRC). |
 
 Invalid or unavailable commands keep the original input for editing.
+
+## Listen mode
+
+Run headless with `--listen` (combine with `-c <PATH>` for another
+config file):
+
+```bash
+termirc --listen
+```
+
+TermIRC connects to every configured server, joins the configured
+channels, and prints incoming chat to stdout — one line per event,
+timestamps always UTC `HH:MM:SS`:
+
+```
+[14:32:05][libera/#termirc][alice] hello
+[14:32:41][libera/#termirc][bob] * waves
+[14:33:02][libera][connected]
+```
+
+- **Read-only**: nothing is ever sent — no messages, no replies. The
+  configured JOINs still happen (that is what makes channel traffic
+  visible); no terminal setup, no stdin.
+- Nothing is written to the history database, even with
+  `[history] persist = true`.
+- Chat, actions (`* text`), query messages, and connection status
+  lines are printed; console chatter (MOTD, numerics) is not.
+- Ctrl+C terminates. `--listen` with no configured servers is an error
+  (there is no setup wizard to fall back on headlessly).
 
 ## Configuration notes
 

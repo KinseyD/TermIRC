@@ -17,6 +17,10 @@ pub struct Cli {
     /// Configuration file to load instead of ~/.config/termirc/config.toml.
     #[arg(short, long, value_name = "PATH")]
     pub config: Option<PathBuf>,
+    /// Run headless in read-only listen mode: print incoming chat lines
+    /// to stdout; nothing is ever sent (Ctrl+C exits)
+    #[arg(long)]
+    pub listen: bool,
 }
 
 #[cfg(test)]
@@ -45,6 +49,26 @@ mod tests {
     #[test]
     fn unknown_arguments_are_rejected() {
         assert!(Cli::try_parse_from(["termirc", "--nope"]).is_err());
+    }
+
+    #[test]
+    fn listen_flag_parses_true_alone() {
+        let cli = Cli::try_parse_from(["termirc", "--listen"]).expect("args parse");
+        assert!(cli.listen);
+        assert_eq!(cli.config, None);
+    }
+
+    #[test]
+    fn listen_flag_combines_with_the_config_flag() {
+        let cli = Cli::try_parse_from(["termirc", "--listen", "-c", "a.toml"]).expect("args parse");
+        assert!(cli.listen);
+        assert_eq!(cli.config, Some(PathBuf::from("a.toml")));
+    }
+
+    #[test]
+    fn listen_flag_stays_false_when_absent() {
+        let cli = Cli::try_parse_from(["termirc", "--config", "a.toml"]).expect("args parse");
+        assert!(!cli.listen);
     }
 
     #[test]
