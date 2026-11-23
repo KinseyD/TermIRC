@@ -167,8 +167,10 @@ fn never_puts_chat_traffic_on_the_wire() {
         lines.push(line);
     }
 
-    // Assert: registration lines only — every observed verb is one the
-    // worker emits to join, and none is user chat.
+    // Assert: registration lines plus transport keepalive — every
+    // observed verb is one the worker emits to join or to keep the
+    // connection alive, and none is user chat. PING/PONG are the
+    // client's timing-dependent keepalive, not chat.
     assert!(
         lines.iter().any(|l| l == "NICK test"),
         "registration did not reach NICK: {lines:?}"
@@ -182,7 +184,7 @@ fn never_puts_chat_traffic_on_the_wire() {
         assert!(
             matches!(
                 verb,
-                "CAP" | "PASS" | "NICK" | "USER" | "JOIN" | "PONG" | "QUIT"
+                "CAP" | "PASS" | "NICK" | "USER" | "JOIN" | "PING" | "PONG" | "QUIT"
             ),
             "listen mode sent unexpected traffic: {line} (all lines: {lines:?})"
         );
