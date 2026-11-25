@@ -4,7 +4,8 @@
 [![Rust](https://img.shields.io/badge/Rust-1.88%2B-DEA584?logo=rust)](https://www.rust-lang.org/)
 
 A terminal IRC client written in Rust. One connection per configured
-server, one config file, one optional flag for read-only monitoring.
+server, one config file, an optional flag for read-only monitoring,
+and a one-shot `send` subcommand for scripts.
 
 ## Requirements
 
@@ -99,6 +100,43 @@ timestamps always UTC `HH:MM:SS`:
   lines are printed; console chatter (MOTD, numerics) is not.
 - Ctrl+C terminates. `--listen` with no configured servers is an error
   (there is no setup wizard to fall back on headlessly).
+
+## Send mode
+
+Run a one-shot send headlessly: connect to one server, deliver a single
+message, and exit — handy from scripts and CI:
+
+```bash
+termirc send libera/#termirc "deploy done"
+termirc send libera/alice "hi"
+echo "build 42 passed" | termirc send libera/#ci -
+termirc -c ~/.config/termirc/ci.toml send libera/#ci "done"
+```
+
+- `SERVER/TARGET` is the `[servers.<name>]` key (case-insensitive), a
+  `/`, then a `#channel` or a nickname. `--config`/`-c` works before or
+  after `send`.
+- A message of `-` reads the text from stdin (one trailing newline is
+  stripped).
+- Only the named server is connected, and only the target channel is
+  joined.
+- Text is sent verbatim — no slash-command parsing, no line splitting.
+  Empty text, control characters, or more than 512 bytes are rejected
+  before connecting.
+- Exactly one PRIVMSG is sent per run, and nothing is written to the
+  history database.
+- Success is silent with exit code 0. Exit code 2 means the message was
+  locally rejected (bad arguments, unknown server, invalid text); exit
+  code 3 means it was not sent (connecting or the `JOIN` failed or
+  timed out, or the message was dropped). Note that `JOIN` must be
+  spelled `JOIN`.
+- "Sent" means handed to the connection, not confirmed by the server.
+- A channel target shows up as a JOIN followed by a QUIT on the
+  network.
+- `--listen` and `send` cannot be combined.
+- A nickname already connected from a running TermIRC is refused by
+  the server (433) — add a second `[servers.<name>]` entry with another
+  nickname for scripts.
 
 ## Configuration notes
 

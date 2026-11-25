@@ -5,9 +5,10 @@ use ratatui::crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
 };
 
-use termirc::cli::Cli;
+use termirc::cli::{Cli, Command};
 use termirc::config::Config;
 use termirc::connection::{ConnectionHandle, IrcEvent, spawn_irc};
+use termirc::send::SendFailure;
 use termirc::tui::App;
 fn main() -> anyhow::Result<()> {
     install_panic_hook();
@@ -63,6 +64,15 @@ fn main() -> anyhow::Result<()> {
     } else {
         Config::default()
     };
+    // `--listen` and `send` are both headless but contradictory: listen
+    // mode promises that nothing is ever sent. clap cannot refuse the pair
+    // itself (`--config` has to stay valid beside the subcommand), so it is
+    // refused here — before listen mode could start, and without connecting.
+    if let Some(Command::Send { .. }) = cli.command
+        && let Some(failure) = termirc::send::listen_conflict(cli.listen)
+    {
+        fail_send(&failure);
+    }
     // `--listen` is headless and read-only: branch off before any
     // terminal takeover so the TUI path below stays exactly as it was.
     if cli.listen {
@@ -81,6 +91,12 @@ fn main() -> anyhow::Result<()> {
             config.servers.len()
         );
         return run_listen(&config);
+    }
+    // `send` is headless too: one message to one server, then a scriptable
+    // exit code. Like listen mode it branches off before any terminal
+    // takeover, and it never returns.
+    if let Some(Command::Send { buffer, message }) = cli.command {
+        run_send(&config, &config_path, &buffer, &message);
     }
     if config.first_server().is_none() {
         // Not fatal: the setup wizard opens on the first frame and can
@@ -206,6 +222,63 @@ fn run_listen(config: &Config) -> anyhow::Result<()> {
     termirc::listen::run(workers, rx)
 }
 
+/// Headless one-shot send: read the message from stdin when it is `-`,
+/// deliver it, and exit with the code scripts branch on. Nothing is printed
+/// on success, and neither the log nor stderr ever carries message text.
+fn run_send(config: &Config, config_path: &std::path::Path, buffer: &str, message: &str) -> ! {
+    // The buffer address names the server and the target; where the text
+    // comes from is all the log ever learns about it.
+    tracing::info!(
+        "termirc v{} starting in send mode; config={}; buffer={}; message={}",
+        env!("CARGO_PKG_VERSION"),
+        config_path.display(),
+        buffer,
+        if message == "-" { "stdin" } else { "argument" }
+    );
+    let outcome = match message {
+        "-" => match read_stdin_message() {
+            Ok(message) => termirc::send::run(config, buffer, &message),
+            Err(error) => {
+                tracing::error!("send mode could not read stdin: {error}");
+                Err(SendFailure::StdinUnreadable)
+            }
+        },
+        message => termirc::send::run(config, buffer, message),
+    };
+    if let Err(failure) = &outcome {
+        fail_send(failure);
+    }
+    tracing::info!("send mode delivered to {buffer}; exiting");
+    std::process::exit(0);
+}
+
+/// Report a `send` that will not happen and exit with its class's code: the
+/// one way send mode leaves the process without delivering.
+fn fail_send(failure: &SendFailure) -> ! {
+    tracing::error!(
+        "send mode failed; exiting with {}: {failure}",
+        failure.exit_code()
+    );
+    eprintln!("termirc send: {failure}");
+    std::process::exit(failure.exit_code())
+}
+
+/// The whole of stdin as the message, minus the one newline a shell pipes
+/// along (`\n` or `\r\n`). Any other newline stays and is refused by the
+/// normal validation, exactly like one typed into the composer.
+fn read_stdin_message() -> std::io::Result<String> {
+    let mut message = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut message)?;
+    Ok(strip_trailing_newline(&message).to_owned())
+}
+
+fn strip_trailing_newline(message: &str) -> &str {
+    match message.strip_suffix('\n') {
+        Some(body) => body.strip_suffix('\r').unwrap_or(body),
+        None => message,
+    }
+}
+
 /// Build the application session exactly as startup does, without spawning
 /// workers: `run()` assembles it so tests can pin the startup invariants.
 fn assemble_session(config: &Config) -> App {
@@ -294,5 +367,47 @@ channels=[]
         assert_eq!(app.session.buffer_count(), 0);
         assert!(app.active_buffer().is_none());
         assert!(app.is_running());
+    }
+
+    #[test]
+    fn stdin_loses_exactly_the_one_trailing_newline() {
+        for (input, expected) in [
+            ("hello world\n", "hello world"),
+            ("hello world\r\n", "hello world"),
+            // Only one: a second newline is message content, refused as such.
+            ("hello world\n\n", "hello world\n"),
+            // A lone carriage return is not a line ending; validation
+            // rejects it like any other control character.
+            ("hello world\r", "hello world\r"),
+            ("hello world", "hello world"),
+            ("\n", ""),
+        ] {
+            assert_eq!(strip_trailing_newline(input), expected, "input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn listen_and_send_parse_together_and_send_refuses_the_pair() {
+        // Arrange: clap accepts the pair — it has to accept `--config`
+        // beside the subcommand — so nothing upstream rejects it.
+        let both = Cli::try_parse_from(["termirc", "--listen", "send", "srv/#c", "hi"])
+            .expect("--listen beside send parses");
+
+        // Act
+        let refusal = termirc::send::listen_conflict(both.listen);
+
+        // Assert: a local rejection (exit 2), while `send` alone is
+        // unaffected.
+        assert_eq!(refusal, Some(SendFailure::ListenConflict));
+        assert_eq!(refusal.unwrap().exit_code(), 2);
+        let alone = Cli::try_parse_from(["termirc", "send", "srv/#c", "hi"]).unwrap();
+        assert_eq!(termirc::send::listen_conflict(alone.listen), None);
+    }
+
+    #[test]
+    fn an_unreadable_stdin_is_a_local_rejection() {
+        let failure = SendFailure::StdinUnreadable;
+        assert_eq!(failure.exit_code(), 2);
+        assert_eq!(failure.to_string(), "could not read the message from stdin");
     }
 }

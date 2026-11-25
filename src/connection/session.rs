@@ -64,11 +64,11 @@ pub(crate) async fn run(
             },
             message = outgoing.recv() => {
                 let Some(message) = message else { break; };
-                retain_channel_intent(&message, &mut channels);
+                discard(&tx, &label, &message, &mut channels);
             },
             _ = sleep_until(next.unwrap_or_else(Instant::now)), if next.is_some() => {
                 // Never replay messages queued for a previous socket.
-                discard_chat(&mut outgoing, &mut channels);
+                discard_chat(&tx, &label, &mut outgoing, &mut channels);
                 state(&tx, &label, ConnectionState::Connecting);
                 let end = session(&mut server, &label, &mut channels, &tx, policy.timeout, &mut outgoing, &mut control).await;
                 channels.disconnected();
@@ -144,7 +144,7 @@ async fn session(
             },
             message = outgoing.recv() => {
                 let Some(message) = message else { return End::Shutdown; };
-                retain_channel_intent(&message, channels);
+                discard(tx, label, &message, channels);
             },
             _ = sleep_until(deadline) => return failed(false, None),
             result = &mut connecting => match result {
@@ -222,13 +222,14 @@ async fn session(
             outgoing = outgoing.recv() => {
                 let Some(message) = outgoing else { close(&client, &mut stream, "").await; return End::Shutdown; };
                 if registered_at.is_none() {
-                    retain_channel_intent(&message, channels);
+                    discard(tx, label, &message, channels);
                     continue;
                 }
                 let wire = match encode_outgoing(&message) {
                     Ok(wire) => wire,
                     Err(error) => {
                         tracing::debug!(target: "termirc::slash", %error, "outgoing message rejected");
+                        discard(tx, label, &message, channels);
                         continue;
                     }
                 };
@@ -239,9 +240,16 @@ async fn session(
                     continue;
                 }
                 if matches!(&message, OutgoingMessage::Privmsg { target, .. } if !channels.can_send(target)) {
+                    let _ = tx.send(IrcEvent::OutgoingDropped(label.into()));
                     continue;
                 }
-                if client.send(wire).is_err() { return failed(false, registered_at); }
+                // A refused send never reached the wire: report it like any
+                // other discard.
+                if client.send(wire).is_err() {
+                    let _ = tx.send(IrcEvent::OutgoingDropped(label.into()));
+                    return failed(false, registered_at);
+                }
+                let _ = tx.send(IrcEvent::OutgoingAccepted(label.into()));
             },
             message = stream.next() => {
                 let message = match message {
@@ -313,7 +321,7 @@ async fn session(
                     Command::Response(Response::RPL_WELCOME, args) if registered_at.is_none() => {
                         negotiation.abandon();
                         if let Some(nick) = args.first() { server.nickname.clone_from(nick); }
-                        discard_chat(outgoing, channels);
+                        discard_chat(tx, label, outgoing, channels);
                         registered_at = Some(Instant::now());
                         let _ = tx.send(IrcEvent::Nickname(label.into(), server.nickname.clone()));
                         let _ = tx.send(IrcEvent::Away(label.into(), false));
@@ -588,9 +596,21 @@ fn own_message(message: &Message, nickname: &str) -> bool {
         .is_some_and(|nick| nick.eq_ignore_ascii_case(nickname))
 }
 
-fn retain_channel_intent(message: &OutgoingMessage, channels: &mut Channels) {
+/// A queued message that will not reach a wire. Raw JOIN/PART keeps its
+/// channel-intent bookkeeping; anything else is reported as dropped, so a
+/// caller waiting on a queued message always gets its verdict. Every
+/// outgoing path that skips `client.send` goes through here, which is what
+/// makes the report exact.
+fn discard(
+    tx: &mpsc::Sender<IrcEvent>,
+    label: &str,
+    message: &OutgoingMessage,
+    channels: &mut Channels,
+) {
     if let Some(command) = raw_channel_control(message) {
         channels.request(&command, false);
+    } else {
+        let _ = tx.send(IrcEvent::OutgoingDropped(label.into()));
     }
 }
 
@@ -601,9 +621,14 @@ fn raw_channel_control(message: &OutgoingMessage) -> Option<ConnectionCommand> {
     }
 }
 
-fn discard_chat(outgoing: &mut Receiver<OutgoingMessage>, channels: &mut Channels) {
+fn discard_chat(
+    tx: &mpsc::Sender<IrcEvent>,
+    label: &str,
+    outgoing: &mut Receiver<OutgoingMessage>,
+    channels: &mut Channels,
+) {
     while let Ok(message) = outgoing.try_recv() {
-        retain_channel_intent(&message, channels);
+        discard(tx, label, &message, channels);
     }
 }
 

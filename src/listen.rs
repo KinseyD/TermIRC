@@ -60,14 +60,17 @@ fn render_event_at(event: &IrcEvent, now: SystemTime) -> Option<String> {
         IrcEvent::Status(server, text) | IrcEvent::Error(server, text) => {
             Some(format!("[{}][{server}] {text}", format_time(now)))
         }
-        // Session bookkeeping for the TUI (buffer state, nick tracking);
-        // a listener has no buffers to reconcile, so none of it prints.
+        // Session bookkeeping for the TUI (buffer state, nick tracking) and
+        // the worker's verdicts on outgoing messages, which a listener never
+        // queues: there are no buffers to reconcile, so none of it prints.
         IrcEvent::ControlApplied(_)
         | IrcEvent::Channel(..)
         | IrcEvent::ChannelControlApplied(..)
         | IrcEvent::Nickname(..)
         | IrcEvent::PeerNickname(..)
-        | IrcEvent::Away(..) => None,
+        | IrcEvent::Away(..)
+        | IrcEvent::OutgoingAccepted(_)
+        | IrcEvent::OutgoingDropped(_) => None,
     }
 }
 
@@ -340,6 +343,8 @@ mod tests {
             IrcEvent::Nickname("libera".to_string(), "me".to_string()),
             IrcEvent::PeerNickname("libera".to_string(), "old".to_string(), "new".to_string()),
             IrcEvent::Away("libera".to_string(), true),
+            IrcEvent::OutgoingAccepted("libera".to_string()),
+            IrcEvent::OutgoingDropped("libera".to_string()),
         ];
         for event in &events {
             assert_eq!(render_event_at(event, now), None, "event: {event:?}");

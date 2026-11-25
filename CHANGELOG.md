@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   servers, joins their channels, and prints UTC-timestamped chat lines
   to stdout. Nothing is ever sent and nothing is written to the
   history database; Ctrl+C exits.
+- `termirc send SERVER/TARGET MESSAGE`: headless one-shot PRIVMSG —
+  connect to one server, send one message, and exit (message `-` reads
+  stdin). Exit code 0 on success, 2 for local rejection, 3 when not
+  sent; nothing is written to the history database.
 
 ## [0.11.2] — 2026-11-17
 

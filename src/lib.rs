@@ -11,6 +11,7 @@ pub mod connection;
 pub mod i18n;
 pub mod listen;
 pub mod logging;
+pub mod send;
 
 pub mod application;
 pub mod core;

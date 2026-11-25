@@ -223,6 +223,46 @@ const REGISTRY: &[(&str, &str)] = &[
         "--listen requires at least one server in the config",
     ),
     ("listen.started", "listening on {count} server(s)"),
+    // send.* — the headless one-shot `send` subcommand (no TUI): why a
+    // message was not sent, and its one stdin failure.
+    (
+        "send.listen_conflict",
+        "--listen never sends, so it cannot be combined with send",
+    ),
+    ("send.no_target", "expected server/target, got \"{buffer}\""),
+    (
+        "send.unknown_server",
+        "server \"{server}\" is not in the config",
+    ),
+    (
+        "send.invalid_target",
+        "\"{target}\" is not a valid #channel or nickname",
+    ),
+    ("send.empty_message", "the message is empty"),
+    ("send.rejected", "the message was rejected: {reason}"),
+    ("send.not_connected", "{server} is not connected: {reason}"),
+    ("send.not_connected_no_reason", "{server} is not connected"),
+    (
+        "send.not_joined",
+        "could not join {channel} on {server}: {reason}",
+    ),
+    (
+        "send.not_joined_no_reason",
+        "could not join {channel} on {server}: no reason given",
+    ),
+    (
+        "send.dropped",
+        "{server} discarded the message without sending it",
+    ),
+    (
+        "send.ack_timeout",
+        "{server} did not confirm the message within {seconds} seconds",
+    ),
+    (
+        "send.shutdown_timeout",
+        "{server} did not finish disconnecting within {seconds} seconds",
+    ),
+    ("send.stdin_read", "could not read the message from stdin"),
 ];
 
 /// Shipped translations embedded in the binary with `include_str!`, so a
@@ -665,6 +705,44 @@ mod tests {
                 "--listen requires at least one server in the config",
             ),
             ("listen.started", "listening on {count} server(s)"),
+            (
+                "send.listen_conflict",
+                "--listen never sends, so it cannot be combined with send",
+            ),
+            ("send.no_target", "expected server/target, got \"{buffer}\""),
+            (
+                "send.unknown_server",
+                "server \"{server}\" is not in the config",
+            ),
+            (
+                "send.invalid_target",
+                "\"{target}\" is not a valid #channel or nickname",
+            ),
+            ("send.empty_message", "the message is empty"),
+            ("send.rejected", "the message was rejected: {reason}"),
+            ("send.not_connected", "{server} is not connected: {reason}"),
+            ("send.not_connected_no_reason", "{server} is not connected"),
+            (
+                "send.not_joined",
+                "could not join {channel} on {server}: {reason}",
+            ),
+            (
+                "send.not_joined_no_reason",
+                "could not join {channel} on {server}: no reason given",
+            ),
+            (
+                "send.dropped",
+                "{server} discarded the message without sending it",
+            ),
+            (
+                "send.ack_timeout",
+                "{server} did not confirm the message within {seconds} seconds",
+            ),
+            (
+                "send.shutdown_timeout",
+                "{server} did not finish disconnecting within {seconds} seconds",
+            ),
+            ("send.stdin_read", "could not read the message from stdin"),
         ];
         assert_eq!(REGISTRY.len(), pinned.len(), "registry and pin table sizes");
         for (key, literal) in pinned {
