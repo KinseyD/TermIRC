@@ -234,9 +234,20 @@ async fn session(
                     }
                 };
                 if let Some(command) = raw_channel_control(&message) {
-                    if channels.request(&command, true).is_some_and(|wire| client.send(wire).is_err()) {
+                    // A raw JOIN/PART from the outgoing queue never yields
+                    // the ordinary verdict, so its completion signal is the
+                    // control acknowledgement — emitted here, exactly once
+                    // per consumed command, whether the wire took it (new
+                    // channel) or the registry already satisfies it (the
+                    // queued sender would otherwise wait out its ack
+                    // timeout). A failed socket write ends the session
+                    // before any acknowledgement.
+                    if let Some(wire) = channels.request(&command, true)
+                        && client.send(wire).is_err()
+                    {
                         return failed(false, registered_at);
                     }
+                    acknowledge(tx, label, Some(&command));
                     continue;
                 }
                 if matches!(&message, OutgoingMessage::Privmsg { target, .. } if !channels.can_send(target)) {

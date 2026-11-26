@@ -1,5 +1,6 @@
 //! Headless one-shot send: the `send` subcommand connects to one configured
-//! server, delivers one PRIVMSG, and exits with a scriptable code.
+//! server, delivers one PRIVMSG (or one raw IRC command), and exits with a
+//! scriptable code.
 //!
 //! Layer boundary: depends only on `core` message types, the `connection`
 //! worker, `protocol` validation, and the `config` server table (plus std).
@@ -7,6 +8,11 @@
 //! receives is recorded. Listen mode never sends; this is the one headless
 //! path that does, and it sends exactly the message it was given — which no
 //! event, failure, or log line ever quotes.
+//!
+//! The address grammar shared with `--stdio` lives here too: parsing
+//! ([`parse_line`]), target and payload validation ([`chat_outgoing`],
+//! [`raw_outgoing`]), and server lookup ([`resolve_server`]) are `pub` so
+//! the stdio session reuses one set of rules instead of growing a second.
 //!
 //! The worker owns all timing (connect, registration, and JOIN deadlines
 //! come from its [`RetryPolicy`]); this module only reads the worker's
@@ -24,7 +30,7 @@ use crate::{
     connection::{ConnectionHandle, ConnectionState, IrcEvent, RetryPolicy, spawn_irc_with_policy},
     core::{ChannelState, MessageKind, OutgoingMessage, valid_channel_name, valid_query_nickname},
     i18n,
-    protocol::{SendError, encode_outgoing},
+    protocol::{SendError, channel_control_from_raw, encode_outgoing},
 };
 
 /// How long the worker may take to report a queued message. It answers
@@ -60,10 +66,10 @@ pub fn one_shot_policy() -> RetryPolicy {
 pub enum SendFailure {
     /// `--listen` and `send` are both headless but contradictory modes.
     ListenConflict,
+    /// `--stdio` and `send` are contradictory: stdio is itself a sender.
+    StdioConflict,
     /// The message had to come from stdin, which could not be read as UTF-8.
     StdinUnreadable,
-    /// The buffer address has no `/` between server and target.
-    NoTarget { buffer: String },
     /// The server part of the address is not a `[servers.<name>]` key.
     UnknownServer { server: String },
     /// The target is neither a valid `#channel` nor a valid nickname.
@@ -101,8 +107,8 @@ impl SendFailure {
     pub fn exit_code(&self) -> i32 {
         match self {
             Self::ListenConflict
+            | Self::StdioConflict
             | Self::StdinUnreadable
-            | Self::NoTarget { .. }
             | Self::UnknownServer { .. }
             | Self::InvalidTarget { .. }
             | Self::EmptyMessage
@@ -122,8 +128,8 @@ impl fmt::Display for SendFailure {
         // language is a configuration choice made after this type exists.
         let text = match self {
             Self::ListenConflict => text("send.listen_conflict", &[]),
+            Self::StdioConflict => text("send.stdio_conflict", &[]),
             Self::StdinUnreadable => text("send.stdin_read", &[]),
-            Self::NoTarget { buffer } => text("send.no_target", &[("buffer", buffer)]),
             Self::UnknownServer { server } => text("send.unknown_server", &[("server", server)]),
             Self::InvalidTarget { target } => text("send.invalid_target", &[("target", target)]),
             Self::EmptyMessage => text("send.empty_message", &[]),
@@ -188,6 +194,147 @@ pub fn listen_conflict(listen: bool) -> Option<SendFailure> {
     listen.then_some(SendFailure::ListenConflict)
 }
 
+/// The usage error for a `send` invoked with `--stdio`: both send, so the
+/// combination would double-deliver every line. clap cannot refuse the pair
+/// itself (`--config` has to stay valid beside the subcommand), so `main`
+/// asks here before anything connects.
+pub fn stdio_conflict(stdio: bool) -> Option<SendFailure> {
+    stdio.then_some(SendFailure::StdioConflict)
+}
+
+/// One stdin line split the way both headless senders read it: the text
+/// before the first space is the conversation address, everything after it
+/// is the payload, verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Parsed {
+    /// `server/target payload` — a chat message to a `#channel` or nickname.
+    Chat {
+        server: String,
+        target: String,
+        text: String,
+    },
+    /// `server payload` — one raw IRC command line, no leading slash.
+    Raw { server: String, command: String },
+}
+
+/// Why a parsed line cannot become a send. [`LineRejection::AddressOnly`]
+/// is stdio's own wording (the line named nothing to send to); everything
+/// else is a [`SendFailure`] whose [`Display`](fmt::Display) already reads
+/// through the catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LineRejection {
+    /// The line was an address with no payload after it.
+    AddressOnly,
+    /// The address or payload failed a send rule.
+    Send(SendFailure),
+}
+
+impl fmt::Display for LineRejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AddressOnly => f.write_str(&text("stdio.address_only", &[])),
+            Self::Send(failure) => f.write_str(&failure.to_string()),
+        }
+    }
+}
+
+/// Split `line` at the first space: `server/target …` is chat, a bare
+/// `server …` is one raw IRC command. The payload is kept verbatim —
+/// validation trims (or refuses) it later, per sender.
+pub fn parse_line(line: &str) -> Result<Parsed, LineRejection> {
+    let Some((address, payload)) = line.split_once(' ') else {
+        return Err(LineRejection::AddressOnly);
+    };
+    match address.split_once('/') {
+        Some((server, target)) => Ok(Parsed::Chat {
+            server: server.to_owned(),
+            target: target.to_owned(),
+            text: payload.to_owned(),
+        }),
+        None => Ok(Parsed::Raw {
+            server: address.to_owned(),
+            command: payload.to_owned(),
+        }),
+    }
+}
+
+/// Look up a configured server by its `[servers.<name>]` key, ASCII
+/// case-insensitively. Returns the key as written (the label every worker
+/// event carries) and the transport settings.
+pub fn resolve_server(config: &Config, name: &str) -> Result<(String, ServerConfig), SendFailure> {
+    // Config validation already refuses two keys that differ only in ASCII
+    // case, so this finds at most one entry.
+    config
+        .servers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(key, server)| (key.clone(), server.clone()))
+        .ok_or_else(|| SendFailure::UnknownServer {
+            server: name.to_owned(),
+        })
+}
+
+/// Build the chat outgoing message the composer would, plus the channel to
+/// confirm (`None` for a nickname): the target must be a valid `#channel`
+/// or nickname, the text trimmed and non-empty, and the result must pass
+/// the same [`encode_outgoing`] the worker runs, so there is one validation
+/// rule rather than two.
+pub fn chat_outgoing(
+    label: &str,
+    target: &str,
+    message: &str,
+) -> Result<(OutgoingMessage, Option<String>), SendFailure> {
+    let is_channel = target.starts_with(['#', '&']);
+    let valid = if is_channel {
+        valid_channel_name(target)
+    } else {
+        valid_query_nickname(target)
+    };
+    if !valid {
+        return Err(SendFailure::InvalidTarget {
+            target: target.to_owned(),
+        });
+    }
+    let text = message.trim();
+    if text.is_empty() {
+        return Err(SendFailure::EmptyMessage);
+    }
+    let outgoing = OutgoingMessage::Privmsg {
+        server: label.to_owned(),
+        target: target.to_owned(),
+        text: text.to_owned(),
+    };
+    encode_outgoing(&outgoing).map_err(SendFailure::Rejected)?;
+    Ok((outgoing, is_channel.then(|| target.to_owned())))
+}
+
+/// Build the raw-command outgoing message, validated by [`encode_outgoing`]
+/// exactly as given: no trim, no composer rules — the wire check is the
+/// only rule a raw line answers to.
+pub fn raw_outgoing(label: &str, command: &str) -> Result<OutgoingMessage, SendFailure> {
+    let outgoing = OutgoingMessage::Raw {
+        server: label.to_owned(),
+        line: command.to_owned(),
+    };
+    encode_outgoing(&outgoing).map_err(SendFailure::Rejected)?;
+    Ok(outgoing)
+}
+
+/// The channel a raw JOIN/PART line drives, whose
+/// `ChannelControlApplied(server, channel)` is the queued message's
+/// completion signal; `None` for anything else (which gets the ordinary
+/// `OutgoingAccepted`/`OutgoingDropped` verdict).
+pub fn raw_control_channel(message: &OutgoingMessage) -> Option<String> {
+    let OutgoingMessage::Raw { line, .. } = message else {
+        return None;
+    };
+    match channel_control_from_raw(line) {
+        Ok(Some(crate::core::ConnectionCommand::Join(channel))) => Some(channel),
+        Ok(Some(crate::core::ConnectionCommand::Part { channel, .. })) => Some(channel),
+        _ => None,
+    }
+}
+
 /// Send one message with the one-shot policy and return once the worker has
 /// sent its QUIT. Nothing is printed; [`SendFailure::exit_code`] is the
 /// scriptable verdict and [`fmt::Display`] the text to report.
@@ -208,6 +355,7 @@ pub fn run_with_policy(
         label,
         message,
         channel,
+        raw_control,
     } = prepare(config, buffer, message)?;
     let (tx, rx) = mpsc::channel();
     let (_worker, handle) = spawn_irc_with_policy(
@@ -218,6 +366,7 @@ pub fn run_with_policy(
         policy,
     );
     let mut delivery = Delivery::new(&label, channel.as_deref());
+    delivery.raw_control = raw_control.clone();
     let outcome = deliver(&rx, &handle, &message, &mut delivery);
     // Closing the control channel is how a caller asks a worker to QUIT and
     // drain. After a failure that releases a worker which may still be
@@ -231,61 +380,52 @@ pub fn run_with_policy(
 
 /// Everything checked before a worker exists, so an invalid request never
 /// opens a socket.
-struct Prepared {
-    server: ServerConfig,
+pub struct Prepared {
+    pub server: ServerConfig,
     /// The `[servers.<name>]` key as written: the label on every worker event.
-    label: String,
-    message: OutgoingMessage,
-    /// The channel to join first; `None` for a nickname, which needs only a
-    /// registered connection.
-    channel: Option<String>,
+    pub label: String,
+    pub message: OutgoingMessage,
+    /// The channel to join first; `None` for a nickname or a raw command,
+    /// which need only a registered connection.
+    pub channel: Option<String>,
+    /// The channel a raw JOIN/PART drives, whose control acknowledgement
+    /// completes the send; `None` for everything else.
+    pub raw_control: Option<String>,
 }
 
 /// Validate the request the way the composer would — a channel or a
-/// nickname, text trimmed and non-empty — and then against the wire with the
-/// same [`encode_outgoing`] the worker runs, so there is one validation rule
+/// nickname, text trimmed and non-empty, or a raw command line for a bare
+/// server address — and then against the wire with the same
+/// [`encode_outgoing`] the worker runs, so there is one validation rule
 /// rather than two.
-fn prepare(config: &Config, buffer: &str, message: &str) -> Result<Prepared, SendFailure> {
-    let (name, target) = buffer
-        .split_once('/')
-        .ok_or_else(|| SendFailure::NoTarget {
-            buffer: buffer.to_owned(),
-        })?;
-    // Config validation already refuses two keys that differ only in ASCII
-    // case, so this finds at most one entry.
-    let (label, server) = config
-        .servers
-        .iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case(name))
-        .ok_or_else(|| SendFailure::UnknownServer {
-            server: name.to_owned(),
-        })?;
-    let is_channel = target.starts_with(['#', '&']);
-    let valid = if is_channel {
-        valid_channel_name(target)
-    } else {
-        valid_query_nickname(target)
+pub fn prepare(config: &Config, buffer: &str, message: &str) -> Result<Prepared, SendFailure> {
+    let (label, server, target) = match buffer.split_once('/') {
+        Some((name, target)) => {
+            let (label, server) = resolve_server(config, name)?;
+            (label, server, Some(target))
+        }
+        None => {
+            let (label, server) = resolve_server(config, buffer)?;
+            (label, server, None)
+        }
     };
-    if !valid {
-        return Err(SendFailure::InvalidTarget {
-            target: target.to_owned(),
-        });
-    }
-    let text = message.trim();
-    if text.is_empty() {
-        return Err(SendFailure::EmptyMessage);
-    }
-    let outgoing = OutgoingMessage::Privmsg {
-        server: label.clone(),
-        target: target.to_owned(),
-        text: text.to_owned(),
+    let (message, channel, raw_control) = match target {
+        Some(target) => {
+            let (message, channel) = chat_outgoing(&label, target, message)?;
+            (message, channel, None)
+        }
+        None => {
+            let message = raw_outgoing(&label, message)?;
+            let raw_control = raw_control_channel(&message);
+            (message, None, raw_control)
+        }
     };
-    encode_outgoing(&outgoing).map_err(SendFailure::Rejected)?;
     Ok(Prepared {
-        server: server.clone(),
-        label: label.clone(),
-        message: outgoing,
-        channel: is_channel.then(|| target.to_owned()),
+        server,
+        label,
+        message,
+        channel,
+        raw_control,
     })
 }
 
@@ -443,6 +583,10 @@ struct Delivery {
     label: String,
     /// The channel being joined; `None` for a nickname.
     channel: Option<String>,
+    /// The channel a queued raw JOIN/PART drives: its
+    /// `ChannelControlApplied` is the verdict, and the ordinary
+    /// accepted/dropped pair never fires for it.
+    raw_control: Option<String>,
     phase: Phase,
     /// The last `Error`/`Status` text the worker produced: the reason a
     /// connection failure reports.
@@ -454,6 +598,7 @@ impl Delivery {
         Self {
             label: label.to_owned(),
             channel: channel.map(str::to_owned),
+            raw_control: None,
             phase: Phase::Waiting,
             note: None,
         }
@@ -466,6 +611,13 @@ impl Delivery {
     fn is_channel(&self, channel: &str) -> bool {
         // Identities compare ASCII case-insensitively, like everywhere else.
         self.channel
+            .as_deref()
+            .is_some_and(|target| target.eq_ignore_ascii_case(channel))
+    }
+
+    /// Whether `channel` is the one the queued raw JOIN/PART drives.
+    fn is_raw_control(&self, channel: &str) -> bool {
+        self.raw_control
             .as_deref()
             .is_some_and(|target| target.eq_ignore_ascii_case(channel))
     }
@@ -501,14 +653,25 @@ impl Delivery {
                 self.on_channel(status.state, channel)
             }
             IrcEvent::OutgoingAccepted(server)
-                if self.phase == Phase::Queued && self.ours(server) =>
+                if self.phase == Phase::Queued
+                    && self.raw_control.is_none()
+                    && self.ours(server) =>
             {
                 Step::Done
             }
-            IrcEvent::OutgoingDropped(_) if self.phase == Phase::Queued => {
+            IrcEvent::OutgoingDropped(_)
+                if self.phase == Phase::Queued && self.raw_control.is_none() =>
+            {
                 Step::Fail(SendFailure::Dropped {
                     server: self.label.clone(),
                 })
+            }
+            IrcEvent::ChannelControlApplied(server, channel)
+                if self.phase == Phase::Queued
+                    && self.is_raw_control(channel)
+                    && self.ours(server) =>
+            {
+                Step::Done
             }
             _ => Step::Wait,
         }
@@ -702,18 +865,47 @@ channels = []
     }
 
     #[test]
+    fn a_bare_server_address_prepares_one_raw_command_line() {
+        // Arrange
+        let config = config();
+
+        // Act
+        let whois = prepare(&config, "libera", "WHOIS alice").unwrap();
+        let join = prepare(&config, "LIBERA", "JOIN #extra").unwrap();
+
+        // Assert: the payload travels as given, the label is the config key,
+        // and no channel JOIN is staged on the side.
+        assert!(matches!(
+            &whois.message,
+            OutgoingMessage::Raw { server, line }
+                if server == "libera" && line == "WHOIS alice"
+        ));
+        assert_eq!(whois.channel, None);
+        assert_eq!(whois.raw_control, None);
+        assert_eq!(join.raw_control.as_deref(), Some("#extra"));
+
+        // Raw validation is the wire's alone: an empty or overlong payload
+        // is refused, a whitespace-only one is not specially treated.
+        assert_eq!(
+            refusal(&config, "libera", ""),
+            SendFailure::Rejected(SendError::InvalidCommand)
+        );
+        assert_eq!(
+            refusal(&config, "libera", &too_long_line()),
+            SendFailure::Rejected(SendError::TooLong)
+        );
+    }
+
+    fn too_long_line() -> String {
+        "a".repeat(600)
+    }
+
+    #[test]
     fn invalid_requests_are_refused_before_a_worker_exists() {
         // Arrange: every local rejection class, each a script's exit 2.
         let config = config();
         let too_long = "x".repeat(600);
         let cases = [
-            (
-                "libera",
-                TEXT,
-                SendFailure::NoTarget {
-                    buffer: "libera".to_string(),
-                },
-            ),
             (
                 "nowhere/#test",
                 TEXT,
@@ -976,10 +1168,8 @@ channels = []
     fn exit_codes_separate_locally_refused_requests_from_undelivered_messages() {
         let locally_refused = [
             SendFailure::ListenConflict,
+            SendFailure::StdioConflict,
             SendFailure::StdinUnreadable,
-            SendFailure::NoTarget {
-                buffer: String::new(),
-            },
             SendFailure::UnknownServer {
                 server: String::new(),
             },
@@ -1025,14 +1215,12 @@ channels = []
                 "--listen never sends, so it cannot be combined with send".to_string(),
             ),
             (
-                SendFailure::StdinUnreadable,
-                "could not read the message from stdin".to_string(),
+                SendFailure::StdioConflict,
+                "--stdio sends lines from stdin, so it cannot be combined with send".to_string(),
             ),
             (
-                SendFailure::NoTarget {
-                    buffer: "libera".to_string(),
-                },
-                "expected server/target, got \"libera\"".to_string(),
+                SendFailure::StdinUnreadable,
+                "could not read the message from stdin".to_string(),
             ),
             (
                 SendFailure::UnknownServer {
@@ -1259,10 +1447,123 @@ channels = []
     }
 
     #[test]
+    fn a_queued_raw_join_completes_on_its_control_acknowledgement() {
+        // Arrange: the raw JOIN is queued once the connection is registered.
+        let mut delivery = Delivery::new("srv", None);
+        delivery.raw_control = Some("#extra".to_string());
+        assert_eq!(
+            delivery.on_event(&connection(ConnectionState::Connected)),
+            Step::Enqueue
+        );
+
+        // Act / Assert: the control acknowledgement is the verdict; the
+        // ordinary accepted/dropped pair never fires for a raw control.
+        assert_eq!(
+            delivery.on_event(&IrcEvent::OutgoingAccepted("srv".to_string())),
+            Step::Wait,
+            "a raw control gets no ordinary verdict"
+        );
+        assert_eq!(
+            delivery.on_event(&IrcEvent::ChannelControlApplied(
+                "srv".to_string(),
+                "#Extra".to_string()
+            )),
+            Step::Done
+        );
+
+        // Another server's or channel's acknowledgement decides nothing.
+        let mut delivery = Delivery::new("srv", None);
+        delivery.raw_control = Some("#extra".to_string());
+        assert_eq!(
+            delivery.on_event(&connection(ConnectionState::Connected)),
+            Step::Enqueue
+        );
+        for event in [
+            IrcEvent::ChannelControlApplied("other".to_string(), "#extra".to_string()),
+            IrcEvent::ChannelControlApplied("srv".to_string(), "#other".to_string()),
+        ] {
+            assert_eq!(delivery.on_event(&event), Step::Wait, "event: {event:?}");
+        }
+    }
+
+    #[test]
+    fn a_queued_raw_command_still_completes_on_the_ordinary_verdict() {
+        // Arrange: a raw line that is no JOIN/PART, like WHOIS.
+        let mut delivery = Delivery::new("srv", None);
+        delivery.raw_control = None;
+        assert_eq!(
+            delivery.on_event(&connection(ConnectionState::Connected)),
+            Step::Enqueue
+        );
+
+        // Act / Assert
+        assert_eq!(
+            delivery.on_event(&IrcEvent::OutgoingAccepted("srv".to_string())),
+            Step::Done
+        );
+    }
+
+    #[test]
     fn listen_mode_cannot_wrap_a_send() {
         let conflict = listen_conflict(true).unwrap();
         assert_eq!(conflict, SendFailure::ListenConflict);
         assert_eq!(conflict.exit_code(), EXIT_LOCAL);
         assert_eq!(listen_conflict(false), None);
+    }
+
+    #[test]
+    fn stdio_mode_cannot_wrap_a_send() {
+        let conflict = stdio_conflict(true).unwrap();
+        assert_eq!(conflict, SendFailure::StdioConflict);
+        assert_eq!(conflict.exit_code(), EXIT_LOCAL);
+        assert_eq!(stdio_conflict(false), None);
+    }
+
+    #[test]
+    fn the_stdin_grammar_splits_the_address_from_a_verbatim_payload() {
+        for (line, expected) in [
+            (
+                "libera/#test hello world",
+                Parsed::Chat {
+                    server: "libera".to_string(),
+                    target: "#test".to_string(),
+                    text: "hello world".to_string(),
+                },
+            ),
+            // The payload is everything after the first space, verbatim.
+            (
+                "libera/#test  padded  out  ",
+                Parsed::Chat {
+                    server: "libera".to_string(),
+                    target: "#test".to_string(),
+                    text: " padded  out  ".to_string(),
+                },
+            ),
+            (
+                "libera/alice hi",
+                Parsed::Chat {
+                    server: "libera".to_string(),
+                    target: "alice".to_string(),
+                    text: "hi".to_string(),
+                },
+            ),
+            (
+                "libera JOIN #newchan",
+                Parsed::Raw {
+                    server: "libera".to_string(),
+                    command: "JOIN #newchan".to_string(),
+                },
+            ),
+        ] {
+            assert_eq!(parse_line(line), Ok(expected), "line: {line:?}");
+        }
+        // An address with no payload after it is its own refusal.
+        for line in ["libera", "libera/#test"] {
+            assert_eq!(
+                parse_line(line),
+                Err(LineRejection::AddressOnly),
+                "line: {line:?}"
+            );
+        }
     }
 }

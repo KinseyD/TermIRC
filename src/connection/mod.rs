@@ -490,6 +490,89 @@ mod tests {
     }
 
     #[test]
+    fn a_raw_join_on_the_outgoing_queue_yields_exactly_one_control_acknowledgement() {
+        // Arrange: no configured channels, so the raw JOIN's channel is new
+        // to the registry and the command must go to the wire.
+        let (port, lines_rx) = spawn_mock(true);
+        let (tx, rx) = mpsc::channel();
+        let server = local_server(port);
+        let (_worker, handle) =
+            spawn_irc_with_policy(server, "srv".to_string(), Vec::new(), tx, one_shot());
+        let join = OutgoingMessage::Raw {
+            server: "srv".to_string(),
+            line: "JOIN #extra".to_string(),
+        };
+
+        // Act: queue once the connection is registered, exactly as a sender
+        // that waits for `Connected` would.
+        events_until(&rx, connected);
+        handle.outgoing.try_send(join).unwrap();
+        let seen = events_until(
+            &rx,
+            |event| matches!(event, IrcEvent::ChannelControlApplied(_, channel) if channel == "#extra"),
+        );
+
+        // Assert: exactly one acknowledgement, and the JOIN reached the wire.
+        let acks = seen
+            .iter()
+            .filter(|event| matches!(event, IrcEvent::ChannelControlApplied(_, _)))
+            .count();
+        assert_eq!(acks, 1, "events: {seen:?}");
+        assert!(
+            wire_lines(&lines_rx)
+                .iter()
+                .any(|line| line == "JOIN #extra"),
+            "the raw JOIN must reach the wire"
+        );
+    }
+
+    #[test]
+    fn a_raw_join_for_an_already_joined_channel_still_acknowledges_without_wire_traffic() {
+        // Arrange: `#test` is configured, so the worker auto-joins it and
+        // the mock's echo makes it Joined — the registry already satisfies
+        // a raw JOIN for it.
+        let (port, lines_rx) = spawn_mock(true);
+        let (tx, rx) = mpsc::channel();
+        let server = local_server(port);
+        let (_worker, handle) = spawn_irc_with_policy(
+            server,
+            "srv".to_string(),
+            vec!["#test".to_string()],
+            tx,
+            one_shot(),
+        );
+        let join = OutgoingMessage::Raw {
+            server: "srv".to_string(),
+            line: "JOIN #test".to_string(),
+        };
+
+        // Act: drain the startup burst and the wire, then queue the
+        // satisfied JOIN exactly as a sender that waits for `Connected`
+        // would.
+        events_until(&rx, connected);
+        events_until(&rx, joined);
+        let before = wire_lines(&lines_rx);
+        handle.outgoing.try_send(join).unwrap();
+        let seen = events_until(
+            &rx,
+            |event| matches!(event, IrcEvent::ChannelControlApplied(_, channel) if channel == "#test"),
+        );
+
+        // Assert: exactly one control acknowledgement — no ordinary
+        // verdict — and the satisfied JOIN never reached the wire again.
+        assert_eq!(
+            verdicts(&seen),
+            Vec::<IrcEvent>::new(),
+            "a control was reported as a verdict: {seen:?}"
+        );
+        let after = wire_lines(&lines_rx);
+        assert!(
+            !after.iter().any(|line| line.starts_with("JOIN")),
+            "the satisfied JOIN reached the wire again: before {before:?}, after {after:?}"
+        );
+    }
+
+    #[test]
     fn a_raw_channel_control_gets_neither_verdict() {
         // Arrange: no configured channels, so the registry only knows the
         // one the raw control asks for.
@@ -507,14 +590,25 @@ mod tests {
         // the registry acts on it instead of reporting a verdict.
         handle.outgoing.try_send(join()).unwrap();
         let mut seen = events_until(&rx, connected);
-        handle.outgoing.try_send(join()).unwrap();
         seen.extend(events_until(&rx, joined));
-
-        // Assert
         let reported = verdicts(&seen);
         assert!(reported.is_empty(), "a control was reported: {reported:?}");
+        // Once `#test` is Joined the registry already satisfies the control:
+        // it restates the channel status it has, acknowledges the command,
+        // and never reports an ordinary verdict.
+        handle.outgoing.try_send(join()).unwrap();
         let late = rx.recv_timeout(QUIET);
-        assert!(late.is_err(), "a control was reported late: {late:?}");
+        assert!(
+            matches!(&late, Ok(IrcEvent::Channel(_, channel, _)) if channel == "#test"),
+            "the satisfied control did not restate the channel: {late:?}"
+        );
+        let late = rx.recv_timeout(QUIET);
+        assert!(
+            matches!(&late, Ok(IrcEvent::ChannelControlApplied(_, channel)) if channel == "#test"),
+            "the satisfied control was reported as a verdict or went unacknowledged: {late:?}"
+        );
+        let late = rx.recv_timeout(QUIET);
+        assert!(late.is_err(), "a control was reported twice: {late:?}");
         assert_eq!(
             wire_lines(&lines_rx)
                 .iter()

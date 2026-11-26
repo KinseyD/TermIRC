@@ -22,6 +22,10 @@ pub struct Cli {
     /// to stdout; nothing is ever sent (Ctrl+C exits)
     #[arg(long)]
     pub listen: bool,
+    /// Run headless in interactive stdio mode: one send per stdin line,
+    /// one rendered event line per stdout line (Ctrl+C exits)
+    #[arg(long, conflicts_with = "listen")]
+    pub stdio: bool,
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -177,5 +181,32 @@ mod tests {
         let cli = Cli::try_parse_from(["termirc", "--listen"]).expect("args parse");
         assert!(cli.listen);
         assert_eq!(cli.command, None);
+    }
+
+    #[test]
+    fn stdio_flag_parses_and_combines_with_the_config_flag() {
+        for args in [
+            vec!["termirc", "--stdio"],
+            vec!["termirc", "--stdio", "-c", "a.toml"],
+            vec!["termirc", "-c", "a.toml", "--stdio"],
+        ] {
+            let cli = Cli::try_parse_from(args.clone()).expect("args parse");
+            assert!(cli.stdio, "args: {args:?}");
+            assert!(!cli.listen, "args: {args:?}");
+        }
+    }
+
+    #[test]
+    fn stdio_flag_stays_false_when_absent() {
+        let cli = Cli::try_parse_from(["termirc", "--config", "a.toml"]).expect("args parse");
+        assert!(!cli.stdio);
+    }
+
+    #[test]
+    fn stdio_and_listen_flags_are_rejected_together() {
+        // The flags contradict each other at the parser, so clap owns the
+        // usage error and its exit code 2.
+        assert!(Cli::try_parse_from(["termirc", "--stdio", "--listen"]).is_err());
+        assert!(Cli::try_parse_from(["termirc", "--listen", "--stdio"]).is_err());
     }
 }

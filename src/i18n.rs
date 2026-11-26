@@ -263,6 +263,19 @@ const REGISTRY: &[(&str, &str)] = &[
         "{server} did not finish disconnecting within {seconds} seconds",
     ),
     ("send.stdin_read", "could not read the message from stdin"),
+    (
+        "send.stdio_conflict",
+        "--stdio sends lines from stdin, so it cannot be combined with send",
+    ),
+    // stdio.* — the headless `--stdio` session mode (no TUI).
+    (
+        "stdio.non_utf8",
+        "a line from stdin was not valid UTF-8 and was refused",
+    ),
+    (
+        "stdio.address_only",
+        "the line named a server or conversation but carried no message",
+    ),
 ];
 
 /// Shipped translations embedded in the binary with `include_str!`, so a
@@ -743,6 +756,18 @@ mod tests {
                 "{server} did not finish disconnecting within {seconds} seconds",
             ),
             ("send.stdin_read", "could not read the message from stdin"),
+            (
+                "send.stdio_conflict",
+                "--stdio sends lines from stdin, so it cannot be combined with send",
+            ),
+            (
+                "stdio.non_utf8",
+                "a line from stdin was not valid UTF-8 and was refused",
+            ),
+            (
+                "stdio.address_only",
+                "the line named a server or conversation but carried no message",
+            ),
         ];
         assert_eq!(REGISTRY.len(), pinned.len(), "registry and pin table sizes");
         for (key, literal) in pinned {

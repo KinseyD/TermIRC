@@ -5,7 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.13.0] — 2026-11-26
+
+### Added
+
+- `termirc send SERVER/TARGET MESSAGE`: headless one-shot PRIVMSG —
+  connect to one server, send one message, and exit (message `-` reads
+  stdin). Exit code 0 on success, 2 for local rejection, 3 when not
+  sent; nothing is written to the history database.
+- `--stdio`: headless bidirectional mode — commands on stdin, chat
+  and numeric replies and local notices on stdout, EOF quits.
+- `--stdio` holds piped input until the worker's readiness events
+  decide it (bounded by 60 s after EOF) and refuses a channel line
+  promptly once its channel is definitively not joined; a held line
+  refused after stdin closed makes the exit code 3. Numeric Info
+  lines print under their code (`311 alice ...`), and `termirc send
+  SERVER "JOIN #chan"` acknowledges even when the channel is already
+  joined (exit 0 instead of an ack timeout).
+- `termirc send SERVER MESSAGE` also accepts a bare server name to
+  send one raw IRC command line to that server.
+
+## [0.12.0] — 2026-11-20
 
 ### Added
 
@@ -13,10 +33,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   servers, joins their channels, and prints UTC-timestamped chat lines
   to stdout. Nothing is ever sent and nothing is written to the
   history database; Ctrl+C exits.
-- `termirc send SERVER/TARGET MESSAGE`: headless one-shot PRIVMSG —
-  connect to one server, send one message, and exit (message `-` reads
-  stdin). Exit code 0 on success, 2 for local rejection, 3 when not
-  sent; nothing is written to the history database.
 
 ## [0.11.2] — 2026-11-17
 
@@ -224,6 +240,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - SQLite-backed persistent chat history configured via the `[history]`
   section; restored history obeys the same in-memory cutoffs as live buffers.
 
+[0.13.0]: https://github.com/KinseyD/TermIRC/releases/tag/v0.13.0
+[0.12.0]: https://github.com/KinseyD/TermIRC/releases/tag/v0.12.0
 [0.11.2]: https://github.com/KinseyD/TermIRC/releases/tag/v0.11.2
 [0.11.1]: https://github.com/KinseyD/TermIRC/releases/tag/v0.11.1
 [0.11.0]: https://github.com/KinseyD/TermIRC/releases/tag/v0.11.0

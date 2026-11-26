@@ -5,7 +5,8 @@
 
 A terminal IRC client written in Rust. One connection per configured
 server, one config file, an optional flag for read-only monitoring,
-and a one-shot `send` subcommand for scripts.
+a bidirectional `--stdio` mode for automation, and a one-shot `send`
+subcommand for scripts.
 
 ## Requirements
 
@@ -115,7 +116,12 @@ termirc -c ~/.config/termirc/ci.toml send libera/#ci "done"
 
 - `SERVER/TARGET` is the `[servers.<name>]` key (case-insensitive), a
   `/`, then a `#channel` or a nickname. `--config`/`-c` works before or
-  after `send`.
+  after `send`. It may also be just a server name, in which case
+  MESSAGE is one raw IRC command line sent to that server, e.g.
+  `termirc send libera "WHOIS alice"` or
+  `termirc send libera "MODE #chan +o alice"`. Replies are not printed
+  by `send` — it only reports whether the command went out; use
+  `--stdio` when you need to see the replies.
 - A message of `-` reads the text from stdin (one trailing newline is
   stripped).
 - Only the named server is connected, and only the target channel is
@@ -137,6 +143,71 @@ termirc -c ~/.config/termirc/ci.toml send libera/#ci "done"
 - A nickname already connected from a running TermIRC is refused by
   the server (433) — add a second `[servers.<name>]` entry with another
   nickname for scripts.
+
+## Stdio mode
+
+Run fully headless and bidirectional with `--stdio` (`-c <PATH>` works
+too): TermIRC connects to every configured server and joins the
+configured channels like `--listen`, then reads commands from stdin
+and prints traffic to stdout until stdin is closed.
+
+```bash
+termirc --stdio
+```
+
+Input is one command per line; the text before the first space is the
+conversation, everything after it is sent verbatim:
+
+```
+libera/#termirc deploy done
+libera/alice hi
+libera WHOIS alice
+libera JOIN #newchan
+```
+
+A message to a channel, a message to a nickname, a raw command to the
+server, and joining a channel that is not in the config — its traffic
+is then printed too. Blank lines are ignored. Raw commands have no
+leading slash.
+
+Output is one line per event, UTC `HH:MM:SS`:
+
+```
+[14:32:05][libera/#termirc][alice] hello
+[14:32:41][libera/#termirc][bob] * waves
+[14:33:02][libera] connected
+[14:33:10][libera] 311 alice is alice@example.com ...
+[14:33:10][libera] error 401: bob :No such nick
+```
+
+Chat and actions look exactly like listen mode. Numeric replies
+(WHOIS, NAMES, TOPIC ...), server errors, and local notices (join
+timeouts, kicks ...) are printed as `[time][server] text` (or
+`[time][server/#channel] text` when they belong to a channel). MOTD
+and other console chatter are not printed.
+
+- A line waits until its server is connected and, for a channel, the
+  channel is joined, so piped input written immediately still goes out
+  once the connection is ready. A line is refused with a message on
+  stderr when the server stops trying or the channel is not joined.
+  Refused lines make the exit code 3 when stdin has already closed, 0
+  otherwise. stdout carries traffic only; errors go to stderr.
+- Closing stdin ends the session (QUIT is sent; exit code 0, or 3 when
+  a refused line went undelivered); Ctrl+C also works. `--stdio`
+  cannot be combined with `--listen` or with `send`.
+- Nothing is written to the history database. A nickname already
+  connected from a running TermIRC (or `--listen`) is refused by the
+  server.
+
+For simple automation:
+
+```bash
+printf 'libera/#ci deploy done\n'; sleep 2 | termirc --stdio
+```
+
+A driving program can use a coprocess (`subprocess.Popen`, `coproc`)
+to keep it running, write lines to its stdin and read lines from its
+stdout.
 
 ## Configuration notes
 

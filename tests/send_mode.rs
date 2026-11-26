@@ -278,3 +278,42 @@ fn a_server_that_never_registers_fails_within_the_injected_timeout() {
         "took {elapsed:?}, far past the {timeout:?} timeout"
     );
 }
+
+#[test]
+fn a_raw_command_to_a_bare_server_goes_out_and_the_run_succeeds() {
+    // Arrange: the address names the server alone, so the payload is one
+    // raw IRC command line.
+    let (port, lines_rx) = spawn_mock(true, Join::Confirm);
+    let config = config_for(port);
+
+    // Act
+    let result = send::run_with_policy(&config, "libera", "WHOIS alice", policy());
+
+    // Assert: delivered verbatim, then the worker's QUIT.
+    assert_eq!(result, Ok(()));
+    let lines = lines_until(&lines_rx, |line| line.starts_with("QUIT"));
+    let whois = position(&lines, "WHOIS alice").expect("the raw command must be sent");
+    let quit = position(&lines, "QUIT").expect("lines_until stops on the QUIT");
+    assert!(whois < quit, "wrong wire order: {lines:?}");
+}
+
+#[test]
+fn a_raw_join_completes_on_its_control_acknowledgement() {
+    // Arrange: no configured channels, so the raw JOIN's channel is new to
+    // the registry and the command must reach the wire.
+    let (port, lines_rx) = spawn_mock(true, Join::Confirm);
+    let config = config_for(port);
+
+    // Act
+    let result = send::run_with_policy(&config, "libera", "JOIN #extra", policy());
+
+    // Assert: the acknowledgement of the raw control is what completed the
+    // send (the ordinary accepted verdict never fires for one), the JOIN
+    // is on the wire, and the worker still quits cleanly.
+    assert_eq!(result, Ok(()));
+    let lines = lines_until(&lines_rx, |line| line.starts_with("QUIT"));
+    assert!(
+        lines.iter().any(|line| line == "JOIN #extra"),
+        "the raw JOIN must reach the wire: {lines:?}"
+    );
+}

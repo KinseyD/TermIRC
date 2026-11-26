@@ -45,11 +45,21 @@ pub fn render_event(event: &IrcEvent) -> Option<String> {
     render_event_at(event, SystemTime::now())
 }
 
-/// [`render_event`] with an injectable clock: the pure core the unit
-/// tests pin and the integration test drives.
-fn render_event_at(event: &IrcEvent, now: SystemTime) -> Option<String> {
+/// How much of the routed traffic a headless frontend prints. [`Scope::Chat`]
+/// is `--listen`'s read-only view, byte for byte; [`Scope::Routed`] is stdio
+/// mode's, which also restates Info, Error, and System messages as status
+/// lines so an interactive peer sees the server's numerics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Scope {
+    Chat,
+    Routed,
+}
+
+/// [`render_event_at`] under a [`Scope`]: the pure core the unit tests pin
+/// and both headless frontends drive.
+pub(crate) fn render_scoped_at(event: &IrcEvent, now: SystemTime, scope: Scope) -> Option<String> {
     match event {
-        IrcEvent::Message(message) => render_message(message),
+        IrcEvent::Message(message) => render_message_scoped(message, scope),
         // The state word stays English, matching the worker's own status
         // text ("connected to ..."): it is transport vocabulary.
         IrcEvent::Connection(server, state) => Some(format!(
@@ -74,8 +84,15 @@ fn render_event_at(event: &IrcEvent, now: SystemTime) -> Option<String> {
     }
 }
 
-/// Render a routed message; `None` means the line is TUI-only noise.
-fn render_message(message: &RoutedMessage) -> Option<String> {
+/// [`render_event_at`] is the [`Scope::Chat`] spelling.
+fn render_event_at(event: &IrcEvent, now: SystemTime) -> Option<String> {
+    render_scoped_at(event, now, Scope::Chat)
+}
+
+/// Render a routed message under a [`Scope`]. Chat and Action keep the one
+/// chat shape everywhere; the difference is the server-facing kinds, which
+/// the [`Scope::Routed`] scope restates as `[time][server(/target)] text`.
+fn render_message_scoped(message: &RoutedMessage, scope: Scope) -> Option<String> {
     let content = &message.content;
     let time = format_time(content.received_at);
     match (&message.target, &content.kind) {
@@ -85,6 +102,21 @@ fn render_message(message: &RoutedMessage) -> Option<String> {
         (_, MessageKind::Error { code, reason, .. }) => Some(format!(
             "[{time}][{}] error {code}: {reason}",
             message.server
+        )),
+        // Info (topic, mode, whois numerics) carries its numeric code so a
+        // scripted peer can parse the reply; System notices are noise for a
+        // listener but the server's own voice for stdio: the routed text
+        // prints as is, addressed to the buffer it routed to (the server
+        // console when no known channel claimed it).
+        (target, MessageKind::Info { code, .. }) if scope == Scope::Routed => Some(format!(
+            "[{time}][{}] {code} {}",
+            addressed_line(&message.server, target),
+            content.text
+        )),
+        (target, MessageKind::System) if scope == Scope::Routed => Some(format!(
+            "[{time}][{}] {}",
+            addressed_line(&message.server, target),
+            content.text
         )),
         // Console/system traffic (MOTD, numerics, local notices) and
         // anything still aimed at the server buffer is not restated:
@@ -104,6 +136,14 @@ fn render_message(message: &RoutedMessage) -> Option<String> {
                 &format!("* {}", content.text),
             ))
         }
+    }
+}
+
+/// `server` for console traffic, `server/target` once a buffer claimed it.
+fn addressed_line(server: &ServerId, target: &BufferKind) -> String {
+    match target {
+        BufferKind::Channel(name) | BufferKind::Query(name) => format!("{server}/{name}"),
+        BufferKind::Server => server.to_string(),
     }
 }
 

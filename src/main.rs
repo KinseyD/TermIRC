@@ -70,6 +70,7 @@ fn main() -> anyhow::Result<()> {
     // refused here — before listen mode could start, and without connecting.
     if let Some(Command::Send { .. }) = cli.command
         && let Some(failure) = termirc::send::listen_conflict(cli.listen)
+            .or_else(|| termirc::send::stdio_conflict(cli.stdio))
     {
         fail_send(&failure);
     }
@@ -91,6 +92,26 @@ fn main() -> anyhow::Result<()> {
             config.servers.len()
         );
         return run_listen(&config);
+    }
+    // `--stdio` is headless and bidirectional: the same workers `--listen`
+    // spawns, plus one queued send per stdin line. It branches off before
+    // any terminal takeover, exactly like the other headless modes.
+    if cli.stdio {
+        // No setup wizard exists without a terminal, and a missing config
+        // file defaults to zero servers — waiting forever with nothing to
+        // answer would look like a hang, so fail fast.
+        if config.first_server().is_none() {
+            let error = anyhow::anyhow!(termirc::i18n::t("listen.no_servers"));
+            tracing::error!("{error}");
+            return Err(error);
+        }
+        tracing::info!(
+            "termirc v{} starting in stdio mode; config={}; servers={}",
+            env!("CARGO_PKG_VERSION"),
+            config_path.display(),
+            config.servers.len()
+        );
+        return run_stdio(&config);
     }
     // `send` is headless too: one message to one server, then a scriptable
     // exit code. Like listen mode it branches off before any terminal
@@ -220,6 +241,25 @@ fn run_listen(config: &Config) -> anyhow::Result<()> {
         )
     );
     termirc::listen::run(workers, rx)
+}
+
+/// Headless stdio mode: spawn the same workers the TUI would, queue one
+/// send per stdin line against their readiness, and print every rendered
+/// event until stdin closes and the verdict drain finishes.
+fn run_stdio(config: &Config) -> anyhow::Result<()> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let workers = spawn_workers(config, &tx);
+    // Drop the last original sender so `recv` can observe "every worker
+    // exited" instead of being kept alive by this clone forever.
+    drop(tx);
+    let exit = termirc::stdio::run(workers, rx)?;
+    // A refusal after stdin closed means piped input was dropped: the
+    // exit code tells the driving script (like send mode, without the
+    // failure text, which stderr already carries).
+    if exit.code() != 0 {
+        std::process::exit(exit.code());
+    }
+    Ok(())
 }
 
 /// Headless one-shot send: read the message from stdin when it is `-`,

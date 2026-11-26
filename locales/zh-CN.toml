@@ -127,3 +127,8 @@ dropped = "{server} 丢弃了消息，未发送"
 ack_timeout = "{server} 未在 {seconds} 秒内确认消息"
 shutdown_timeout = "{server} 未在 {seconds} 秒内完成断开"
 stdin_read = "无法从标准输入读取消息"
+stdio_conflict = "--stdio 从标准输入逐行发送，因此不能与 send 同时使用"
+
+[stdio]
+non_utf8 = "标准输入中的一行不是有效的 UTF-8，已拒绝"
+address_only = "该行只给出了服务器或会话地址，没有消息"
